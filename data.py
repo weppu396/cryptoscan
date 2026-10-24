@@ -1,7 +1,11 @@
 """
 Fetches OHLCV candles from the exchange and caches them to disk.
-Delete the data_cache folder any time to force a fresh download.
+
+Includes automatic exchange failover: Binance blocks US IPs, so Streamlit
+Cloud (which runs on Google Cloud US) cannot reach it. resolve_exchange()
+tries a list of exchanges and returns the first one that actually responds.
 """
+from dataclasses import replace
 import time
 import pathlib
 import ccxt
@@ -16,14 +20,64 @@ TF_MS = {
     "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000,
 }
 
+# order matters: first reachable one wins
+CANDIDATES = ["binanceusdm", "bybit", "okx", "bitget", "kucoinfutures"]
+
+DEFAULT_TYPE = {
+    "binanceusdm": "future",
+    "binance": "future",
+    "bybit": "swap",
+    "okx": "swap",
+    "bitget": "swap",
+    "kucoinfutures": "swap",
+}
+
+_RESOLVED = {}
+
 
 def get_exchange(cfg):
-    klass = getattr(ccxt, cfg.scan.exchange)
+    name = cfg.scan.exchange
+    klass = getattr(ccxt, name)
     return klass({
         "enableRateLimit": True,
-        "options": {"defaultType": "future"},
         "timeout": 30_000,
+        "options": {"defaultType": DEFAULT_TYPE.get(name, "swap")},
     })
+
+
+def resolve_exchange(cfg, preferred=None, verbose=True):
+    """
+    Return (exchange, name) for the first reachable exchange.
+    Result is cached so we only probe once per session.
+    """
+    key = preferred or "auto"
+    if key in _RESOLVED:
+        name = _RESOLVED[key]
+        try:
+            ex = get_exchange(replace(cfg, scan=replace(cfg.scan, exchange=name)))
+            ex.load_markets()
+            if len(ex.markets) > 50:
+                return ex, name
+        except Exception:
+            _RESOLVED.pop(key, None)
+
+    order = ([preferred] if preferred else []) + [c for c in CANDIDATES if c != preferred]
+    last_err = None
+    for name in order:
+        try:
+            ex = get_exchange(replace(cfg, scan=replace(cfg.scan, exchange=name)))
+            ex.load_markets()
+            if len(ex.markets) > 50:
+                _RESOLVED[key] = name
+                if verbose:
+                    print(f"[exchange] using {name}")
+                return ex, name
+        except Exception as e:
+            last_err = e
+            if verbose:
+                print(f"[exchange] {name} unreachable: {type(e).__name__}")
+
+    raise RuntimeError(f"no reachable exchange. last error: {last_err}")
 
 
 def build_universe(ex, cfg) -> list:
@@ -54,8 +108,8 @@ def build_universe(ex, cfg) -> list:
 
 
 def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
-    """Clean OHLCV frame indexed by UTC timestamp. Cache is re-fetched if it
-    holds fewer bars than requested - this was silently truncating backtests."""
+    """Clean OHLCV frame indexed by UTC timestamp. Re-fetches if the cache
+    holds fewer bars than requested."""
     safe = symbol.replace("/", "_").replace(":", "_")
     key = CACHE / f"{ex.id}_{safe}_{timeframe}.parquet"
 
@@ -68,16 +122,20 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
             pass
 
     step = TF_MS[timeframe]
+    # respect each exchange's per-request ceiling (OKX caps at 300)
+    batch_limit = int(ex.options.get("fetchOHLCVLimit") or 1000)
+    batch_limit = max(50, min(batch_limit, 1000))
+
     since = ex.milliseconds() - step * limit
     rows = []
 
     while len(rows) < limit:
-        batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
+        batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=batch_limit)
         if not batch:
             break
         rows += batch
         since = batch[-1][0] + step
-        if len(batch) < 1000:
+        if len(batch) < batch_limit:
             break
         time.sleep(ex.rateLimit / 1000)
 

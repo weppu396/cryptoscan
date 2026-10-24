@@ -1,3 +1,4 @@
+streamlit>=1.36
 ccxt=4.3
 pandas=2.0
 numpy=1.26

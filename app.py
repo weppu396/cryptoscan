@@ -2,7 +2,7 @@
 app.py - CryptoScan web interface (Streamlit).
 
 Run locally:
-    pip install -r requirements-web.txt
+    pip install -r requirements.txt
     streamlit run app.py
 """
 from dataclasses import replace
@@ -14,7 +14,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from config import CFG
-from data import get_exchange, build_universe, load
+from data import resolve_exchange, build_universe, load
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.levels import build_zones
@@ -27,9 +27,6 @@ from backtest.metrics import report, bucket_stats
 from backtest.validate import permutation_test, monte_carlo_drawdown
 
 
-# ============================================================
-# page setup
-# ============================================================
 st.set_page_config(page_title="CryptoScan", page_icon="chart",
                    layout="wide", initial_sidebar_state="expanded")
 
@@ -39,16 +36,12 @@ GRADE_COLOR = {"A+": "#16a34a", "A": "#22c55e", "B": "#eab308",
                "C": "#f97316", "D": "#ef4444"}
 
 
-# ============================================================
-# helpers
-# ============================================================
 def tv_link(symbol: str) -> str:
     base = symbol.split(":")[0].replace("/", "")
     return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}.P"
 
 
 def load_stats():
-    """Read edge_stats.json produced by run_backtest.py, if it exists."""
     p = pathlib.Path("edge_stats.json")
     if p.exists():
         try:
@@ -59,32 +52,21 @@ def load_stats():
 
 
 def setup_status(s, ltf) -> str:
-    """Is this setup still tradeable RIGHT NOW?"""
     cur = float(ltf["close"].iat[-1])
     tol = 0.5 * s.atr
     if s.direction == "long":
-        if cur <= s.stop:
-            return "INVALID"
-        if cur >= s.tp2:
-            return "TARGET_HIT"
-        if cur >= s.tp1:
-            return "RUNNING"
-        if abs(cur - s.entry) <= tol:
-            return "ACTIONABLE"
-        if cur < s.entry:
-            return "BETTER_PRICE"
+        if cur <= s.stop: return "INVALID"
+        if cur >= s.tp2: return "TARGET_HIT"
+        if cur >= s.tp1: return "RUNNING"
+        if abs(cur - s.entry) <= tol: return "ACTIONABLE"
+        if cur < s.entry: return "BETTER_PRICE"
         return "EXTENDED"
     else:
-        if cur >= s.stop:
-            return "INVALID"
-        if cur <= s.tp2:
-            return "TARGET_HIT"
-        if cur <= s.tp1:
-            return "RUNNING"
-        if abs(cur - s.entry) <= tol:
-            return "ACTIONABLE"
-        if cur > s.entry:
-            return "BETTER_PRICE"
+        if cur >= s.stop: return "INVALID"
+        if cur <= s.tp2: return "TARGET_HIT"
+        if cur <= s.tp1: return "RUNNING"
+        if abs(cur - s.entry) <= tol: return "ACTIONABLE"
+        if cur > s.entry: return "BETTER_PRICE"
         return "EXTENDED"
 
 
@@ -98,12 +80,8 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     )
 
 
-# ============================================================
-# core pipelines
-# ============================================================
 def scan_pipeline(cfg, recent_bars, min_grade):
-    """Self-contained scan loop. Returns a list of rated setups."""
-    ex = get_exchange(cfg)
+    ex, ex_name = resolve_exchange(cfg, preferred=cfg.scan.exchange, verbose=False)
     universe = build_universe(ex, cfg)
     stats = load_stats()
     found = []
@@ -142,14 +120,14 @@ def scan_pipeline(cfg, recent_bars, min_grade):
             continue
 
     found.sort(key=lambda s: (-s.meta["rating"].confidence, -s.score))
-    return found
+    return found, ex_name
 
 
 def backtest_pipeline(cfg, symbol, limit):
-    ex = get_exchange(cfg)
+    ex, ex_name = resolve_exchange(cfg, preferred=cfg.scan.exchange, verbose=False)
     df = load(ex, symbol, cfg.scan.ltf, limit=limit)
     if len(df) < 300:
-        return None, None, 0, 0
+        return None, None, 0, 0, ex_name
 
     ind = compute_all(df, cfg)
     stt = build_structure(df, cfg.structure)
@@ -169,12 +147,9 @@ def backtest_pipeline(cfg, symbol, limit):
                             "tp1": s.tp1, "tp2": s.tp2, "score": s.score}
 
     curve, trades = engine_run(df, signals, cfg, symbol)
-    return curve, trades, len(raw), len(setups)
+    return curve, trades, len(raw), len(setups), ex_name
 
 
-# ============================================================
-# cached wrappers
-# ============================================================
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr,
                 risk_pct, equity, recent_bars, min_grade):
@@ -191,14 +166,16 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr,
     return backtest_pipeline(cfg, symbol, limit)
 
 
-# ============================================================
-# sidebar
-# ============================================================
+# ---------------- sidebar ----------------
 st.sidebar.title("CryptoScan")
 st.sidebar.caption("BOS + retest scanner with transparent grading")
 
 st.sidebar.subheader("Market")
-exch = st.sidebar.selectbox("Exchange", ["binanceusdm", "bybit", "okx"], index=0)
+exch_pref = st.sidebar.selectbox(
+    "Preferred exchange",
+    ["auto", "binanceusdm", "bybit", "okx", "bitget"],
+    index=0,
+    help="auto tries each in turn and uses the first that responds")
 ltf = st.sidebar.selectbox("Timeframe", ["1h", "4h", "1d"], index=1)
 top = st.sidebar.slider("Symbols to scan", 10, 150, 40, step=10)
 min_vol = st.sidebar.select_slider(
@@ -207,8 +184,7 @@ min_vol = st.sidebar.select_slider(
     value=30e6, format_func=lambda v: f"${v/1e6:.0f}M")
 
 st.sidebar.subheader("Filters")
-recent = st.sidebar.slider("Signal freshness (bars)", 1, 12, 2,
-                           help="Only signals from the last N candles")
+recent = st.sidebar.slider("Signal freshness (bars)", 1, 12, 2)
 min_grade = st.sidebar.select_slider("Minimum grade", GRADE_ORDER, value="B")
 only_ok = st.sidebar.checkbox("Show only actionable", value=True)
 limit = st.sidebar.slider("Max results", 3, 40, 10)
@@ -221,9 +197,6 @@ min_rr = st.sidebar.slider("Minimum R:R", 1.5, 5.0, 2.0, step=0.25)
 max_stop_atr = st.sidebar.slider("Max stop (ATR)", 1.5, 6.0, 3.5, step=0.25)
 
 
-# ============================================================
-# tabs
-# ============================================================
 tab_scan, tab_bt, tab_journal, tab_help = st.tabs(
     ["Live Scan", "Backtest", "Journal", "How to use"])
 
@@ -231,25 +204,32 @@ tab_scan, tab_bt, tab_journal, tab_help = st.tabs(
 # ---------------- live scan ----------------
 with tab_scan:
     st.subheader("Live scan")
-    st.caption(f"Scanning top {top} {exch} symbols on {ltf}. "
+    st.caption(f"Scanning top {top} symbols on {ltf}. "
                f"Grade {min_grade} and above. Signals from the last {recent} bars.")
 
     if st.button("Run scan", type="primary"):
-        with st.spinner(f"Scanning {top} symbols. First run downloads candles - "
-                        f"allow 1 to 2 minutes..."):
-            st.session_state["setups"] = cached_scan(
-                exch, top, min_vol, ltf, min_rr, max_stop_atr,
+        with st.spinner("Scanning. First run downloads candles - allow 1 to 2 minutes..."):
+            setups, used = cached_scan(
+                exch_pref, top, min_vol, ltf, min_rr, max_stop_atr,
                 risk_pct, equity, recent, min_grade)
-        st.session_state["scan_meta"] = {"top": top, "exch": exch, "ltf": ltf}
+        st.session_state["setups"] = setups
+        st.session_state["used_ex"] = used
+
+    if st.session_state.get("used_ex"):
+        used = st.session_state["used_ex"]
+        if used == "binanceusdm":
+            st.success(f"Connected to {used}")
+        else:
+            st.info(f"Using {used} (binance unavailable from this region - "
+                    f"same data, no problem)")
 
     setups = st.session_state.get("setups", [])
     stats_src = load_stats()
 
     if stats_src:
-        st.caption(f"Ratings calibrated on {stats_src.get('n', 0)} backtested trades "
-                   f"(edge_stats.json found).")
+        st.caption(f"Ratings calibrated on {stats_src.get('n', 0)} backtested trades.")
     else:
-        st.caption("Ratings use heuristic base rates. Run a backtest to calibrate them.")
+        st.caption("Ratings use heuristic base rates. Run a backtest to calibrate.")
 
     if not setups:
         st.info("No results yet. Press Run scan. Zero setups is a normal outcome.")
@@ -260,29 +240,24 @@ with tab_scan:
 
         if not rows:
             st.warning("Signals exist but none are actionable right now. "
-                       "Uncheck 'Show only actionable' to see them all.")
+                       "Uncheck 'Show only actionable'.")
         else:
             table = pd.DataFrame([{
                 "grade": s.meta["rating"].grade,
                 "conf": s.meta["rating"].confidence,
                 "verdict": s.meta["rating"].verdict,
                 "est_win%": s.meta["rating"].est_win_rate,
-                "symbol": s.symbol,
-                "dir": s.direction.upper(),
+                "symbol": s.symbol, "dir": s.direction.upper(),
                 "status": s.meta.get("status"),
-                "entry": round(s.entry, 6),
-                "stop": round(s.stop, 6),
-                "tp1": round(s.tp1, 6),
-                "tp2": round(s.tp2, 6),
-                "R:R": round(s.rr, 2),
-                "stop_ATR": round(s.stop_atr, 2),
+                "entry": round(s.entry, 6), "stop": round(s.stop, 6),
+                "tp1": round(s.tp1, 6), "tp2": round(s.tp2, 6),
+                "R:R": round(s.rr, 2), "stop_ATR": round(s.stop_atr, 2),
                 "qty": round(s.meta.get("qty", 0), 6),
                 "risk_$": round(s.meta.get("risk_cash", 0), 2),
                 "signal_bar": s.ts.strftime("%Y-%m-%d %H:%M"),
             } for s in rows])
 
             st.dataframe(table, use_container_width=True, hide_index=True)
-
             st.download_button(
                 "Download as CSV",
                 table.to_csv(index=False).encode("utf-8"),
@@ -315,13 +290,11 @@ with tab_scan:
                     c3.metric("R:R", f"{s.rr:.2f}")
                     c1.metric("Take profit 1", f"{s.tp1:,.4f}",
                               f"+{abs(s.tp1-s.entry)/stop_dist:.1f}R")
-                    c2.metric("Take profit 2", f"{s.tp2:,.4f}",
-                              f"+{s.rr:.1f}R")
+                    c2.metric("Take profit 2", f"{s.tp2:,.4f}", f"+{s.rr:.1f}R")
                     c3.metric("Size", f"{s.meta.get('qty', 0):,.4f}")
 
                     st.caption(f"Risk ${s.meta.get('risk_cash', 0):,.2f} "
                                f"({risk_pct}% of ${equity:,.0f})   |   "
-                               f"notional ${s.meta.get('notional', 0):,.0f}   |   "
                                f"signal bar {s.ts}")
 
                     st.divider()
@@ -349,8 +322,8 @@ with tab_scan:
 # ---------------- backtest ----------------
 with tab_bt:
     st.subheader("Backtest")
-    st.caption("Runs the same logic bar by bar with fees, slippage and "
-               "next-open fills. Writes edge_stats.json which calibrates the ratings.")
+    st.caption("Same logic, bar by bar, with fees and slippage. "
+               "Writes edge_stats.json which calibrates the ratings.")
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     bt_symbol = c1.text_input("Symbol", "BTC/USDT:USDT")
@@ -360,21 +333,22 @@ with tab_bt:
 
     if bt_go:
         with st.spinner("Backtesting. Downloading history if needed..."):
-            curve, trades, n_raw, n_kept = cached_backtest(
-                exch, bt_symbol, bt_ltf, int(bt_limit),
+            curve, trades, n_raw, n_kept, used = cached_backtest(
+                exch_pref, bt_symbol, bt_ltf, int(bt_limit),
                 min_rr, max_stop_atr, risk_pct, equity)
-        st.session_state["bt"] = (curve, trades, n_raw, n_kept, bt_symbol, bt_ltf)
+        st.session_state["bt"] = (curve, trades, n_raw, n_kept, bt_symbol, bt_ltf, used)
 
     if "bt" in st.session_state:
-        curve, trades, n_raw, n_kept, sym_used, tf_used = st.session_state["bt"]
-        st.caption(f"{sym_used} {tf_used}: {n_raw} raw signals -> {n_kept} after filters")
+        curve, trades, n_raw, n_kept, sym_used, tf_used, used = st.session_state["bt"]
+        st.caption(f"{sym_used} {tf_used} via {used}: "
+                   f"{n_raw} raw signals -> {n_kept} after filters")
 
         if trades is None or trades.empty:
-            st.warning("No trades. Lower Minimum R:R to 1.5, then raise Max stop ATR to 4.5.")
+            st.warning("No trades. Lower Minimum R:R to 1.5, raise Max stop ATR to 4.5.")
         else:
             if len(trades) < 30:
-                st.warning(f"Only {len(trades)} trades. That is too few to conclude "
-                           f"anything - raise the bar count or use 1h.")
+                st.warning(f"Only {len(trades)} trades - too few to conclude anything. "
+                           f"Raise the bar count.")
 
             stats = report(trades, curve, CFG)
             c = st.columns(5)
@@ -411,9 +385,8 @@ with tab_bt:
                 st.dataframe(pd.DataFrame(bs["buckets"], columns=[
                     "score_from", "score_to", "win_rate", "trades", "expectancy_R"]),
                     use_container_width=True, hide_index=True)
-                st.caption("This is what makes the ratings empirical instead of guessed. "
-                           "Buckets with 15+ trades get used automatically.")
                 pathlib.Path("edge_stats.json").write_text(json.dumps(bs, indent=2))
+                st.caption("This is what makes the ratings empirical instead of guessed.")
             else:
                 st.caption("Not enough trades per bucket yet.")
 
@@ -446,9 +419,7 @@ with tab_journal:
         c5, c6 = st.columns(2)
         j_followed = c5.selectbox("Followed the rules?", ["yes", "no"])
         j_notes = c6.text_input("Notes")
-        submitted = st.form_submit_button("Add trade")
-
-        if submitted and j_symbol:
+        if st.form_submit_button("Add trade") and j_symbol:
             row = pd.DataFrame([{
                 "date": pd.Timestamp.utcnow().date().isoformat(),
                 "symbol": j_symbol, "dir": j_dir, "grade": j_grade,
@@ -468,73 +439,60 @@ with tab_journal:
             c1.metric("Trades logged", len(j))
             c2.metric("Expectancy", f"{j['result_R'].mean():.2f} R")
             c3.metric("Win rate", f"{(j['result_R'] > 0).mean() * 100:.0f}%")
-            c4.metric("Rule adherence",
-                      f"{(j['followed'] == 'yes').mean() * 100:.0f}%")
+            c4.metric("Rule adherence", f"{(j['followed'] == 'yes').mean() * 100:.0f}%")
             st.dataframe(j, use_container_width=True, hide_index=True)
-            st.download_button("Download journal",
-                               j.to_csv(index=False).encode("utf-8"),
-                               "journal.csv", "text/csv")
     except FileNotFoundError:
-        st.caption("No journal yet. Add your first trade above.")
+        st.caption("No journal yet.")
 
 
 # ---------------- help ----------------
 with tab_help:
     st.subheader("How to use this")
     st.markdown("""
-### The daily routine
+### Daily routine
 
-Run the scan just after each 4-hour candle closes:
+Run the scan just after each 4-hour close:
 **00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.**
 
 1. Press **Run scan**.
 2. Keep only rows marked **ACTIONABLE** or **BETTER_PRICE**.
-3. Sort is already by confidence. Take the top 3 maximum.
-4. Check portfolio heat: total open risk must stay under 3% of equity.
-5. Place a limit order at the entry. Attach a stop at the stop loss,
-   take-profit-1 for 50% of size, take-profit-2 for the other 50%.
+3. Take the top 3 by confidence, maximum.
+4. Total open risk must stay under 3% of equity.
+5. Limit order at entry. Stop at the stop loss. TP1 for 50%, TP2 for 50%.
 6. When TP1 fills, move the stop to breakeven. Never widen it.
 7. Close anything still open after 24 bars.
 
-### What the grade means
+### Grade meaning
 
-| Grade | Confidence | Meaning |
+| Grade | Confidence | Action |
 |---|---|---|
-| A+ | 88-100 | Everything lines up. Take it. |
-| A | 78-87 | Strong. Take it. |
-| B | 66-77 | Good. Take it if you have room. |
-| C | 52-65 | Marginal. Watch it. |
-| D | below 52 | Skip. |
+| A+ | 88-100 | Take it |
+| A | 78-87 | Take it |
+| B | 66-77 | Take if you have room |
+| C | 52-65 | Watch |
+| D | below 52 | Skip |
 
-The **est. TP1 hit rate** is the chance price reaches take-profit-1 before
-hitting the stop. Before you run a backtest it is a heuristic. After a
-backtest it becomes the real measured hit rate for that score band.
+**est. TP1 hit rate** = chance price reaches TP1 before the stop.
+Heuristic until you run a backtest, then it becomes the real measured rate.
 
-### What the status means
+### Status meaning
 
-- **ACTIONABLE** - price is at the entry. Place the order.
-- **BETTER_PRICE** - price pulled back past entry. Even better fill.
-- **RUNNING** - TP1 already hit. Manage what is left.
-- **EXTENDED** - price ran away. Wait for a pullback.
-- **INVALID** - the stop was already hit. Skip.
+- **ACTIONABLE** - price is at entry. Place the order.
+- **BETTER_PRICE** - price pulled back past entry. Better fill.
+- **RUNNING** - TP1 already hit. Manage the rest.
+- **EXTENDED** - price ran away. Wait.
+- **INVALID** - stop already hit. Skip.
 
-### Risk rules, set once
+### Exchange note
 
-- Risk 0.5% of equity per trade
-- Maximum 3% total open risk
-- Maximum 3 positions in correlated majors (BTC, ETH, SOL count as one)
-- Maximum 5 positions total
-- Never widen a stop
+Binance blocks US IPs. The app auto-switches to Bybit or OKX when that
+happens - identical data, same symbols, no action needed from you.
 
-### Before you risk real money
+### Before real money
 
-Paper trade for 4 to 8 weeks and collect at least 30 signals. Then trade at
-25% of your target risk for 4 weeks. Only then go full size.
+Paper trade 4-8 weeks, minimum 30 signals. Then 25% size for 4 weeks.
 """)
 
 
-# ============================================================
-# footer
-# ============================================================
 st.sidebar.divider()
 st.sidebar.caption("Not financial advice. Backtest before risking money.")

@@ -326,7 +326,8 @@ with tab_bt:
                "Writes edge_stats.json which calibrates the ratings.")
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    bt_symbol = c1.text_input("Symbol", "BTC/USDT:USDT")
+    default_sym = "BTC/USDT:USDT" if exch_pref == "binanceusdm" else "BTC/USDT"
+    bt_symbol = c1.text_input("Symbol", default_sym)
     bt_ltf = c2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1, key="bt_tf")
     bt_limit = c3.number_input("Bars", 1000, 20000, 6000, step=500)
     bt_go = c4.button("Run backtest", type="primary")

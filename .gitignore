@@ -1,0 +1,8 @@
+venv/
+data_cache/
+__pycache__/
+*.pyc
+state/
+journal.csv
+trades.csv
+edge_stats.json

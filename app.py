@@ -14,7 +14,8 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from config import CFG
-from data import resolve_exchange, build_universe, load
+from data import (resolve_exchange, probe_exchanges, probe_proxy,
+                  build_universe, load, CANDIDATES)
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.levels import build_zones
@@ -36,9 +37,13 @@ GRADE_COLOR = {"A+": "#16a34a", "A": "#22c55e", "B": "#eab308",
                "C": "#f97316", "D": "#ef4444"}
 
 
+# ============================================================
+# helpers
+# ============================================================
 def tv_link(symbol: str) -> str:
     base = symbol.split(":")[0].replace("/", "")
-    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}.P"
+    suffix = ".P" if ":" in symbol else ""
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}{suffix}"
 
 
 def load_stats():
@@ -80,8 +85,11 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     )
 
 
-def scan_pipeline(cfg, recent_bars, min_grade):
-    ex, ex_name = resolve_exchange(cfg, preferred=cfg.scan.exchange, verbose=False)
+# ============================================================
+# pipelines
+# ============================================================
+def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
+    ex, ex_name = resolve_exchange(cfg, preferred=preferred, proxy=proxy)
     universe = build_universe(ex, cfg)
     stats = load_stats()
     found = []
@@ -123,8 +131,8 @@ def scan_pipeline(cfg, recent_bars, min_grade):
     return found, ex_name
 
 
-def backtest_pipeline(cfg, symbol, limit):
-    ex, ex_name = resolve_exchange(cfg, preferred=cfg.scan.exchange, verbose=False)
+def backtest_pipeline(cfg, symbol, limit, preferred, proxy):
+    ex, ex_name = resolve_exchange(cfg, preferred=preferred, proxy=proxy)
     df = load(ex, symbol, cfg.scan.ltf, limit=limit)
     if len(df) < 300:
         return None, None, 0, 0, ex_name
@@ -150,37 +158,75 @@ def backtest_pipeline(cfg, symbol, limit):
     return curve, trades, len(raw), len(setups), ex_name
 
 
+# ============================================================
+# cached wrappers
+# ============================================================
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr,
-                risk_pct, equity, recent_bars, min_grade):
+                risk_pct, equity, recent_bars, min_grade, preferred, proxy):
     cfg = build_cfg(exchange, top, min_vol, ltf, min_rr,
                     max_stop_atr, risk_pct, equity)
-    return scan_pipeline(cfg, recent_bars, min_grade)
+    return scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_backtest(exchange, symbol, ltf, limit, min_rr,
-                    max_stop_atr, risk_pct, equity):
+                    max_stop_atr, risk_pct, equity, preferred, proxy):
     cfg = build_cfg(exchange, 40, 30e6, ltf, min_rr,
                     max_stop_atr, risk_pct, equity)
-    return backtest_pipeline(cfg, symbol, limit)
+    return backtest_pipeline(cfg, symbol, limit, preferred, proxy)
 
 
-# ---------------- sidebar ----------------
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_probe(proxy):
+    return probe_exchanges(proxy or None)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_proxy_health(proxy):
+    return probe_proxy(proxy)
+
+
+# ============================================================
+# sidebar
+# ============================================================
 st.sidebar.title("CryptoScan")
 st.sidebar.caption("BOS + retest scanner with transparent grading")
 
+st.sidebar.subheader("Exchange")
+proxy_url = st.sidebar.text_input(
+    "Binance proxy URL",
+    value=st.session_state.get("proxy_url", ""),
+    placeholder="https://binance-proxy.you.workers.dev",
+    help="Cloudflare Worker that unblocks Binance from US servers")
+st.session_state["proxy_url"] = proxy_url
+
+_opts = ["auto"] + CANDIDATES
+_default = _opts.index("binance") if "binance" in _opts else 0
+exch = st.sidebar.selectbox("Use this exchange", _opts, index=_default)
+
+if not proxy_url.strip():
+    st.sidebar.caption("no proxy set - binance will fall through to okx")
+
+if st.sidebar.button("Test all exchanges"):
+    with st.spinner("probing..."):
+        st.session_state["health"] = cached_probe(proxy_url.strip() or None)
+
+h = st.session_state.get("health")
+if h:
+    st.sidebar.dataframe(pd.DataFrame([{
+        "exchange": n,
+        "ok": "YES" if r["ok"] else "no",
+        "markets": r.get("markets", 0),
+        "ms": r["ms"],
+        "err": r.get("error", ""),
+    } for n, r in h.items()]), hide_index=True, use_container_width=True)
+
 st.sidebar.subheader("Market")
-exch_pref = st.sidebar.selectbox(
-    "Preferred exchange",
-    ["auto", "binanceusdm", "bybit", "okx", "bitget"],
-    index=0,
-    help="auto tries each in turn and uses the first that responds")
 ltf = st.sidebar.selectbox("Timeframe", ["1h", "4h", "1d"], index=1)
 top = st.sidebar.slider("Symbols to scan", 10, 150, 40, step=10)
 min_vol = st.sidebar.select_slider(
-    "Min 24h volume",
-    options=[10e6, 30e6, 50e6, 100e6, 250e6],
+    "Min 24h volume", options=[10e6, 30e6, 50e6, 100e6, 250e6],
     value=30e6, format_func=lambda v: f"${v/1e6:.0f}M")
 
 st.sidebar.subheader("Filters")
@@ -197,31 +243,35 @@ min_rr = st.sidebar.slider("Minimum R:R", 1.5, 5.0, 2.0, step=0.25)
 max_stop_atr = st.sidebar.slider("Max stop (ATR)", 1.5, 6.0, 3.5, step=0.25)
 
 
-tab_scan, tab_bt, tab_journal, tab_help = st.tabs(
-    ["Live Scan", "Backtest", "Journal", "How to use"])
+tab_scan, tab_bt, tab_ex, tab_journal, tab_help = st.tabs(
+    ["Live Scan", "Backtest", "Exchanges", "Journal", "How to use"])
 
 
-# ---------------- live scan ----------------
+# ============================================================
+# live scan
+# ============================================================
 with tab_scan:
     st.subheader("Live scan")
-    st.caption(f"Scanning top {top} symbols on {ltf}. "
-               f"Grade {min_grade} and above. Signals from the last {recent} bars.")
+    st.caption(f"Exchange: {exch}. Timeframe {ltf}. Grade {min_grade}+. "
+               f"Signals from the last {recent} bars.")
 
     if st.button("Run scan", type="primary"):
         with st.spinner("Scanning. First run downloads candles - allow 1 to 2 minutes..."):
             setups, used = cached_scan(
-                exch_pref, top, min_vol, ltf, min_rr, max_stop_atr,
-                risk_pct, equity, recent, min_grade)
+                exch, top, min_vol, ltf, min_rr, max_stop_atr,
+                risk_pct, equity, recent, min_grade, exch,
+                proxy_url.strip() or None)
         st.session_state["setups"] = setups
         st.session_state["used_ex"] = used
 
     if st.session_state.get("used_ex"):
         used = st.session_state["used_ex"]
-        if used == "binanceusdm":
+        if used == exch or exch == "auto":
             st.success(f"Connected to {used}")
         else:
-            st.info(f"Using {used} (binance unavailable from this region - "
-                    f"same data, no problem)")
+            st.info(f"You asked for {exch}, it was unreachable. Using {used}.")
+        if used in ("binance", "binanceus"):
+            st.caption("Spot route. Symbols look like BTC/USDT.")
 
     setups = st.session_state.get("setups", [])
     stats_src = load_stats()
@@ -319,14 +369,16 @@ with tab_scan:
                     st.link_button("Open chart on TradingView", tv_link(s.symbol))
 
 
-# ---------------- backtest ----------------
+# ============================================================
+# backtest
+# ============================================================
 with tab_bt:
     st.subheader("Backtest")
     st.caption("Same logic, bar by bar, with fees and slippage. "
                "Writes edge_stats.json which calibrates the ratings.")
 
+    default_sym = "BTC/USDT:USDT" if exch == "binanceusdm" else "BTC/USDT"
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    default_sym = "BTC/USDT:USDT" if exch_pref == "binanceusdm" else "BTC/USDT"
     bt_symbol = c1.text_input("Symbol", default_sym)
     bt_ltf = c2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1, key="bt_tf")
     bt_limit = c3.number_input("Bars", 1000, 20000, 6000, step=500)
@@ -335,9 +387,10 @@ with tab_bt:
     if bt_go:
         with st.spinner("Backtesting. Downloading history if needed..."):
             curve, trades, n_raw, n_kept, used = cached_backtest(
-                exch_pref, bt_symbol, bt_ltf, int(bt_limit),
-                min_rr, max_stop_atr, risk_pct, equity)
-        st.session_state["bt"] = (curve, trades, n_raw, n_kept, bt_symbol, bt_ltf, used)
+                exch, bt_symbol, bt_ltf, int(bt_limit), min_rr,
+                max_stop_atr, risk_pct, equity, exch, proxy_url.strip() or None)
+        st.session_state["bt"] = (curve, trades, n_raw, n_kept,
+                                  bt_symbol, bt_ltf, used)
 
     if "bt" in st.session_state:
         curve, trades, n_raw, n_kept, sym_used, tf_used, used = st.session_state["bt"]
@@ -367,15 +420,14 @@ with tab_bt:
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=curve.index, y=curve["equity"],
-                                     name="equity", line=dict(width=2, color="#22c55e")))
+                                     line=dict(width=2, color="#22c55e")))
             fig.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0),
                               title="Equity curve", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
             dd_fig = go.Figure()
             dd_fig.add_trace(go.Scatter(x=curve.index, y=curve["dd"] * 100,
-                                        name="drawdown", fill="tozeroy",
-                                        line=dict(color="#ef4444")))
+                                        fill="tozeroy", line=dict(color="#ef4444")))
             dd_fig.update_layout(height=180, margin=dict(l=0, r=0, t=30, b=0),
                                  title="Drawdown %", template="plotly_dark")
             st.plotly_chart(dd_fig, use_container_width=True)
@@ -406,7 +458,62 @@ with tab_bt:
                                "trades.csv", "text/csv")
 
 
-# ---------------- journal ----------------
+# ============================================================
+# exchanges
+# ============================================================
+with tab_ex:
+    st.subheader("Exchange health")
+    st.caption("Tests every venue live from this server.")
+
+    c1, c2 = st.columns(2)
+    if c1.button("Test exchanges"):
+        with st.spinner("probing..."):
+            st.session_state["health"] = cached_probe(proxy_url.strip() or None)
+    if c2.button("Test Binance proxy"):
+        if not proxy_url.strip():
+            st.warning("Paste your worker URL in the sidebar first.")
+        else:
+            with st.spinner("asking the worker..."):
+                st.session_state["proxy_h"] = cached_proxy_health(proxy_url.strip())
+
+    if st.session_state.get("proxy_h"):
+        ph = st.session_state["proxy_h"]
+        st.markdown("**Worker upstream health**")
+        st.json(ph)
+        if any(x.get("ok") for x in ph.get("spot", [])):
+            st.success("Spot route healthy. Use exchange = binance, symbols like BTC/USDT.")
+        if not any(x.get("ok") for x in ph.get("futures", [])):
+            st.info("Futures upstreams are CloudFront-blocked. The worker maps /fapi "
+                    "to spot, so just use exchange = binance.")
+
+    h2 = st.session_state.get("health")
+    if h2:
+        st.dataframe(pd.DataFrame([{
+            "exchange": n,
+            "reachable": "YES" if r["ok"] else "no",
+            "markets": r.get("markets", 0),
+            "latency_ms": r["ms"],
+            "error": r.get("error", ""),
+        } for n, r in h2.items()]), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Route that works")
+    st.markdown("""
+Binance blocks US datacentre IPs with HTTP 451. Only
+`api-gcp.binance.com` is reachable through Cloudflare (everything else sits
+behind AWS CloudFront and returns 403).
+
+So: **exchange = `binance`** (spot) + your worker URL. Symbols look like
+`BTC/USDT`.
+
+Verify the worker in your browser first:
+- `<worker>/api/v3/exchangeInfo`  -> must return JSON
+""")
+
+
+# ============================================================
+# journal
+# ============================================================
 with tab_journal:
     st.subheader("Trade journal")
     st.caption("Log every trade. The 'followed rules' column is the one that matters.")
@@ -446,52 +553,34 @@ with tab_journal:
         st.caption("No journal yet.")
 
 
-# ---------------- help ----------------
+# ============================================================
+# help
+# ============================================================
 with tab_help:
     st.subheader("How to use this")
     st.markdown("""
 ### Daily routine
+Run after each 4-hour close: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.
 
-Run the scan just after each 4-hour close:
-**00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC.**
+1. Press Run scan
+2. Keep ACTIONABLE and BETTER_PRICE rows only
+3. Top 3 by confidence, maximum
+4. Total open risk under 3% of equity
+5. Limit order at entry, stop at stop loss, TP1 for 50%, TP2 for 50%
+6. Move stop to breakeven when TP1 fills
+7. Close anything open after 24 bars
 
-1. Press **Run scan**.
-2. Keep only rows marked **ACTIONABLE** or **BETTER_PRICE**.
-3. Take the top 3 by confidence, maximum.
-4. Total open risk must stay under 3% of equity.
-5. Limit order at entry. Stop at the stop loss. TP1 for 50%, TP2 for 50%.
-6. When TP1 fills, move the stop to breakeven. Never widen it.
-7. Close anything still open after 24 bars.
+### Grade
+A+ 88-100 take it | A 78-87 take it | B 66-77 take if room |
+C 52-65 watch | D below 52 skip
 
-### Grade meaning
+### Status
+ACTIONABLE price at entry | BETTER_PRICE pulled back past entry |
+RUNNING TP1 hit | EXTENDED ran away | INVALID stopped out
 
-| Grade | Confidence | Action |
-|---|---|---|
-| A+ | 88-100 | Take it |
-| A | 78-87 | Take it |
-| B | 66-77 | Take if you have room |
-| C | 52-65 | Watch |
-| D | below 52 | Skip |
-
-**est. TP1 hit rate** = chance price reaches TP1 before the stop.
-Heuristic until you run a backtest, then it becomes the real measured rate.
-
-### Status meaning
-
-- **ACTIONABLE** - price is at entry. Place the order.
-- **BETTER_PRICE** - price pulled back past entry. Better fill.
-- **RUNNING** - TP1 already hit. Manage the rest.
-- **EXTENDED** - price ran away. Wait.
-- **INVALID** - stop already hit. Skip.
-
-### Exchange note
-
-Binance blocks US IPs. The app auto-switches to Bybit or OKX when that
-happens - identical data, same symbols, no action needed from you.
-
-### Before real money
-
-Paper trade 4-8 weeks, minimum 30 signals. Then 25% size for 4 weeks.
+### Exchange
+Paste your Cloudflare worker URL in the sidebar, set exchange to
+`binance`, use symbols like `BTC/USDT`.
 """)
 
 

@@ -28,7 +28,7 @@ def run(df, signals, cfg, symbol="X"):
                            "tp2": d["tp2"], "entry": fill, "qty": qty,
                            "risk": risk, "bars": 0, "tp1_done": False,
                            "be": False, "entry_bar": t, "mae": 0.0,
-                           "score": d.get("score")}
+                           "score": d.get("score"), "grade": d.get("grade")}
                     equity -= qty * fill * fee
             pending = None
 
@@ -89,7 +89,7 @@ def run(df, signals, cfg, symbol="X"):
                     "symbol": symbol, "dir": d, "entry": entry, "exit": exit_price,
                     "r": (exit_price - entry) * sign / risk, "tag": tag,
                     "bars": pos["bars"], "mae_r": pos["mae"],
-                    "score": pos["score"],
+                    "score": pos["score"], "grade": pos["grade"],
                     "entry_ts": df.index[pos["entry_bar"]], "exit_ts": df.index[t],
                 })
                 pos = None

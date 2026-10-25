@@ -39,7 +39,25 @@ def report(trades, curve, cfg, bars_per_year=2190):
         "config_hash": cfg.fingerprint(),
     }
 
-
+def grade_stats(trades):
+    """Expectancy per grade. This tells you whether A grades actually work."""
+    if trades is None or trades.empty or "grade" not in trades.columns:
+        return pd.DataFrame()
+    rows = []
+    for g in ["A+", "A", "B", "C", "D"]:
+        sub = trades[trades["grade"] == g]
+        if sub.empty:
+            continue
+        rows.append({
+            "grade": g,
+            "trades": len(sub),
+            "win_rate": round(float((sub["r"] > 0).mean()) * 100, 1),
+            "expectancy_R": round(float(sub["r"].mean()), 3),
+            "total_R": round(float(sub["r"].sum()), 2),
+            "avg_mae_R": round(float(sub["mae_r"].mean()), 2),
+        })
+    return pd.DataFrame(rows)
+    
 def bucket_stats(trades, bucket_size=10):
     """
     Real historical hit rate per score bucket. This is what turns the

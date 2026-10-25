@@ -37,6 +37,9 @@ GRADE_COLOR = {"A+": "#16a34a", "A": "#22c55e", "B": "#eab308",
                "C": "#f97316", "D": "#ef4444"}
 
 
+# ============================================================
+# helpers
+# ============================================================
 def tv_link(symbol: str) -> str:
     base = symbol.split(":")[0].replace("/", "")
     suffix = ".P" if ":" in symbol else ""
@@ -82,6 +85,9 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     )
 
 
+# ============================================================
+# pipelines
+# ============================================================
 def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
     ex, ex_name = resolve_exchange(cfg, preferred=preferred, proxy=proxy)
     universe, note = build_universe(ex, cfg)
@@ -139,7 +145,7 @@ def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
     return found, ex_name, diag
 
 
-def backtest_pipeline(cfg, symbol, limit, preferred, proxy):
+def backtest_pipeline(cfg, symbol, limit, preferred, proxy, min_grade=None):
     ex, ex_name = resolve_exchange(cfg, preferred=preferred, proxy=proxy)
     df = load(ex, symbol, cfg.scan.ltf, limit=limit)
     if len(df) < 300:
@@ -155,17 +161,37 @@ def backtest_pipeline(cfg, symbol, limit, preferred, proxy):
     raw = scan_bos_retest(symbol, df, hb, ind, stt, zu, zd, cfg)
     setups = filter_setups(raw, ind, zu, zd, cfg)
 
+    stats_src = load_stats()
+    graded = []
+    for s in setups:
+        try:
+            row = ind.loc[s.ts]
+        except KeyError:
+            continue
+        zone = (zu[0] if zu else None) if s.direction == "long" \
+            else (zd[0] if zd else None)
+        rt = rate(s, row, zone, cfg, stats_src)
+        s.meta["rating"] = rt
+        if min_grade and GRADE_ORDER.index(rt.grade) > GRADE_ORDER.index(min_grade):
+            continue
+        graded.append(s)
+    setups = graded
+
     signals = {}
     for s in setups:
         loc = df.index.get_loc(s.ts)
         if loc not in signals:
             signals[loc] = {"dir": s.direction, "stop": s.stop,
-                            "tp1": s.tp1, "tp2": s.tp2, "score": s.score}
+                            "tp1": s.tp1, "tp2": s.tp2, "score": s.score,
+                            "grade": s.meta["rating"].grade}
 
     curve, trades = engine_run(df, signals, cfg, symbol)
     return curve, trades, len(raw), len(setups), ex_name
 
 
+# ============================================================
+# cached wrappers
+# ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_connection(exchange, proxy):
     cfg = build_cfg(exchange, 40, 30e6, "4h", 2.0, 3.5, 0.5, 10000.0)
@@ -183,10 +209,11 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr,
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_backtest(exchange, symbol, ltf, limit, min_rr,
-                    max_stop_atr, risk_pct, equity, preferred, proxy):
+                    max_stop_atr, risk_pct, equity, preferred, proxy,
+                    min_grade="D"):
     cfg = build_cfg(exchange, 40, 30e6, ltf, min_rr,
                     max_stop_atr, risk_pct, equity)
-    return backtest_pipeline(cfg, symbol, limit, preferred, proxy)
+    return backtest_pipeline(cfg, symbol, limit, preferred, proxy, min_grade)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -237,7 +264,7 @@ _top = st.sidebar.slider("Symbols to scan", 10, 150, 40, step=10)
 _min_vol = st.sidebar.select_slider(
     "Min 24h volume", options=[1e6, 5e6, 10e6, 30e6, 50e6, 100e6],
     value=5e6, format_func=lambda v: f"${v/1e6:.0f}M",
-    help="Binance US is thin - use $5M or lower")
+    help="Thin venues like Binance US need $5M or lower")
 
 st.sidebar.subheader("Filters")
 recent = st.sidebar.slider("Signal freshness (bars)", 1, 24, 6,
@@ -288,12 +315,11 @@ with tab_scan:
                          expanded=not st.session_state.get("setups")):
             st.json(d)
             if d["universe"] == 0:
-                st.error("Universe is empty. Lower Min 24h volume in the sidebar.")
+                st.error("Universe empty. Lower Min 24h volume.")
             elif d["loaded"] == 0:
                 st.error("No symbols loaded enough history.")
             elif d["raw_signals"] == 0:
-                st.warning("No raw signals at all. Try freshness = 24, "
-                           "and check that bars are sufficient.")
+                st.warning("No raw signals at all. Increase freshness.")
             elif d["after_grade"] == 0:
                 st.info("Signals existed but none met the grade. Lower Minimum grade.")
 
@@ -396,24 +422,33 @@ with tab_bt:
     bt_limit = c3.number_input("Bars", 1000, 30000, max(6000, need), step=500)
     bt_go = c4.button("Run backtest", type="primary")
 
+    bt_min_grade = st.selectbox(
+        "Minimum grade in backtest",
+        ["D", "C", "B", "A", "A+"], index=0,
+        help="D = test every filtered setup. A+ = test only the best. "
+             "Run D first, then A+ to see if the grading actually works.")
+
     if bt_go:
         with st.spinner("Backtesting. Downloading history if needed..."):
             curve, trades, n_raw, n_kept, used = cached_backtest(
                 exch, bt_symbol, bt_ltf, int(bt_limit), min_rr,
-                max_stop_atr, risk_pct, equity, exch, proxy)
+                max_stop_atr, risk_pct, equity, exch, proxy, bt_min_grade)
         st.session_state["bt"] = (curve, trades, n_raw, n_kept,
-                                  bt_symbol, bt_ltf, used)
+                                  bt_symbol, bt_ltf, used, bt_min_grade)
 
     if "bt" in st.session_state:
-        curve, trades, n_raw, n_kept, sym_used, tf_used, used = st.session_state["bt"]
-        st.caption(f"{sym_used} {tf_used} via {used}: "
-                   f"{n_raw} raw signals -> {n_kept} after filters")
+        (curve, trades, n_raw, n_kept, sym_used, tf_used,
+         used, grade_used) = st.session_state["bt"]
+        st.caption(f"{sym_used} {tf_used} via {used} | min grade {grade_used}: "
+                   f"{n_raw} raw signals -> {n_kept} after filters and grade")
 
         if trades is None or trades.empty:
-            st.warning("No trades. Lower Minimum R:R to 1.5, raise Max stop ATR to 4.5.")
+            st.warning("No trades. Lower Minimum R:R to 1.5, raise Max stop ATR "
+                       "to 4.5, or set Minimum grade back to D.")
         else:
             if len(trades) < 30:
-                st.warning(f"Only {len(trades)} trades - too few. Raise the bar count.")
+                st.warning(f"Only {len(trades)} trades - too few to conclude "
+                           f"anything. Raise the bar count.")
 
             stats = report(trades, curve, CFG)
             c = st.columns(5)
@@ -429,12 +464,28 @@ with tab_bt:
             c[3].metric("Avg MAE", f"{stats['avg_mae_R']} R")
             c[4].metric("Avg bars held", stats["avg_bars_held"])
 
+            st.subheader("Expectancy by grade")
+            gs = grade_stats(trades)
+            if not gs.empty:
+                st.dataframe(gs, use_container_width=True, hide_index=True)
+                st.caption("If A+ is positive and C is negative, the grading works "
+                           "and you should only trade the top grades.")
+            else:
+                st.caption("No grade data.")
+
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=curve.index, y=curve["equity"],
                                      line=dict(width=2, color="#22c55e")))
             fig.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0),
                               title="Equity curve", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
+
+            dd = go.Figure()
+            dd.add_trace(go.Scatter(x=curve.index, y=curve["dd"] * 100,
+                                    fill="tozeroy", line=dict(color="#ef4444")))
+            dd.update_layout(height=180, margin=dict(l=0, r=0, t=30, b=0),
+                             title="Drawdown %", template="plotly_dark")
+            st.plotly_chart(dd, use_container_width=True)
 
             st.subheader("Hit rate by score bucket")
             bs = bucket_stats(trades)
@@ -443,6 +494,7 @@ with tab_bt:
                     "score_from", "score_to", "win_rate", "trades", "expectancy_R"]),
                     use_container_width=True, hide_index=True)
                 pathlib.Path("edge_stats.json").write_text(json.dumps(bs, indent=2))
+                st.caption("edge_stats.json written - ratings are now empirical.")
             else:
                 st.caption("Not enough trades per bucket yet.")
 
@@ -456,6 +508,9 @@ with tab_bt:
 
             st.subheader("Last 50 trades")
             st.dataframe(trades.tail(50), use_container_width=True, hide_index=True)
+            st.download_button("Download all trades",
+                               trades.to_csv(index=False).encode("utf-8"),
+                               "trades.csv", "text/csv")
 
 
 # ============================================================
@@ -578,8 +633,15 @@ followed the rules. The rules column is the one that matters.
 
 ### 7. Weekly review, Sunday
 Re-run the backtest on BTC and ETH 4h. Compare live expectancy to
-backtest expectancy. If they diverge and rule adherence is under 90%,
-the problem is you, not the code.
+backtest expectancy.
+
+### The experiment ladder
+Change ONE thing at a time:
+1. Backtest with Minimum grade = A+ (does the grading work?)
+2. Max stop ATR 3.5 -> 2.0
+3. config.py adx_trend_min 20 -> 30
+4. Add a hard veto for >2.5 ATR from EMA50
+5. Pool BTC + ETH + SOL for more trades
 
 ### Grade
 A+ 88-100 take | A 78-87 take | B 66-77 take if room | C watch | D skip
@@ -587,10 +649,6 @@ A+ 88-100 take | A 78-87 take | B 66-77 take if room | C watch | D skip
 ### Status
 ACTIONABLE price at entry | BETTER_PRICE pulled back past entry |
 RUNNING TP1 hit | EXTENDED ran away | INVALID stopped out
-
-### If you get zero setups
-Open the diagnostics expander on the Live Scan tab. It tells you exactly
-where the funnel emptied: universe, loading, raw signals, filters, or grade.
 """)
 
 

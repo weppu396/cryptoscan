@@ -1,9 +1,9 @@
 """
-Candles + cache, with optional Cloudflare Worker proxy for Binance.
+Candles + cache. Multiple Binance routes, tested live.
 
-Binance geo-blocks US datacentre IPs. Only api-gcp.binance.com is reachable
-through Cloudflare. The proxy override is explicit, and symbols are
-auto-mapped onto whatever the resolved exchange actually lists.
+Binance geo-blocks US datacentre IPs. Cloudflare Workers do not help because
+they run in the colo nearest the CALLER (a US caller egresses from the US).
+So we test direct routes from the server instead, and use whichever works.
 """
 from dataclasses import replace
 import time
@@ -26,15 +26,25 @@ HTF_PER_DAY = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48,
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
+# names the app can pick. binance_vision and binanceus need no proxy.
 CANDIDATES = [
-    "binance", "binanceusdm", "bybit", "okx", "bitget",
-    "gateio", "kucoinfutures", "mexc", "htx",
+    "binance_vision", "binanceus", "okx", "binance", "binanceusdm",
+    "mexc", "kucoinfutures", "gateio", "bitget", "bybit", "htx",
 ]
 
+# pseudo-name -> (real ccxt class, base url override)
+ROUTES = {
+    "binance_vision": ("binance", "https://data-api.binance.vision"),
+    "binanceus": ("binanceus", None),
+    "binance": ("binance", None),
+    "binanceusdm": ("binanceusdm", None),
+}
+
 DEFAULT_TYPE = {
-    "binance": "spot", "binanceusdm": "future", "bybit": "swap",
-    "okx": "swap", "bitget": "swap", "gateio": "swap",
-    "kucoinfutures": "swap", "mexc": "swap", "htx": "swap",
+    "binance": "spot", "binance_vision": "spot", "binanceus": "spot",
+    "binanceusdm": "future", "bybit": "swap", "okx": "swap",
+    "bitget": "swap", "gateio": "swap", "kucoinfutures": "swap",
+    "mexc": "swap", "htx": "swap",
 }
 
 BINANCE_CLASSES = ("binance", "binanceusdm", "binanceus", "binancecoinm")
@@ -46,26 +56,20 @@ def min_bars_needed(cfg, htf_need=230):
     return int(HTF_PER_DAY.get(cfg.scan.htf, 6) * htf_need) + 600
 
 
-def _override_binance_urls(ex, proxy):
-    base = proxy.rstrip("/")
+def _set_api_base(ex, base):
+    b = base.rstrip("/")
     ex.urls["api"] = {
-        "public": f"{base}/api/v3",
-        "private": f"{base}/api/v3",
-        "v3": f"{base}/api/v3",
-        "sapi": f"{base}/sapi/v1",
-        "fapiPublic": f"{base}/fapi/v1",
-        "fapiPrivate": f"{base}/fapi/v1",
-        "fapiPublicV2": f"{base}/fapi/v2",
-        "fapiPrivateV2": f"{base}/fapi/v2",
-        "fapiPublicV3": f"{base}/fapi/v3",
-        "fapiPrivateV3": f"{base}/fapi/v3",
-        "dapiPublic": f"{base}/dapi/v1",
-        "dapiPrivate": f"{base}/dapi/v1",
+        "public": f"{b}/api/v3", "private": f"{b}/api/v3", "v3": f"{b}/api/v3",
+        "sapi": f"{b}/sapi/v1",
+        "fapiPublic": f"{b}/fapi/v1", "fapiPrivate": f"{b}/fapi/v1",
+        "fapiPublicV2": f"{b}/fapi/v2", "fapiPrivateV2": f"{b}/fapi/v2",
+        "dapiPublic": f"{b}/dapi/v1", "dapiPrivate": f"{b}/dapi/v1",
     }
 
 
 def get_exchange(name, proxy=None):
-    klass = getattr(ccxt, name)
+    real, base = ROUTES.get(name, (name, None))
+    klass = getattr(ccxt, real)
     ex = klass({
         "enableRateLimit": True,
         "timeout": 30_000,
@@ -74,63 +78,48 @@ def get_exchange(name, proxy=None):
                     "Accept": "application/json, text/plain, */*",
                     "Accept-Language": "en-US,en;q=0.9"},
     })
-    if proxy and name in BINANCE_CLASSES:
-        _override_binance_urls(ex, proxy)
+    if base and not proxy:
+        _set_api_base(ex, base)
+    if proxy and real in BINANCE_CLASSES:
+        _set_api_base(ex, proxy)
     return ex
 
 
-def resolve_symbol(ex, wanted: str) -> str:
-    """
-    Map a loose symbol like BTC/USDT onto something this exchange lists.
-    BTC/USDT <-> BTC/USDT:USDT are interchangeable across venues.
-    """
-    ex.load_markets()
-    if wanted in ex.markets:
-        return wanted
-
-    base = wanted.split(":")[0]
-    for cand in (f"{base}:USDT", f"{base}:USD", base):
-        if cand in ex.markets:
-            return cand
-
-    b, _, q = base.partition("/")
-    matches = [s for s, m in ex.markets.items()
-               if m.get("base") == b and m.get("quote") == q and m.get("active")]
-    if matches:
-        matches.sort(key=lambda s: ":" not in s)
-        return matches[0]
-
-    raise KeyError(f"'{wanted}' not listed on {ex.id}")
-
-
-def diagnose_binance(proxy):
+def probe_binance_routes(proxy=None):
+    """Runs FROM THIS SERVER. Tells you exactly which Binance route works."""
     import requests
+    tests = [
+        ("direct api.binance.com", "https://api.binance.com/api/v3/ping"),
+        ("data-api.binance.vision", "https://data-api.binance.vision/api/v3/ping"),
+        ("api.binance.us", "https://api.binance.us/api/v3/ping"),
+        ("api-gcp.binance.com", "https://api-gcp.binance.com/api/v3/ping"),
+        ("fapi.binance.com", "https://fapi.binance.com/fapi/v1/ping"),
+        ("bybit.com", "https://api.bybit.com/v5/market/time"),
+        ("okx.com", "https://www.okx.com/api/v5/public/time"),
+    ]
+    if proxy:
+        tests.append(("your proxy /api/v3/ping",
+                      proxy.rstrip("/") + "/api/v3/ping"))
+
     out = {}
-    if not proxy:
-        return {"error": "no proxy URL set"}
-    base = proxy.rstrip("/")
-
-    for label, url in [
-        ("worker_health", f"{base}/__health"),
-        ("api_ping", f"{base}/api/v3/ping"),
-        ("api_exchangeInfo", f"{base}/api/v3/exchangeInfo"),
-    ]:
+    for label, url in tests:
         try:
-            r = requests.get(url, timeout=25, headers={"User-Agent": BROWSER_UA})
-            out[label] = {"status": r.status_code, "bytes": len(r.text),
-                          "head": r.text[:150]}
+            r = requests.get(url, timeout=20, headers={"User-Agent": BROWSER_UA})
+            out[label] = {"status": r.status_code, "body": r.text[:70]}
         except Exception as e:
-            out[label] = {"error": f"{type(e).__name__}: {e}"}
+            out[label] = {"error": type(e).__name__}
+    return out
 
-    try:
-        ex = get_exchange("binance", proxy)
-        out["ccxt_url_public"] = ex.urls["api"].get("public")
-        mk = ex.load_markets()
-        out["ccxt_markets_loaded"] = len(mk)
-        out["ccxt_symbol_sample"] = list(mk.keys())[:5]
-    except Exception as e:
-        out["ccxt_error"] = f"{type(e).__name__}: {str(e)[:300]}"
 
+def diagnose_binance(proxy=None):
+    out = {"routes": probe_binance_routes(proxy)}
+    for name in ("binance_vision", "binanceus", "binance"):
+        try:
+            ex = get_exchange(name, proxy)
+            mk = ex.load_markets()
+            out[name] = {"markets": len(mk), "url": ex.urls["api"].get("public")}
+        except Exception as e:
+            out[name] = {"error": f"{type(e).__name__}: {str(e)[:180]}"}
     return out
 
 
@@ -185,9 +174,26 @@ def resolve_exchange(cfg, preferred=None, proxy=None, verbose=False):
                     print(f"[exchange] using {name}")
                 return ex, name
         except Exception as e:
-            LAST_ERRORS[name] = f"{type(e).__name__}: {str(e)[:200]}"
+            LAST_ERRORS[name] = f"{type(e).__name__}: {str(e)[:160]}"
 
     raise RuntimeError("no reachable exchange. see LAST_ERRORS")
+
+
+def resolve_symbol(ex, wanted: str) -> str:
+    ex.load_markets()
+    if wanted in ex.markets:
+        return wanted
+    base = wanted.split(":")[0]
+    for cand in (f"{base}:USDT", f"{base}:USD", base):
+        if cand in ex.markets:
+            return cand
+    b, _, q = base.partition("/")
+    matches = [s for s, m in ex.markets.items()
+               if m.get("base") == b and m.get("quote") == q and m.get("active")]
+    if matches:
+        matches.sort(key=lambda s: ":" not in s)
+        return matches[0]
+    raise KeyError(f"'{wanted}' not listed on {ex.id}")
 
 
 def build_universe(ex, cfg) -> list:

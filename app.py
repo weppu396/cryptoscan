@@ -14,8 +14,8 @@ import plotly.graph_objects as go
 import data as datamod
 from config import CFG
 from data import (resolve_exchange, probe_exchanges, probe_proxy,
-                  diagnose_binance, probe_binance_routes, build_universe,
-                  load, list_symbols, min_bars_needed, CANDIDATES)
+                  diagnose_binance, build_universe, load, list_symbols,
+                  min_bars_needed, CANDIDATES)
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.levels import build_zones
@@ -84,15 +84,25 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
 
 def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
     ex, ex_name = resolve_exchange(cfg, preferred=preferred, proxy=proxy)
-    universe = build_universe(ex, cfg)
+    universe, note = build_universe(ex, cfg)
+
+    diag = {"exchange": ex_name, "universe_note": note,
+            "universe": len(universe), "loaded": 0, "too_short": 0,
+            "raw_signals": 0, "after_filters": 0, "after_recency": 0,
+            "after_grade": 0, "errors": 0, "sample": universe[:8]}
+
+    bars = max(1500, min_bars_needed(cfg))
     stats = load_stats()
     found = []
 
     for sym in universe:
         try:
-            ltf = load(ex, sym, cfg.scan.ltf)
+            ltf = load(ex, sym, cfg.scan.ltf, limit=bars)
             if len(ltf) < 500:
+                diag["too_short"] += 1
                 continue
+            diag["loaded"] += 1
+
             ind = compute_all(ltf, cfg)
             stt = build_structure(ltf, cfg.structure)
             hb = htf_bias(ltf, cfg)
@@ -101,11 +111,15 @@ def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
             zd = build_zones(ltf, sw, ind["atr"], cfg.structure, "sup")
 
             raw = scan_bos_retest(sym, ltf, hb, ind, stt, zu, zd, cfg)
+            diag["raw_signals"] += len(raw)
+
             kept = filter_setups(raw, ind, zu, zd, cfg)
+            diag["after_filters"] += len(kept)
 
             if recent_bars is not None and kept:
                 cut = ltf.index[max(0, len(ltf) - 1 - recent_bars)]
                 kept = [s for s in kept if s.ts >= cut]
+            diag["after_recency"] += len(kept)
 
             for s in kept:
                 s.meta["status"] = setup_status(s, ltf)
@@ -116,12 +130,13 @@ def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
                 s.meta["rating"] = rt
                 if min_grade and GRADE_ORDER.index(rt.grade) > GRADE_ORDER.index(min_grade):
                     continue
+                diag["after_grade"] += 1
                 found.append(s)
         except Exception:
-            continue
+            diag["errors"] += 1
 
     found.sort(key=lambda s: (-s.meta["rating"].confidence, -s.score))
-    return found, ex_name
+    return found, ex_name, diag
 
 
 def backtest_pipeline(cfg, symbol, limit, preferred, proxy):
@@ -196,12 +211,12 @@ st.sidebar.title("CryptoScan")
 
 st.sidebar.subheader("Exchange")
 proxy_url = st.sidebar.text_input(
-    "Binance proxy URL", value="",
+    "Binance proxy URL (optional)", value="",
     placeholder="https://binance-proxy.you.workers.dev")
 proxy = proxy_url.strip() or None
 
 _opts = ["auto"] + CANDIDATES
-_default = _opts.index("binance") if "binance" in _opts else 0
+_default = _opts.index("okx") if "okx" in _opts else 0
 exch = st.sidebar.selectbox("Use this exchange", _opts, index=_default)
 
 if st.sidebar.button("Check connection"):
@@ -213,8 +228,6 @@ if st.sidebar.button("Check connection"):
         st.sidebar.success(f"resolved -> {name}")
     except Exception as e:
         st.sidebar.error(f"failed: {e}")
-        if datamod.LAST_ERRORS:
-            st.sidebar.json(datamod.LAST_ERRORS)
 
 if st.session_state.get("resolved"):
     st.sidebar.caption(f"active exchange: {st.session_state['resolved']}")
@@ -222,13 +235,15 @@ if st.session_state.get("resolved"):
 ltf = st.sidebar.selectbox("Timeframe", ["1h", "4h", "1d"], index=1)
 _top = st.sidebar.slider("Symbols to scan", 10, 150, 40, step=10)
 _min_vol = st.sidebar.select_slider(
-    "Min 24h volume", options=[10e6, 30e6, 50e6, 100e6, 250e6],
-    value=30e6, format_func=lambda v: f"${v/1e6:.0f}M")
+    "Min 24h volume", options=[1e6, 5e6, 10e6, 30e6, 50e6, 100e6],
+    value=5e6, format_func=lambda v: f"${v/1e6:.0f}M",
+    help="Binance US is thin - use $5M or lower")
 
 st.sidebar.subheader("Filters")
-recent = st.sidebar.slider("Signal freshness (bars)", 1, 12, 2)
+recent = st.sidebar.slider("Signal freshness (bars)", 1, 24, 6,
+                           help="On 4h, 6 bars = 24 hours")
 min_grade = st.sidebar.select_slider("Minimum grade", GRADE_ORDER, value="B")
-only_ok = st.sidebar.checkbox("Show only actionable", value=True)
+only_ok = st.sidebar.checkbox("Show only actionable", value=False)
 _limit = st.sidebar.slider("Max results", 3, 40, 10)
 
 st.sidebar.subheader("Risk")
@@ -253,11 +268,12 @@ with tab_scan:
 
     if st.button("Run scan", type="primary"):
         with st.spinner("Scanning. Allow 1 to 2 minutes..."):
-            setups, used = cached_scan(
+            setups, used, diag = cached_scan(
                 exch, _top, _min_vol, ltf, min_rr, max_stop_atr,
                 risk_pct, equity, recent, min_grade, exch, proxy)
         st.session_state["setups"] = setups
         st.session_state["used_ex"] = used
+        st.session_state["diag"] = diag
 
     if st.session_state.get("used_ex"):
         used = st.session_state["used_ex"]
@@ -266,8 +282,23 @@ with tab_scan:
         else:
             st.info(f"You asked for {exch}, unreachable. Using {used}.")
 
+    if st.session_state.get("diag"):
+        d = st.session_state["diag"]
+        with st.expander("scan diagnostics - read this if you get zero results",
+                         expanded=not st.session_state.get("setups")):
+            st.json(d)
+            if d["universe"] == 0:
+                st.error("Universe is empty. Lower Min 24h volume in the sidebar.")
+            elif d["loaded"] == 0:
+                st.error("No symbols loaded enough history.")
+            elif d["raw_signals"] == 0:
+                st.warning("No raw signals at all. Try freshness = 24, "
+                           "and check that bars are sufficient.")
+            elif d["after_grade"] == 0:
+                st.info("Signals existed but none met the grade. Lower Minimum grade.")
+
     if datamod.LAST_ERRORS:
-        with st.expander("exchanges that were skipped"):
+        with st.expander("exchanges skipped"):
             st.json(datamod.LAST_ERRORS)
 
     setups = st.session_state.get("setups", [])
@@ -278,75 +309,72 @@ with tab_scan:
         st.caption("Ratings use heuristic base rates. Run a backtest to calibrate.")
 
     if not setups:
-        st.info("No results yet. Press Run scan. Zero setups is normal.")
+        st.info("No results yet. Open the diagnostics expander above for the reason.")
     else:
         rows = [s for s in setups
                 if (not only_ok) or s.meta.get("status") in OK_STATUS][:_limit]
         st.caption(f"{len(setups)} graded signals, {len(rows)} shown")
 
-        if not rows:
-            st.warning("Signals exist but none actionable. Uncheck 'Show only actionable'.")
-        else:
-            table = pd.DataFrame([{
-                "grade": s.meta["rating"].grade,
-                "conf": s.meta["rating"].confidence,
-                "verdict": s.meta["rating"].verdict,
-                "est_win%": s.meta["rating"].est_win_rate,
-                "symbol": s.symbol, "dir": s.direction.upper(),
-                "status": s.meta.get("status"),
-                "entry": round(s.entry, 6), "stop": round(s.stop, 6),
-                "tp1": round(s.tp1, 6), "tp2": round(s.tp2, 6),
-                "R:R": round(s.rr, 2), "stop_ATR": round(s.stop_atr, 2),
-                "qty": round(s.meta.get("qty", 0), 6),
-                "risk_$": round(s.meta.get("risk_cash", 0), 2),
-                "signal_bar": s.ts.strftime("%Y-%m-%d %H:%M"),
-            } for s in rows])
+        table = pd.DataFrame([{
+            "grade": s.meta["rating"].grade,
+            "conf": s.meta["rating"].confidence,
+            "verdict": s.meta["rating"].verdict,
+            "est_win%": s.meta["rating"].est_win_rate,
+            "symbol": s.symbol, "dir": s.direction.upper(),
+            "status": s.meta.get("status"),
+            "entry": round(s.entry, 6), "stop": round(s.stop, 6),
+            "tp1": round(s.tp1, 6), "tp2": round(s.tp2, 6),
+            "R:R": round(s.rr, 2), "stop_ATR": round(s.stop_atr, 2),
+            "qty": round(s.meta.get("qty", 0), 6),
+            "risk_$": round(s.meta.get("risk_cash", 0), 2),
+            "signal_bar": s.ts.strftime("%Y-%m-%d %H:%M"),
+        } for s in rows])
 
-            st.dataframe(table, use_container_width=True, hide_index=True)
-            st.download_button("Download as CSV",
-                               table.to_csv(index=False).encode("utf-8"),
-                               "setups.csv", "text/csv")
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.download_button("Download as CSV",
+                           table.to_csv(index=False).encode("utf-8"),
+                           "setups.csv", "text/csv")
 
-            st.divider()
-            for s in rows:
-                rt = s.meta["rating"]
-                stop_dist = abs(s.entry - s.stop)
-                header = (f"{rt.grade}   {s.symbol}   {s.direction.upper()}   "
-                          f"conf {rt.confidence}   [{s.meta.get('status')}]")
-                with st.expander(header, expanded=(rt.grade in ("A+", "A"))):
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.markdown(
-                        f"<h2 style='color:{GRADE_COLOR[rt.grade]};margin:0'>"
-                        f"{rt.grade}</h2>", unsafe_allow_html=True)
-                    c2.metric("Confidence", f"{rt.confidence}/100")
-                    c3.metric("Est. TP1 hit", f"{rt.est_win_rate}%")
-                    c4.metric("Verdict", rt.verdict)
-                    st.caption(f"probability basis: {rt.basis}")
+        st.divider()
+        for s in rows:
+            rt = s.meta["rating"]
+            stop_dist = abs(s.entry - s.stop)
+            header = (f"{rt.grade}   {s.symbol}   {s.direction.upper()}   "
+                      f"conf {rt.confidence}   [{s.meta.get('status')}]")
+            with st.expander(header, expanded=(rt.grade in ("A+", "A"))):
+                c1, c2, c3, c4 = st.columns(4)
+                c1.markdown(
+                    f"<h2 style='color:{GRADE_COLOR[rt.grade]};margin:0'>"
+                    f"{rt.grade}</h2>", unsafe_allow_html=True)
+                c2.metric("Confidence", f"{rt.confidence}/100")
+                c3.metric("Est. TP1 hit", f"{rt.est_win_rate}%")
+                c4.metric("Verdict", rt.verdict)
+                st.caption(f"probability basis: {rt.basis}")
 
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Entry", f"{s.entry:,.4f}")
-                    c2.metric("Stop loss", f"{s.stop:,.4f}",
-                              f"-{s.stop_atr:.2f} ATR", delta_color="inverse")
-                    c3.metric("R:R", f"{s.rr:.2f}")
-                    c1.metric("Take profit 1", f"{s.tp1:,.4f}",
-                              f"+{abs(s.tp1-s.entry)/stop_dist:.1f}R")
-                    c2.metric("Take profit 2", f"{s.tp2:,.4f}", f"+{s.rr:.1f}R")
-                    c3.metric("Size", f"{s.meta.get('qty', 0):,.4f}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Entry", f"{s.entry:,.4f}")
+                c2.metric("Stop loss", f"{s.stop:,.4f}",
+                          f"-{s.stop_atr:.2f} ATR", delta_color="inverse")
+                c3.metric("R:R", f"{s.rr:.2f}")
+                c1.metric("Take profit 1", f"{s.tp1:,.4f}",
+                          f"+{abs(s.tp1-s.entry)/stop_dist:.1f}R")
+                c2.metric("Take profit 2", f"{s.tp2:,.4f}", f"+{s.rr:.1f}R")
+                c3.metric("Size", f"{s.meta.get('qty', 0):,.4f}")
 
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.markdown("**Works in favour**")
-                        for x in rt.positives:
-                            st.markdown(f":green[+ ] {x}")
-                    with col_b:
-                        st.markdown("**Works against**")
-                        for x in (rt.negatives or ["nothing material"]):
-                            st.markdown(f":red[- ] {x}")
-                    if rt.improve:
-                        st.markdown("**To upgrade this setup**")
-                        for x in rt.improve:
-                            st.markdown(f"> {x}")
-                    st.link_button("Open chart on TradingView", tv_link(s.symbol))
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown("**Works in favour**")
+                    for x in rt.positives:
+                        st.markdown(f":green[+ ] {x}")
+                with col_b:
+                    st.markdown("**Works against**")
+                    for x in (rt.negatives or ["nothing material"]):
+                        st.markdown(f":red[- ] {x}")
+                if rt.improve:
+                    st.markdown("**To upgrade this setup**")
+                    for x in rt.improve:
+                        st.markdown(f"> {x}")
+                st.link_button("Open chart on TradingView", tv_link(s.symbol))
 
 
 # ============================================================
@@ -358,29 +386,17 @@ with tab_bt:
 
     need = min_bars_needed(build_cfg(exch, 40, 30e6, ltf, min_rr,
                                      max_stop_atr, risk_pct, equity))
-    st.info(f"Bars needed for a {CFG.scan.htf} bias on {ltf}: **{need}**. "
-            f"Use 4h for reliable results.")
+    st.info(f"Bars needed for a {CFG.scan.htf} bias on {ltf}: **{need}**. Use 4h.")
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    syms = st.session_state.get("symbols") or ["BTC/USDT", "BTC/USDT:USDT",
-                                               "ETH/USDT", "ETH/USDT:USDT"]
-    default_idx = 0
-    for i, s in enumerate(syms):
-        if s.startswith("BTC/USDT"):
-            default_idx = i
-            break
-    bt_symbol = c1.selectbox("Symbol", syms, index=default_idx)
+    syms = st.session_state.get("symbols") or ["BTC/USDT", "ETH/USDT",
+                                               "BTC/USDT:USDT", "ETH/USDT:USDT"]
+    bt_symbol = c1.selectbox("Symbol", syms, index=0)
     bt_ltf = c2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1, key="bt_tf")
     bt_limit = c3.number_input("Bars", 1000, 30000, max(6000, need), step=500)
     bt_go = c4.button("Run backtest", type="primary")
 
-    if not st.session_state.get("symbols"):
-        st.caption("Tip: press 'Check connection' in the sidebar first to load the "
-                   "real symbol list for this exchange.")
-
     if bt_go:
-        if int(bt_limit) < need:
-            st.warning(f"{int(bt_limit)} bars supplied, {need} needed. Results may be empty.")
         with st.spinner("Backtesting. Downloading history if needed..."):
             curve, trades, n_raw, n_kept, used = cached_backtest(
                 exch, bt_symbol, bt_ltf, int(bt_limit), min_rr,
@@ -394,8 +410,7 @@ with tab_bt:
                    f"{n_raw} raw signals -> {n_kept} after filters")
 
         if trades is None or trades.empty:
-            st.warning("No trades. Check the bars warning, lower Minimum R:R to 1.5, "
-                       "raise Max stop ATR to 4.5.")
+            st.warning("No trades. Lower Minimum R:R to 1.5, raise Max stop ATR to 4.5.")
         else:
             if len(trades) < 30:
                 st.warning(f"Only {len(trades)} trades - too few. Raise the bar count.")
@@ -420,13 +435,6 @@ with tab_bt:
             fig.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0),
                               title="Equity curve", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
-
-            dd = go.Figure()
-            dd.add_trace(go.Scatter(x=curve.index, y=curve["dd"] * 100,
-                                    fill="tozeroy", line=dict(color="#ef4444")))
-            dd.update_layout(height=180, margin=dict(l=0, r=0, t=30, b=0),
-                             title="Drawdown %", template="plotly_dark")
-            st.plotly_chart(dd, use_container_width=True)
 
             st.subheader("Hit rate by score bucket")
             bs = bucket_stats(trades)
@@ -467,15 +475,14 @@ with tab_ex:
                 st.session_state["proxy_h"] = cached_proxy_health(proxy)
     if c3.button("Diagnose binance"):
         with st.spinner("testing every route from this server..."):
-            st.session_state["diag"] = cached_diagnose(proxy or None)
+            st.session_state["diag_bi"] = cached_diagnose(proxy)
 
-    if st.session_state.get("diag"):
-        d = st.session_state["diag"]
+    if st.session_state.get("diag_bi"):
+        d = st.session_state["diag_bi"]
         st.json(d)
-        if d.get("ccxt_markets_loaded"):
-            st.success(f"binance works: {d['ccxt_markets_loaded']} markets loaded.")
-        elif d.get("ccxt_error"):
-            st.error(d["ccxt_error"])
+        for k in ("binanceus", "binance_vision", "binance"):
+            if d.get(k, {}).get("markets"):
+                st.success(f"{k} works: {d[k]['markets']} markets")
 
     if st.session_state.get("proxy_h"):
         st.markdown("### worker upstreams")
@@ -484,83 +491,3 @@ with tab_ex:
     if st.session_state.get("health"):
         st.markdown("### venue probe")
         st.dataframe(pd.DataFrame([{
-            "exchange": n, "reachable": "YES" if r["ok"] else "no",
-            "markets": r.get("markets", 0), "ms": r["ms"],
-            "error": r.get("error", ""),
-        } for n, r in st.session_state["health"].items()]),
-            use_container_width=True, hide_index=True)
-
-    if datamod.LAST_ERRORS:
-        st.markdown("### resolution errors")
-        st.json(datamod.LAST_ERRORS)
-
-
-# ============================================================
-# journal
-# ============================================================
-with tab_journal:
-    st.subheader("Trade journal")
-    with st.form("journal_form", clear_on_submit=True):
-        c1, c2, c3, c4 = st.columns(4)
-        j_symbol = c1.text_input("Symbol")
-        j_dir = c2.selectbox("Direction", ["long", "short"])
-        j_grade = c3.selectbox("Grade", GRADE_ORDER)
-        j_result = c4.number_input("Result (R)", -5.0, 30.0, 0.0, step=0.1)
-        c5, c6 = st.columns(2)
-        j_followed = c5.selectbox("Followed the rules?", ["yes", "no"])
-        j_notes = c6.text_input("Notes")
-        if st.form_submit_button("Add trade") and j_symbol:
-            row = pd.DataFrame([{
-                "date": pd.Timestamp.utcnow().date().isoformat(),
-                "symbol": j_symbol, "dir": j_dir, "grade": j_grade,
-                "result_R": j_result, "followed": j_followed, "notes": j_notes}])
-            try:
-                old = pd.read_csv("journal.csv")
-                row = pd.concat([old, row], ignore_index=True)
-            except FileNotFoundError:
-                pass
-            row.to_csv("journal.csv", index=False)
-            st.success(f"Logged {j_symbol}")
-
-    try:
-        j = pd.read_csv("journal.csv")
-        if not j.empty:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades logged", len(j))
-            c2.metric("Expectancy", f"{j['result_R'].mean():.2f} R")
-            c3.metric("Win rate", f"{(j['result_R'] > 0).mean() * 100:.0f}%")
-            c4.metric("Rule adherence", f"{(j['followed'] == 'yes').mean() * 100:.0f}%")
-            st.dataframe(j, use_container_width=True, hide_index=True)
-    except FileNotFoundError:
-        st.caption("No journal yet.")
-
-
-# ============================================================
-# help
-# ============================================================
-with tab_help:
-    st.subheader("How to use this")
-    st.markdown("""
-### Order of operations
-1. Paste worker URL in the sidebar (if using binance)
-2. Press **Check connection** - this loads the real symbol list
-3. Go to **Backtest**, pick a symbol from the dropdown, use **4h** and **6000** bars
-4. Then go to **Live Scan** and press **Run scan**
-
-### Minimum bars
-HTF bias needs 200 daily candles:
-- 4h -> 2,000 bars  (use this)
-- 1h -> 6,100 bars
-- 1d -> 2,000 bars
-
-### Grade
-A+ 88-100 take | A 78-87 take | B 66-77 take if room | C watch | D skip
-
-### Status
-ACTIONABLE price at entry | BETTER_PRICE pulled back past entry |
-RUNNING TP1 hit | EXTENDED ran away | INVALID stopped out
-""")
-
-
-st.sidebar.divider()
-st.sidebar.caption("Not financial advice. Backtest before risking money.")

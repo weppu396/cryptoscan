@@ -288,3 +288,7 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df = df.drop_duplicates("ts").set_index("ts").sort_index().astype(float)
+    if not df.empty:
+        df.to_parquet(key)
+    return df

@@ -2,8 +2,7 @@
 Candles + cache. Multiple Binance routes, tested live.
 
 Binance geo-blocks US datacentre IPs. Cloudflare Workers do not help because
-they run in the colo nearest the CALLER (a US caller egresses from the US).
-So we test direct routes from the server instead, and use whichever works.
+they run in the colo nearest the CALLER. So we test direct routes instead.
 """
 from dataclasses import replace
 import time
@@ -26,13 +25,16 @@ HTF_PER_DAY = {"1m": 1440, "5m": 288, "15m": 96, "30m": 48,
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-# names the app can pick. binance_vision and binanceus need no proxy.
+FALLBACK_MAJORS = [
+    "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK",
+    "DOT", "LTC", "ATOM", "NEAR", "APT", "ARB", "OP", "SUI", "INJ",
+]
+
 CANDIDATES = [
-    "binance_vision", "binanceus", "okx", "binance", "binanceusdm",
+    "okx", "binanceus", "binance_vision", "binance", "binanceusdm",
     "mexc", "kucoinfutures", "gateio", "bitget", "bybit", "htx",
 ]
 
-# pseudo-name -> (real ccxt class, base url override)
 ROUTES = {
     "binance_vision": ("binance", "https://data-api.binance.vision"),
     "binanceus": ("binanceus", None),
@@ -86,21 +88,17 @@ def get_exchange(name, proxy=None):
 
 
 def probe_binance_routes(proxy=None):
-    """Runs FROM THIS SERVER. Tells you exactly which Binance route works."""
     import requests
     tests = [
         ("direct api.binance.com", "https://api.binance.com/api/v3/ping"),
         ("data-api.binance.vision", "https://data-api.binance.vision/api/v3/ping"),
         ("api.binance.us", "https://api.binance.us/api/v3/ping"),
-        ("api-gcp.binance.com", "https://api-gcp.binance.com/api/v3/ping"),
         ("fapi.binance.com", "https://fapi.binance.com/fapi/v1/ping"),
         ("bybit.com", "https://api.bybit.com/v5/market/time"),
         ("okx.com", "https://www.okx.com/api/v5/public/time"),
     ]
     if proxy:
-        tests.append(("your proxy /api/v3/ping",
-                      proxy.rstrip("/") + "/api/v3/ping"))
-
+        tests.append(("your proxy", proxy.rstrip("/") + "/api/v3/ping"))
     out = {}
     for label, url in tests:
         try:
@@ -113,7 +111,7 @@ def probe_binance_routes(proxy=None):
 
 def diagnose_binance(proxy=None):
     out = {"routes": probe_binance_routes(proxy)}
-    for name in ("binance_vision", "binanceus", "binance"):
+    for name in ("binanceus", "binance_vision", "binance"):
         try:
             ex = get_exchange(name, proxy)
             mk = ex.load_markets()
@@ -196,14 +194,27 @@ def resolve_symbol(ex, wanted: str) -> str:
     raise KeyError(f"'{wanted}' not listed on {ex.id}")
 
 
-def build_universe(ex, cfg) -> list:
+def build_universe(ex, cfg) -> tuple:
+    """
+    Returns (symbols, note). Progressively relaxes the volume filter and
+    falls back to majors if tickers are unavailable - otherwise a thin
+    venue like Binance US yields an empty universe with no error.
+    """
     ex.load_markets()
+    tickers = {}
     try:
         tickers = ex.fetch_tickers()
     except Exception:
-        tickers = {}
+        pass
 
-    rows = []
+    def qv_of(sym):
+        t = tickers.get(sym) or {}
+        q = float(t.get("quoteVolume") or 0.0)
+        if q == 0.0 and t.get("baseVolume") and t.get("last"):
+            q = float(t["baseVolume"]) * float(t["last"])
+        return q
+
+    cands = []
     for sym, m in ex.markets.items():
         if not m.get("active") or m.get("quote") != cfg.scan.quote:
             continue
@@ -211,15 +222,27 @@ def build_universe(ex, cfg) -> list:
             continue
         if not (m.get("swap") or m.get("spot")):
             continue
-        t = tickers.get(sym) or {}
-        qv = float(t.get("quoteVolume") or 0.0)
-        if qv == 0.0 and t.get("baseVolume") and t.get("last"):
-            qv = float(t["baseVolume"]) * float(t["last"])
-        rows.append((sym, qv))
+        cands.append((sym, qv_of(sym)))
 
-    rows = [r for r in rows if r[1] >= cfg.scan.min_quote_vol_24h]
-    rows.sort(key=lambda r: -r[1])
-    return [s for s, _ in rows][: cfg.scan.top_n_symbols]
+    if not cands:
+        return [], "no USDT markets found"
+
+    if all(q == 0 for _, q in cands):
+        syms = sorted(s for s, m in ex.markets.items()
+                      if m.get("base") in FALLBACK_MAJORS
+                      and m.get("quote") == cfg.scan.quote and m.get("active"))
+        return syms[:cfg.scan.top_n_symbols], "tickers unavailable, using majors"
+
+    note = f"volume filter ${cfg.scan.min_quote_vol_24h/1e6:.0f}M"
+    for thr in (cfg.scan.min_quote_vol_24h, 20e6, 10e6, 5e6, 1e6, 0.0):
+        keep = [c for c in cands if c[1] >= thr]
+        if len(keep) >= 15 or thr == 0.0:
+            if thr != cfg.scan.min_quote_vol_24h:
+                note = f"volume filter relaxed to ${thr/1e6:.0f}M"
+            break
+
+    keep.sort(key=lambda x: -x[1])
+    return [s for s, _ in keep][:cfg.scan.top_n_symbols], note
 
 
 def list_symbols(ex, quote="USDT", limit=800):
@@ -265,7 +288,3 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df = df.drop_duplicates("ts").set_index("ts").sort_index().astype(float)
-    if not df.empty:
-        df.to_parquet(key)
-    return df

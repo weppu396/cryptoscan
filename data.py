@@ -271,20 +271,34 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
     batch_limit = int(ex.options.get("fetchOHLCVLimit") or 1000)
     batch_limit = max(50, min(batch_limit, 1000))
 
-    since = ex.milliseconds() - step * limit
     rows = []
+    since = None
     guard = 0
 
-    while len(rows) < limit and guard < 40:
+    while len(rows) < limit and guard < 60:
         guard += 1
-        batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=batch_limit)
+        try:
+            batch = ex.fetch_ohlcv(symbol, timeframe, since=since,
+                                   limit=batch_limit)
+        except Exception:
+            break
         if not batch:
             break
-        rows += batch
-        since = batch[-1][0] + step
-        if len(batch) < batch_limit:
+
+        prev_earliest = rows[0][0] if rows else None
+        rows = batch + rows
+        rows = list({r[0]: r for r in rows}.values())
+        rows.sort(key=lambda r: r[0])
+
+        if len(rows) >= limit:
             break
+        if prev_earliest is not None and rows[0][0] >= prev_earliest:
+            break
+
+        since = rows[0][0] - step * batch_limit
         time.sleep(ex.rateLimit / 1000)
+
+    rows = rows[-limit:]
 
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)

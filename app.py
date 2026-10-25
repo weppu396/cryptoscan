@@ -491,3 +491,108 @@ with tab_ex:
     if st.session_state.get("health"):
         st.markdown("### venue probe")
         st.dataframe(pd.DataFrame([{
+            "exchange": n, "reachable": "YES" if r["ok"] else "no",
+            "markets": r.get("markets", 0), "ms": r["ms"],
+            "error": r.get("error", ""),
+        } for n, r in st.session_state["health"].items()]),
+            use_container_width=True, hide_index=True)
+
+    if datamod.LAST_ERRORS:
+        st.markdown("### resolution errors")
+        st.json(datamod.LAST_ERRORS)
+
+
+# ============================================================
+# journal
+# ============================================================
+with tab_journal:
+    st.subheader("Trade journal")
+    with st.form("journal_form", clear_on_submit=True):
+        c1, c2, c3, c4 = st.columns(4)
+        j_symbol = c1.text_input("Symbol")
+        j_dir = c2.selectbox("Direction", ["long", "short"])
+        j_grade = c3.selectbox("Grade", GRADE_ORDER)
+        j_result = c4.number_input("Result (R)", -5.0, 30.0, 0.0, step=0.1)
+        c5, c6 = st.columns(2)
+        j_followed = c5.selectbox("Followed the rules?", ["yes", "no"])
+        j_notes = c6.text_input("Notes")
+        if st.form_submit_button("Add trade") and j_symbol:
+            row = pd.DataFrame([{
+                "date": pd.Timestamp.utcnow().date().isoformat(),
+                "symbol": j_symbol, "dir": j_dir, "grade": j_grade,
+                "result_R": j_result, "followed": j_followed, "notes": j_notes}])
+            try:
+                old = pd.read_csv("journal.csv")
+                row = pd.concat([old, row], ignore_index=True)
+            except FileNotFoundError:
+                pass
+            row.to_csv("journal.csv", index=False)
+            st.success(f"Logged {j_symbol}")
+
+    try:
+        j = pd.read_csv("journal.csv")
+        if not j.empty:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Trades logged", len(j))
+            c2.metric("Expectancy", f"{j['result_R'].mean():.2f} R")
+            c3.metric("Win rate", f"{(j['result_R'] > 0).mean() * 100:.0f}%")
+            c4.metric("Rule adherence", f"{(j['followed'] == 'yes').mean() * 100:.0f}%")
+            st.dataframe(j, use_container_width=True, hide_index=True)
+    except FileNotFoundError:
+        st.caption("No journal yet.")
+
+
+# ============================================================
+# help
+# ============================================================
+with tab_help:
+    st.subheader("Full SOP")
+    st.markdown("""
+### 1. Daily scan (5 min, six times a day)
+Run at 00:00 / 04:00 / 08:00 / 12:00 / 16:00 / 20:00 UTC, just after each
+4H candle closes.
+
+### 2. Qualification gates - all six must pass
+1. Status is ACTIONABLE or BETTER_PRICE
+2. Grade is A+ or A (B only if you have room)
+3. Total open risk + 0.5% stays under 3%
+4. Fewer than 3 correlated majors already open
+5. The chart matches the written reasons
+6. The stop sits at a level you would genuinely call "I was wrong"
+
+### 3. Sizing
+Risk 0.5% of equity. Size is calculated for you - do not round it up.
+
+### 4. Execution
+Limit order at entry. Then stop at the stop loss, TP1 for 50%,
+TP2 for the other 50%.
+
+### 5. Management
+- TP1 fills -> stop to breakeven. Non-negotiable.
+- 24 bars pass with no TP1 -> close at market
+- Price closes back through the broken level -> manual exit
+- Never widen a stop
+
+### 6. Journal every trade, including the R result and whether you
+followed the rules. The rules column is the one that matters.
+
+### 7. Weekly review, Sunday
+Re-run the backtest on BTC and ETH 4h. Compare live expectancy to
+backtest expectancy. If they diverge and rule adherence is under 90%,
+the problem is you, not the code.
+
+### Grade
+A+ 88-100 take | A 78-87 take | B 66-77 take if room | C watch | D skip
+
+### Status
+ACTIONABLE price at entry | BETTER_PRICE pulled back past entry |
+RUNNING TP1 hit | EXTENDED ran away | INVALID stopped out
+
+### If you get zero setups
+Open the diagnostics expander on the Live Scan tab. It tells you exactly
+where the funnel emptied: universe, loading, raw signals, filters, or grade.
+""")
+
+
+st.sidebar.divider()
+st.sidebar.caption("Not financial advice. Backtest before risking money.")

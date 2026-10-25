@@ -24,7 +24,7 @@ from strategy.setups import scan_bos_retest
 from strategy.risk import filter_setups
 from strategy.rating import rate
 from backtest.engine import run as engine_run
-from backtest.metrics import report, bucket_stats
+from backtest.metrics import report, bucket_stats, grade_stats
 from backtest.validate import permutation_test, monte_carlo_drawdown
 
 

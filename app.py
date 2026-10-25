@@ -14,8 +14,8 @@ import plotly.graph_objects as go
 import data as datamod
 from config import CFG
 from data import (resolve_exchange, probe_exchanges, probe_proxy,
-                  diagnose_binance, build_universe, load, list_symbols,
-                  min_bars_needed, CANDIDATES)
+                  diagnose_binance, probe_binance_routes, build_universe,
+                  load, list_symbols, min_bars_needed, CANDIDATES)
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.levels import build_zones
@@ -186,7 +186,7 @@ def cached_proxy_health(proxy):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_diagnose(proxy):
-    return diagnose_binance(proxy)
+    return diagnose_binance(proxy or None)
 
 
 # ============================================================
@@ -466,11 +466,8 @@ with tab_ex:
             with st.spinner("asking worker..."):
                 st.session_state["proxy_h"] = cached_proxy_health(proxy)
     if c3.button("Diagnose binance"):
-        if not proxy:
-            st.warning("Paste the worker URL first.")
-        else:
-            with st.spinner("running..."):
-                st.session_state["diag"] = cached_diagnose(proxy)
+        with st.spinner("testing every route from this server..."):
+            st.session_state["diag"] = cached_diagnose(proxy or None)
 
     if st.session_state.get("diag"):
         d = st.session_state["diag"]

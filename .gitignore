@@ -6,3 +6,9 @@ state/
 journal.csv
 trades.csv
 edge_stats.json
+alert_config.json
+portfolio.json
+tickets.json
+baserates.json
+health_history.json
+alerts_sent.json

@@ -1,9 +1,4 @@
-"""
-portfolio.py - holdings with edit, remove, export, and optional GitHub Gist
-persistence so data survives a container restart.
-
-Streamlit Cloud wipes local files on redeploy. Use Export or Gist to keep it.
-"""
+"""portfolio.py - holdings with edit, remove, export, optional Gist persistence."""
 import json
 import pathlib
 
@@ -96,9 +91,7 @@ def import_json(text) -> int:
 
 
 def gist_push(token, gist_id=None):
-    """Save the portfolio to a private gist. Returns the gist id."""
-    payload = {"description": "cryptoscan portfolio",
-               "public": False,
+    payload = {"description": "cryptoscan portfolio", "public": False,
                "files": {"portfolio.json": {"content": export_json()}}}
     h = {"Authorization": f"Bearer {token}",
          "Accept": "application/vnd.github+json"}
@@ -120,8 +113,7 @@ def gist_pull(token, gist_id):
         r = requests.get(f"{GIST_API}/{gist_id}", headers=h, timeout=25)
         if r.status_code >= 300:
             return -1
-        content = r.json()["files"]["portfolio.json"]["content"]
-        return import_json(content)
+        return import_json(r.json()["files"]["portfolio.json"]["content"])
     except Exception:
         return -1
 
@@ -142,9 +134,9 @@ def health_check(ex, cfg, equity):
     out = []
     for sym, h in load_pf().items():
         row = {"symbol": sym, "qty": h["qty"], "avg": h["avg"],
-               "stop": h.get("stop"), "tp": h.get("tp"),
-               "signals": [], "severity": 0, "last": None,
-               "pnl_pct": None, "value": 0.0, "pnl_usd": 0.0, "ret_pct": 0.0}
+               "stop": h.get("stop"), "tp": h.get("tp"), "signals": [],
+               "severity": 0, "last": None, "pnl_pct": None,
+               "value": 0.0, "pnl_usd": 0.0, "ret_pct": 0.0}
         try:
             df = load(ex, sym, cfg.scan.ltf, limit=1500)
             if len(df) < 300:
@@ -172,10 +164,10 @@ def health_check(ex, cfg, equity):
                 row["signals"].append("target reached - take profit")
                 row["severity"] = max(row["severity"], 2)
             if st["choch_dn"].tail(3).any():
-                row["signals"].append("bearish CHoCH on 4H - structure broke")
+                row["signals"].append("bearish CHoCH on 4H")
                 row["severity"] = max(row["severity"], 2)
             if last < float(ind["ema_fast"].iat[-1]):
-                row["signals"].append("trading below EMA50")
+                row["signals"].append("below EMA50")
                 row["severity"] = max(row["severity"], 1)
             if float(ind["rsi"].iat[-1]) > 78:
                 row["signals"].append(f"RSI {float(ind['rsi'].iat[-1]):.0f} overbought")

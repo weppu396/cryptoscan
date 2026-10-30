@@ -1,4 +1,4 @@
-"""portfolio.py - holdings with edit, remove, export, optional Gist persistence."""
+"""portfolio.py - holdings, risk buckets, health, export, optional Gist sync."""
 import json
 import pathlib
 
@@ -13,6 +13,7 @@ from core.regime import htf_bias
 P = pathlib.Path("portfolio.json")
 MAJORS = {"BTC", "ETH", "SOL"}
 GIST_API = "https://api.github.com/gists"
+BUCKET_COLOR = {"low": "#22c55e", "medium": "#eab308", "high": "#ef4444"}
 
 
 def load_pf():
@@ -130,13 +131,31 @@ def open_risk_pct(equity):
     return round(total / equity * 100, 2) if equity else 0.0
 
 
+def classify(h, atr_pct, weight_pct):
+    """Risk bucket: low / medium / high. Unprotected positions score highest."""
+    stop_dist = (abs(h["avg"] - h["stop"]) / h["avg"] * 100
+                 if h.get("stop") and h["avg"] else None)
+    score = 0.0
+    score += min((atr_pct or 20) * 3, 45)
+    if stop_dist is None:
+        score += 25
+    elif stop_dist > 20:
+        score += 20
+    elif stop_dist > 10:
+        score += 10
+    score += min(weight_pct * 1.5, 30)
+    bucket = "high" if score >= 55 else "medium" if score >= 32 else "low"
+    return bucket, round(score, 1), stop_dist
+
+
 def health_check(ex, cfg, equity):
     out = []
     for sym, h in load_pf().items():
         row = {"symbol": sym, "qty": h["qty"], "avg": h["avg"],
                "stop": h.get("stop"), "tp": h.get("tp"), "signals": [],
                "severity": 0, "last": None, "pnl_pct": None,
-               "value": 0.0, "pnl_usd": 0.0, "ret_pct": 0.0}
+               "value": 0.0, "pnl_usd": 0.0, "atr_pct": None,
+               "bucket": "high", "risk_score": 100.0, "stop_dist": None}
         try:
             df = load(ex, sym, cfg.scan.ltf, limit=1500)
             if len(df) < 300:
@@ -148,9 +167,13 @@ def health_check(ex, cfg, equity):
             last = float(df["close"].iat[-1])
             row["last"] = last
             row["pnl_pct"] = round((last / h["avg"] - 1) * 100, 2) if h["avg"] else None
-            row["ret_pct"] = row["pnl_pct"] or 0.0
             row["value"] = last * h["qty"]
             row["pnl_usd"] = (last - h["avg"]) * h["qty"]
+            row["atr_pct"] = round(float(ind["atr_pct"].iat[-1]), 2)
+
+            weight = (row["value"] / equity * 100) if equity else 0
+            b, sc, sd = classify(h, row["atr_pct"], weight)
+            row["bucket"], row["risk_score"], row["stop_dist"] = b, sc, sd
 
             if h.get("stop") and last <= h["stop"]:
                 row["signals"].append("STOP HIT - exit now")
@@ -179,6 +202,13 @@ def health_check(ex, cfg, equity):
             row["signals"].append(f"data error: {type(e).__name__}")
         out.append(row)
     return sorted(out, key=lambda r: -r["severity"])
+
+
+def bucket_totals(rows):
+    tot = {"low": 0.0, "medium": 0.0, "high": 0.0}
+    for r in rows:
+        tot[r["bucket"]] = tot.get(r["bucket"], 0.0) + (r.get("value") or 0)
+    return tot
 
 
 def summary(rows, equity):

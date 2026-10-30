@@ -343,6 +343,16 @@ mm = (st.session_state.get("macro") or {}).get("state")
 if mm and mm.get("blackout"):
     st.sidebar.warning(mm["blackout_reason"])
 
+# ---- proxy compatibility shim ----
+_proxy_raw = ""
+for _n in ("proxy_url", "proxy_input", "binance_proxy", "proxy"):
+    if _n in globals() and globals()[_n] is not None:
+        _proxy_raw = str(globals()[_n])
+        break
+proxy = _proxy_raw.strip() or None
+_top = globals().get("_top", globals().get("top", 40))
+_min_vol = globals().get("_min_vol", globals().get("min_vol", 30e6))
+_limit = globals().get("_limit", globals().get("limit", 10))
 
 (tab_scan, tab_radar, tab_pf, tab_bt, tab_macro,
  tab_alert, tab_journal, tab_help) = st.tabs(

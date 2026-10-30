@@ -12,6 +12,14 @@ import streamlit as st
 import plotly.graph_objects as go
 
 import data as datamod
+import macro
+import market_health as mh
+import baserates
+import portfolio
+import risk_gate
+import ticket
+import alerts
+import brief
 from config import CFG
 from data import (resolve_exchange, probe_exchanges, probe_proxy,
                   diagnose_binance, build_universe, load, list_symbols,
@@ -37,10 +45,7 @@ GRADE_COLOR = {"A+": "#16a34a", "A": "#22c55e", "B": "#eab308",
                "C": "#f97316", "D": "#ef4444"}
 
 
-# ============================================================
-# helpers
-# ============================================================
-def tv_link(symbol: str) -> str:
+def tv_link(symbol):
     base = symbol.split(":")[0].replace("/", "")
     suffix = ".P" if ":" in symbol else ""
     return f"https://www.tradingview.com/chart/?symbol=BINANCE:{base}{suffix}"
@@ -56,7 +61,7 @@ def load_stats():
     return None
 
 
-def setup_status(s, ltf) -> str:
+def setup_status(s, ltf):
     cur = float(ltf["close"].iat[-1])
     tol = 0.5 * s.atr
     if s.direction == "long":
@@ -66,13 +71,12 @@ def setup_status(s, ltf) -> str:
         if abs(cur - s.entry) <= tol: return "ACTIONABLE"
         if cur < s.entry: return "BETTER_PRICE"
         return "EXTENDED"
-    else:
-        if cur >= s.stop: return "INVALID"
-        if cur <= s.tp2: return "TARGET_HIT"
-        if cur <= s.tp1: return "RUNNING"
-        if abs(cur - s.entry) <= tol: return "ACTIONABLE"
-        if cur > s.entry: return "BETTER_PRICE"
-        return "EXTENDED"
+    if cur >= s.stop: return "INVALID"
+    if cur <= s.tp2: return "TARGET_HIT"
+    if cur <= s.tp1: return "RUNNING"
+    if abs(cur - s.entry) <= tol: return "ACTIONABLE"
+    if cur > s.entry: return "BETTER_PRICE"
+    return "EXTENDED"
 
 
 def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity):
@@ -85,20 +89,16 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     )
 
 
-# ============================================================
-# pipelines
-# ============================================================
 def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
     ex, ex_name = resolve_exchange(cfg, preferred=preferred, proxy=proxy)
     universe, note = build_universe(ex, cfg)
-
     diag = {"exchange": ex_name, "universe_note": note,
             "universe": len(universe), "loaded": 0, "too_short": 0,
             "raw_signals": 0, "after_filters": 0, "after_recency": 0,
             "after_grade": 0, "errors": 0, "sample": universe[:8]}
 
     bars = max(1500, min_bars_needed(cfg))
-    stats = load_stats()
+    stats, brt = load_stats(), baserates.load()
     found = []
 
     for sym in universe:
@@ -118,7 +118,6 @@ def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
 
             raw = scan_bos_retest(sym, ltf, hb, ind, stt, zu, zd, cfg)
             diag["raw_signals"] += len(raw)
-
             kept = filter_setups(raw, ind, zu, zd, cfg)
             diag["after_filters"] += len(kept)
 
@@ -136,6 +135,7 @@ def scan_pipeline(cfg, recent_bars, min_grade, preferred, proxy):
                 s.meta["rating"] = rt
                 if min_grade and GRADE_ORDER.index(rt.grade) > GRADE_ORDER.index(min_grade):
                     continue
+                s.meta["base_rate"] = baserates.lookup(brt, s.direction, rt.grade, s.stop_atr)
                 diag["after_grade"] += 1
                 found.append(s)
         except Exception:
@@ -161,8 +161,7 @@ def backtest_pipeline(cfg, symbol, limit, preferred, proxy, min_grade=None):
     raw = scan_bos_retest(symbol, df, hb, ind, stt, zu, zd, cfg)
     setups = filter_setups(raw, ind, zu, zd, cfg)
 
-    stats_src = load_stats()
-    graded = []
+    stats_src, graded = load_stats(), []
     for s in setups:
         try:
             row = ind.loc[s.ts]
@@ -180,18 +179,13 @@ def backtest_pipeline(cfg, symbol, limit, preferred, proxy, min_grade=None):
     signals = {}
     for s in setups:
         loc = df.index.get_loc(s.ts)
-        if loc not in signals:
-            signals[loc] = {"dir": s.direction, "stop": s.stop,
-                            "tp1": s.tp1, "tp2": s.tp2, "score": s.score,
-                            "grade": s.meta["rating"].grade}
-
+        signals.setdefault(loc, {"dir": s.direction, "stop": s.stop,
+                                 "tp1": s.tp1, "tp2": s.tp2, "score": s.score,
+                                 "grade": s.meta["rating"].grade})
     curve, trades = engine_run(df, signals, cfg, symbol)
     return curve, trades, len(raw), len(setups), ex_name
 
 
-# ============================================================
-# cached wrappers
-# ============================================================
 @st.cache_data(ttl=600, show_spinner=False)
 def cached_connection(exchange, proxy):
     cfg = build_cfg(exchange, 40, 30e6, "4h", 2.0, 3.5, 0.5, 10000.0)
@@ -231,15 +225,10 @@ def cached_diagnose(proxy):
     return diagnose_binance(proxy or None)
 
 
-# ============================================================
-# sidebar
-# ============================================================
+# ---------------- sidebar ----------------
 st.sidebar.title("CryptoScan")
-
 st.sidebar.subheader("Exchange")
-proxy_url = st.sidebar.text_input(
-    "Binance proxy URL (optional)", value="",
-    placeholder="https://binance-proxy.you.workers.dev")
+proxy_url = st.sidebar.text_input("Binance proxy URL (optional)", value="")
 proxy = proxy_url.strip() or None
 
 _opts = ["auto"] + CANDIDATES
@@ -256,19 +245,14 @@ if st.sidebar.button("Check connection"):
     except Exception as e:
         st.sidebar.error(f"failed: {e}")
 
-if st.session_state.get("resolved"):
-    st.sidebar.caption(f"active exchange: {st.session_state['resolved']}")
-
 ltf = st.sidebar.selectbox("Timeframe", ["1h", "4h", "1d"], index=1)
 _top = st.sidebar.slider("Symbols to scan", 10, 150, 40, step=10)
 _min_vol = st.sidebar.select_slider(
     "Min 24h volume", options=[1e6, 5e6, 10e6, 30e6, 50e6, 100e6],
-    value=5e6, format_func=lambda v: f"${v/1e6:.0f}M",
-    help="Thin venues like Binance US need $5M or lower")
+    value=5e6, format_func=lambda v: f"${v/1e6:.0f}M")
 
 st.sidebar.subheader("Filters")
-recent = st.sidebar.slider("Signal freshness (bars)", 1, 24, 6,
-                           help="On 4h, 6 bars = 24 hours")
+recent = st.sidebar.slider("Signal freshness (bars)", 1, 24, 6)
 min_grade = st.sidebar.select_slider("Minimum grade", GRADE_ORDER, value="B")
 only_ok = st.sidebar.checkbox("Show only actionable", value=False)
 _limit = st.sidebar.slider("Max results", 3, 40, 10)
@@ -280,377 +264,378 @@ risk_pct = st.sidebar.slider("Risk per trade (%)", 0.1, 3.0, 0.5, step=0.1)
 min_rr = st.sidebar.slider("Minimum R:R", 1.5, 5.0, 2.0, step=0.25)
 max_stop_atr = st.sidebar.slider("Max stop (ATR)", 1.5, 6.0, 3.5, step=0.25)
 
+st.sidebar.subheader("Context")
+if st.sidebar.button("Refresh health + macro"):
+    with st.spinner("loading..."):
+        st.session_state["health"] = mh.health()
+        st.session_state["macro"] = macro.macro_report("BTC/USDT:USDT")
 
-tab_scan, tab_bt, tab_ex, tab_journal, tab_help = st.tabs(
-    ["Live Scan", "Backtest", "Exchanges", "Journal", "How to use"])
+hstate = st.session_state.get("health")
+if hstate:
+    st.sidebar.metric("Market health", f"{hstate['score']}/100", hstate["verdict"])
+    for r in hstate["reasons"]:
+        st.sidebar.caption(f"- {r}")
+
+mstate = (st.session_state.get("macro") or {}).get("state")
+if mstate and mstate.get("blackout"):
+    st.sidebar.warning(f"BLACKOUT: {mstate['blackout_reason']}")
 
 
-# ============================================================
-# live scan
-# ============================================================
+tab_scan, tab_bt, tab_pf, tab_ex, tab_macro, tab_alert, tab_journal, tab_help = st.tabs(
+    ["Scan", "Backtest", "Portfolio", "Exchanges", "Macro", "Alerts", "Journal", "Help"])
+
+
+# ---------------- scan ----------------
 with tab_scan:
-    st.subheader("Live scan")
-    st.caption(f"Exchange: {exch} | {ltf} | grade {min_grade}+ | "
-               f"last {recent} bars")
-
+    st.subheader("Scan")
     if st.button("Run scan", type="primary"):
-        with st.spinner("Scanning. Allow 1 to 2 minutes..."):
+        with st.spinner("Scanning..."):
             setups, used, diag = cached_scan(
                 exch, _top, _min_vol, ltf, min_rr, max_stop_atr,
                 risk_pct, equity, recent, min_grade, exch, proxy)
         st.session_state["setups"] = setups
-        st.session_state["used_ex"] = used
         st.session_state["diag"] = diag
 
-    if st.session_state.get("used_ex"):
-        used = st.session_state["used_ex"]
-        if used == exch or exch == "auto":
-            st.success(f"Connected to {used}")
-        else:
-            st.info(f"You asked for {exch}, unreachable. Using {used}.")
-
     if st.session_state.get("diag"):
-        d = st.session_state["diag"]
-        with st.expander("scan diagnostics - read this if you get zero results",
-                         expanded=not st.session_state.get("setups")):
-            st.json(d)
-            if d["universe"] == 0:
-                st.error("Universe empty. Lower Min 24h volume.")
-            elif d["loaded"] == 0:
-                st.error("No symbols loaded enough history.")
-            elif d["raw_signals"] == 0:
-                st.warning("No raw signals at all. Increase freshness.")
-            elif d["after_grade"] == 0:
-                st.info("Signals existed but none met the grade. Lower Minimum grade.")
-
-    if datamod.LAST_ERRORS:
-        with st.expander("exchanges skipped"):
-            st.json(datamod.LAST_ERRORS)
+        with st.expander("diagnostics", expanded=not st.session_state.get("setups")):
+            st.json(st.session_state["diag"])
 
     setups = st.session_state.get("setups", [])
-    stats_src = load_stats()
-    if stats_src:
-        st.caption(f"Ratings calibrated on {stats_src.get('n', 0)} backtested trades.")
-    else:
-        st.caption("Ratings use heuristic base rates. Run a backtest to calibrate.")
-
     if not setups:
-        st.info("No results yet. Open the diagnostics expander above for the reason.")
+        st.info("No results. Check diagnostics above.")
     else:
         rows = [s for s in setups
                 if (not only_ok) or s.meta.get("status") in OK_STATUS][:_limit]
-        st.caption(f"{len(setups)} graded signals, {len(rows)} shown")
+        st.caption(f"{len(setups)} graded, {len(rows)} shown")
 
-        table = pd.DataFrame([{
-            "grade": s.meta["rating"].grade,
-            "conf": s.meta["rating"].confidence,
-            "verdict": s.meta["rating"].verdict,
-            "est_win%": s.meta["rating"].est_win_rate,
-            "symbol": s.symbol, "dir": s.direction.upper(),
-            "status": s.meta.get("status"),
-            "entry": round(s.entry, 6), "stop": round(s.stop, 6),
-            "tp1": round(s.tp1, 6), "tp2": round(s.tp2, 6),
-            "R:R": round(s.rr, 2), "stop_ATR": round(s.stop_atr, 2),
-            "qty": round(s.meta.get("qty", 0), 6),
-            "risk_$": round(s.meta.get("risk_cash", 0), 2),
-            "signal_bar": s.ts.strftime("%Y-%m-%d %H:%M"),
-        } for s in rows])
+        ctx_base = {"equity": float(equity),
+                    "open_risk_pct": portfolio.open_risk_pct(float(equity)),
+                    "open_majors": portfolio.majors_held(),
+                    "macro": mstate or {},
+                    "health": hstate or {}}
 
-        st.dataframe(table, use_container_width=True, hide_index=True)
-        st.download_button("Download as CSV",
-                           table.to_csv(index=False).encode("utf-8"),
-                           "setups.csv", "text/csv")
-
-        st.divider()
         for s in rows:
             rt = s.meta["rating"]
-            stop_dist = abs(s.entry - s.stop)
-            header = (f"{rt.grade}   {s.symbol}   {s.direction.upper()}   "
-                      f"conf {rt.confidence}   [{s.meta.get('status')}]")
-            with st.expander(header, expanded=(rt.grade in ("A+", "A"))):
+            br = s.meta.get("base_rate")
+            gate_ctx = dict(ctx_base, base_rate=br)
+            verdict, blocks, warns, mult = risk_gate.evaluate(s, gate_ctx)
+
+            with st.expander(f"{rt.grade}  {s.symbol}  {s.direction.upper()}  "
+                             f"[{s.meta.get('status')}]  {verdict}"):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.markdown(
-                    f"<h2 style='color:{GRADE_COLOR[rt.grade]};margin:0'>"
-                    f"{rt.grade}</h2>", unsafe_allow_html=True)
+                c1.markdown(f"<h2 style='color:{GRADE_COLOR[rt.grade]};margin:0'>"
+                            f"{rt.grade}</h2>", unsafe_allow_html=True)
                 c2.metric("Confidence", f"{rt.confidence}/100")
-                c3.metric("Est. TP1 hit", f"{rt.est_win_rate}%")
-                c4.metric("Verdict", rt.verdict)
-                st.caption(f"probability basis: {rt.basis}")
+                c3.metric("Est. hit",
+                          f"{br['rate']*100:.0f}%" if br else f"{rt.est_win_rate}%")
+                c4.metric("Verdict", verdict)
 
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Entry", f"{s.entry:,.4f}")
-                c2.metric("Stop loss", f"{s.stop:,.4f}",
-                          f"-{s.stop_atr:.2f} ATR", delta_color="inverse")
+                c1.metric("Entry", f"{s.entry:,.6f}")
+                c2.metric("Stop", f"{s.stop:,.6f}", f"-{s.stop_atr:.2f} ATR",
+                          delta_color="inverse")
                 c3.metric("R:R", f"{s.rr:.2f}")
-                c1.metric("Take profit 1", f"{s.tp1:,.4f}",
-                          f"+{abs(s.tp1-s.entry)/stop_dist:.1f}R")
-                c2.metric("Take profit 2", f"{s.tp2:,.4f}", f"+{s.rr:.1f}R")
-                c3.metric("Size", f"{s.meta.get('qty', 0):,.4f}")
+                c1.metric("TP1", f"{s.tp1:,.6f}")
+                c2.metric("TP2", f"{s.tp2:,.6f}")
+                c3.metric("Size x", f"{mult}")
 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown("**Works in favour**")
-                    for x in rt.positives:
-                        st.markdown(f":green[+ ] {x}")
-                with col_b:
-                    st.markdown("**Works against**")
-                    for x in (rt.negatives or ["nothing material"]):
-                        st.markdown(f":red[- ] {x}")
-                if rt.improve:
-                    st.markdown("**To upgrade this setup**")
-                    for x in rt.improve:
-                        st.markdown(f"> {x}")
-                st.link_button("Open chart on TradingView", tv_link(s.symbol))
+                for b in blocks:
+                    st.error(f"BLOCK: {b}")
+                for w in warns:
+                    st.warning(w)
+                for r in rt.positives:
+                    st.markdown(f":green[+ ] {r}")
+                for r in rt.negatives:
+                    st.markdown(f":red[- ] {r}")
+
+                if st.button("Build ticket", key=f"t{s.symbol}{s.ts}"):
+                    size = s.meta or {}
+                    t = ticket.build(s, size, mult, (verdict, blocks, warns, mult),
+                                     s.reasons)
+                    ticket.save(t)
+                    st.code(ticket.as_text(t))
+                    if verdict == "PASS":
+                        alerts.send("entry", t["id"],
+                                    f"{t['grade']} {t['symbol']} {t['side']}",
+                                    ticket.as_text(t))
+                st.link_button("TradingView", tv_link(s.symbol))
+
+    if st.button("Send desk brief"):
+        with st.spinner("composing..."):
+            hh = hstate or mh.health()
+            mm = mstate or {}
+            pp = st.session_state.get("pf_rows") or []
+            body = brief.compose(hh, mm, setups, pp,
+                                 portfolio.summary(pp, float(equity)))
+        st.text(body)
+        alerts.send("macro", f"brief{pd.Timestamp.now():%H%M}", "DESK BRIEF", body)
 
 
-# ============================================================
-# backtest
-# ============================================================
+# ---------------- backtest ----------------
 with tab_bt:
     st.subheader("Backtest")
-    st.caption("Writes edge_stats.json which calibrates the ratings.")
-
     need = min_bars_needed(build_cfg(exch, 40, 30e6, ltf, min_rr,
                                      max_stop_atr, risk_pct, equity))
-    st.info(f"Bars needed for a {CFG.scan.htf} bias on {ltf}: **{need}**. Use 4h.")
+    st.info(f"Bars needed for a {CFG.scan.htf} bias on {ltf}: {need}. Use 4h.")
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-    syms = st.session_state.get("symbols") or ["BTC/USDT", "ETH/USDT",
-                                               "BTC/USDT:USDT", "ETH/USDT:USDT"]
+    syms = st.session_state.get("symbols") or ["BTC/USDT", "ETH/USDT"]
     bt_symbol = c1.selectbox("Symbol", syms, index=0)
     bt_ltf = c2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1, key="bt_tf")
     bt_limit = c3.number_input("Bars", 1000, 30000, max(6000, need), step=500)
     bt_go = c4.button("Run backtest", type="primary")
-
-    bt_min_grade = st.selectbox(
-        "Minimum grade in backtest",
-        ["D", "C", "B", "A", "A+"], index=0,
-        help="D = test every filtered setup. A+ = test only the best. "
-             "Run D first, then A+ to see if the grading actually works.")
+    bt_min_grade = st.selectbox("Minimum grade", ["D", "C", "B", "A", "A+"], index=0)
 
     if bt_go:
-        with st.spinner("Backtesting. Downloading history if needed..."):
+        with st.spinner("Backtesting..."):
             curve, trades, n_raw, n_kept, used = cached_backtest(
-                exch, bt_symbol, bt_ltf, int(bt_limit), min_rr,
-                max_stop_atr, risk_pct, equity, exch, proxy, bt_min_grade)
-        st.session_state["bt"] = (curve, trades, n_raw, n_kept,
-                                  bt_symbol, bt_ltf, used, bt_min_grade)
+                exch, bt_symbol, bt_ltf, int(bt_limit), min_rr, max_stop_atr,
+                risk_pct, equity, exch, proxy, bt_min_grade)
+        st.session_state["bt"] = (curve, trades, n_raw, n_kept, bt_symbol,
+                                  bt_ltf, used, bt_min_grade)
 
     if "bt" in st.session_state:
         (curve, trades, n_raw, n_kept, sym_used, tf_used,
-         used, grade_used) = st.session_state["bt"]
-        st.caption(f"{sym_used} {tf_used} via {used} | min grade {grade_used}: "
-                   f"{n_raw} raw signals -> {n_kept} after filters and grade")
+         used, g_used) = st.session_state["bt"]
+        st.caption(f"{sym_used} {tf_used} via {used} | grade {g_used}: "
+                   f"{n_raw} raw -> {n_kept} after filters+grade")
 
         if trades is None or trades.empty:
-            st.warning("No trades. Lower Minimum R:R to 1.5, raise Max stop ATR "
-                       "to 4.5, or set Minimum grade back to D.")
+            st.warning("No trades. Lower min R:R to 1.5 or set grade back to D.")
         else:
-            if len(trades) < 30:
-                st.warning(f"Only {len(trades)} trades - too few to conclude "
-                           f"anything. Raise the bar count.")
-
             stats = report(trades, curve, CFG)
             c = st.columns(5)
             c[0].metric("Trades", stats["trades"])
             c[1].metric("Win rate", f"{stats['win_rate_pct']}%")
             c[2].metric("Expectancy", f"{stats['expectancy_R']} R")
-            c[3].metric("Profit factor", stats["profit_factor"])
-            c[4].metric("Max drawdown", f"{stats['max_dd_pct']}%")
-            c = st.columns(5)
-            c[0].metric("Total R", stats["total_R"])
-            c[1].metric("Sharpe", stats["sharpe"])
-            c[2].metric("Sortino", stats["sortino"])
-            c[3].metric("Avg MAE", f"{stats['avg_mae_R']} R")
-            c[4].metric("Avg bars held", stats["avg_bars_held"])
+            c[3].metric("PF", stats["profit_factor"])
+            c[4].metric("Max DD", f"{stats['max_dd_pct']}%")
 
-            st.subheader("Expectancy by grade")
             gs = grade_stats(trades)
             if not gs.empty:
+                st.subheader("Expectancy by grade")
                 st.dataframe(gs, use_container_width=True, hide_index=True)
-                st.caption("If A+ is positive and C is negative, the grading works "
-                           "and you should only trade the top grades.")
-            else:
-                st.caption("No grade data.")
 
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=curve.index, y=curve["equity"],
                                      line=dict(width=2, color="#22c55e")))
-            fig.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0),
-                              title="Equity curve", template="plotly_dark")
+            fig.update_layout(height=300, template="plotly_dark",
+                              title="Equity curve")
             st.plotly_chart(fig, use_container_width=True)
-
-            dd = go.Figure()
-            dd.add_trace(go.Scatter(x=curve.index, y=curve["dd"] * 100,
-                                    fill="tozeroy", line=dict(color="#ef4444")))
-            dd.update_layout(height=180, margin=dict(l=0, r=0, t=30, b=0),
-                             title="Drawdown %", template="plotly_dark")
-            st.plotly_chart(dd, use_container_width=True)
-
-            st.subheader("Hit rate by score bucket")
-            bs = bucket_stats(trades)
-            if bs["buckets"]:
-                st.dataframe(pd.DataFrame(bs["buckets"], columns=[
-                    "score_from", "score_to", "win_rate", "trades", "expectancy_R"]),
-                    use_container_width=True, hide_index=True)
-                pathlib.Path("edge_stats.json").write_text(json.dumps(bs, indent=2))
-                st.caption("edge_stats.json written - ratings are now empirical.")
-            else:
-                st.caption("Not enough trades per bucket yet.")
 
             c1, c2 = st.columns(2)
             with c1:
-                st.markdown("**Permutation test**")
                 st.json(permutation_test(trades["r"].values))
             with c2:
-                st.markdown("**Monte carlo drawdown**")
                 st.json(monte_carlo_drawdown(trades["r"].values, risk_pct))
 
-            st.subheader("Last 50 trades")
+            if st.button("Build base rates from this run"):
+                try:
+                    ex_br, _ = resolve_exchange(
+                        build_cfg(exch, 40, 5e6, bt_ltf, min_rr, max_stop_atr,
+                                  risk_pct, equity), preferred=exch, proxy=proxy)
+                    df_br = load(ex_br, sym_used, bt_ltf, limit=int(bt_limit))
+                    tbl = baserates.build(df_br, CFG, sym_used,
+                                          lambda s: (s.meta.get("rating").grade
+                                                     if s.meta.get("rating") else "C"))
+                    baserates.save(tbl)
+                    st.dataframe(pd.DataFrame(
+                        [{"signature": k, **v} for k, v in tbl.items()]),
+                        use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.error(f"failed: {e}")
+
             st.dataframe(trades.tail(50), use_container_width=True, hide_index=True)
-            st.download_button("Download all trades",
-                               trades.to_csv(index=False).encode("utf-8"),
-                               "trades.csv", "text/csv")
 
 
-# ============================================================
-# exchanges
-# ============================================================
+# ---------------- portfolio ----------------
+with tab_pf:
+    st.subheader("Portfolio")
+    pf_eq = float(equity)
+
+    with st.form("add_pos"):
+        a, b, c, d = st.columns(4)
+        p_sym = a.text_input("Symbol", "BTC/USDT")
+        p_qty = b.number_input("Qty", 0.0, 1e9, 0.0, format="%.8f")
+        p_px = c.number_input("Price", 0.0, 1e9, 0.0, format="%.6f")
+        p_stop = d.number_input("Stop (0 = none)", 0.0, 1e9, 0.0, format="%.6f")
+        if st.form_submit_button("Add / increase") and p_sym and p_qty > 0 and p_px > 0:
+            portfolio.add(p_sym, p_qty, p_px, p_stop or None)
+            st.success(f"added {p_qty} {p_sym}")
+
+    if st.button("Refresh health check"):
+        with st.spinner("checking holdings..."):
+            try:
+                cfg_pf = build_cfg(exch, 40, 5e6, ltf, min_rr, max_stop_atr,
+                                   risk_pct, pf_eq)
+                ex_pf, _ = resolve_exchange(cfg_pf, preferred=exch, proxy=proxy)
+                st.session_state["pf_rows"] = portfolio.health_check(ex_pf, cfg_pf, pf_eq)
+            except Exception as e:
+                st.error(f"failed: {e}")
+
+    rows_pf = st.session_state.get("pf_rows", [])
+    if rows_pf:
+        summ = portfolio.summary(rows_pf, pf_eq)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Positions", summ["positions"])
+        c2.metric("Value", f"${summ['value']:,.0f}")
+        c3.metric("P&L", f"{summ['pnl_pct']:+.2f}%", f"${summ['pnl_usd']:,.0f}")
+        c4.metric("Weight", f"{summ['weight_pct']:.1f}%")
+        st.caption(f"open risk {portfolio.open_risk_pct(pf_eq)}% (cap 3.0) | "
+                   f"majors {portfolio.majors_held()}/3")
+
+        for r in rows_pf:
+            tag = "RED" if r["severity"] >= 3 else "AMBER" if r["severity"] == 2 else "GREY"
+            with st.expander(f"[{tag}] {r['symbol']}  qty {r['qty']}  P&L {r['pnl_pct']}%"):
+                for sig in r["signals"]:
+                    st.write(f"- {sig}")
+                if st.button("Remove", key=f"rm{r['symbol']}"):
+                    portfolio.remove(r["symbol"]); st.rerun()
+
+        if summ["exits"] and st.button("Alert all exits"):
+            for r in rows_pf:
+                if r["severity"] >= 2:
+                    alerts.send("exit", f"{r['symbol']}{r['severity']}",
+                                f"EXIT {r['symbol']}", "\n".join(r["signals"]))
+            st.success("sent")
+    else:
+        st.caption("no data yet - press Refresh health check")
+
+
+# ---------------- exchanges ----------------
 with tab_ex:
     st.subheader("Exchange health")
     c1, c2, c3 = st.columns(3)
     if c1.button("Test exchanges"):
         with st.spinner("probing..."):
-            st.session_state["health"] = cached_probe(proxy)
+            st.session_state["health_x"] = cached_probe(proxy)
     if c2.button("Test proxy"):
-        if not proxy:
-            st.warning("Paste the worker URL first.")
-        else:
-            with st.spinner("asking worker..."):
-                st.session_state["proxy_h"] = cached_proxy_health(proxy)
+        with st.spinner("..."):
+            st.session_state["proxy_h"] = cached_proxy_health(proxy)
     if c3.button("Diagnose binance"):
-        with st.spinner("testing every route from this server..."):
+        with st.spinner("..."):
             st.session_state["diag_bi"] = cached_diagnose(proxy)
 
     if st.session_state.get("diag_bi"):
-        d = st.session_state["diag_bi"]
-        st.json(d)
-        for k in ("binanceus", "binance_vision", "binance"):
-            if d.get(k, {}).get("markets"):
-                st.success(f"{k} works: {d[k]['markets']} markets")
-
-    if st.session_state.get("proxy_h"):
-        st.markdown("### worker upstreams")
-        st.json(st.session_state["proxy_h"])
-
-    if st.session_state.get("health"):
-        st.markdown("### venue probe")
+        st.json(st.session_state["diag_bi"])
+    if st.session_state.get("health_x"):
         st.dataframe(pd.DataFrame([{
-            "exchange": n, "reachable": "YES" if r["ok"] else "no",
-            "markets": r.get("markets", 0), "ms": r["ms"],
-            "error": r.get("error", ""),
-        } for n, r in st.session_state["health"].items()]),
+            "exchange": n, "ok": "YES" if r["ok"] else "no",
+            "markets": r.get("markets", 0), "err": r.get("error", ""),
+        } for n, r in st.session_state["health_x"].items()]),
             use_container_width=True, hide_index=True)
 
-    if datamod.LAST_ERRORS:
-        st.markdown("### resolution errors")
-        st.json(datamod.LAST_ERRORS)
+
+# ---------------- macro ----------------
+with tab_macro:
+    st.subheader("Macro & market health")
+    if st.button("Refresh", type="primary"):
+        with st.spinner("loading..."):
+            st.session_state["health"] = mh.health()
+            st.session_state["macro"] = macro.macro_report("BTC/USDT:USDT")
+
+    hh = st.session_state.get("health")
+    if hh:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Health score", f"{hh['score']}/100")
+        c2.metric("Verdict", hh["verdict"])
+        c3.metric("Size mult", f"x{mh.size_multiplier(hh)}")
+        for r in hh["reasons"]:
+            st.write(f"- {r}")
+
+    rep = st.session_state.get("macro")
+    if rep:
+        s = rep["state"]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Blackout", "YES" if s["blackout"] else "no")
+        c2.metric("BTC funding", f"{s['funding_annualised_pct']}" if s["funding_annualised_pct"] is not None else "n/a")
+        c3.metric("News tone", f"{s['sentiment']:+.2f}")
+        for n in s["notes"]:
+            st.write(f"- {n}")
+        if rep["calendar"]:
+            dfc = pd.DataFrame(rep["calendar"])
+            dfc["when"] = pd.to_datetime(dfc["when"]).dt.strftime("%a %d %b %H:%M")
+            st.dataframe(dfc[["when", "title", "impact"]],
+                         use_container_width=True, hide_index=True)
 
 
-# ============================================================
-# journal
-# ============================================================
+# ---------------- alerts ----------------
+with tab_alert:
+    st.subheader("Alerts")
+    c = alerts.config()
+    with st.form("alertcfg"):
+        st.markdown("**Telegram** - message @BotFather, /newbot, paste token")
+        t1 = st.text_input("Bot token", c.get("telegram_bot_token", ""), type="password")
+        t2 = st.text_input("Chat id", c.get("telegram_chat_id", ""))
+        st.markdown("**Email** - Gmail needs an App Password")
+        e1 = st.text_input("SMTP host", c.get("smtp_host", "smtp.gmail.com"))
+        e2 = st.number_input("SMTP port", 1, 65535, int(c.get("smtp_port") or 587))
+        e3 = st.text_input("SMTP user", c.get("smtp_user", ""))
+        e4 = st.text_input("SMTP password", c.get("smtp_pass", ""), type="password")
+        e5 = st.text_input("Send to", c.get("email_to", ""))
+        w1 = st.text_input("Webhook URL", c.get("webhook", ""))
+        if st.form_submit_button("Save"):
+            alerts.save_config({"telegram_bot_token": t1, "telegram_chat_id": t2,
+                                "smtp_host": e1, "smtp_port": e2, "smtp_user": e3,
+                                "smtp_pass": e4, "email_to": e5, "webhook": w1})
+            st.success("saved")
+
+    if st.button("Send test alert"):
+        used = alerts.send("risk", f"t{pd.Timestamp.now().timestamp()}",
+                           "TEST", "Alerts working.")
+        st.success(f"sent via {used}" if used else "no channel configured")
+
+
+# ---------------- journal ----------------
 with tab_journal:
-    st.subheader("Trade journal")
-    with st.form("journal_form", clear_on_submit=True):
+    st.subheader("Journal")
+    with st.form("jform", clear_on_submit=True):
         c1, c2, c3, c4 = st.columns(4)
-        j_symbol = c1.text_input("Symbol")
-        j_dir = c2.selectbox("Direction", ["long", "short"])
-        j_grade = c3.selectbox("Grade", GRADE_ORDER)
-        j_result = c4.number_input("Result (R)", -5.0, 30.0, 0.0, step=0.1)
-        c5, c6 = st.columns(2)
-        j_followed = c5.selectbox("Followed the rules?", ["yes", "no"])
-        j_notes = c6.text_input("Notes")
-        if st.form_submit_button("Add trade") and j_symbol:
-            row = pd.DataFrame([{
-                "date": pd.Timestamp.utcnow().date().isoformat(),
-                "symbol": j_symbol, "dir": j_dir, "grade": j_grade,
-                "result_R": j_result, "followed": j_followed, "notes": j_notes}])
+        j_s = c1.text_input("Symbol")
+        j_d = c2.selectbox("Dir", ["long", "short"])
+        j_g = c3.selectbox("Grade", GRADE_ORDER)
+        j_r = c4.number_input("Result R", -5.0, 30.0, 0.0, step=0.1)
+        j_f = st.selectbox("Followed rules?", ["yes", "no"])
+        if st.form_submit_button("Add") and j_s:
+            row = pd.DataFrame([{"date": pd.Timestamp.now(tz="UTC").date().isoformat(),
+                                 "symbol": j_s, "dir": j_d, "grade": j_g,
+                                 "result_R": j_r, "followed": j_f}])
             try:
-                old = pd.read_csv("journal.csv")
-                row = pd.concat([old, row], ignore_index=True)
+                row = pd.concat([pd.read_csv("journal.csv"), row], ignore_index=True)
             except FileNotFoundError:
                 pass
             row.to_csv("journal.csv", index=False)
-            st.success(f"Logged {j_symbol}")
-
+            st.success("logged")
     try:
         j = pd.read_csv("journal.csv")
-        if not j.empty:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades logged", len(j))
-            c2.metric("Expectancy", f"{j['result_R'].mean():.2f} R")
-            c3.metric("Win rate", f"{(j['result_R'] > 0).mean() * 100:.0f}%")
-            c4.metric("Rule adherence", f"{(j['followed'] == 'yes').mean() * 100:.0f}%")
-            st.dataframe(j, use_container_width=True, hide_index=True)
+        st.dataframe(j, use_container_width=True, hide_index=True)
     except FileNotFoundError:
-        st.caption("No journal yet.")
+        st.caption("no journal yet")
 
 
-# ============================================================
-# help
-# ============================================================
+# ---------------- help ----------------
 with tab_help:
-    st.subheader("Full SOP")
     st.markdown("""
-### 1. Daily scan (5 min, six times a day)
-Run at 00:00 / 04:00 / 08:00 / 12:00 / 16:00 / 20:00 UTC, just after each
-4H candle closes.
+### Order of operations
+1. Refresh health + macro (sidebar)
+2. Backtest grade D, then A+ - note both expectancies
+3. Build base rates from the run
+4. Scan, read the PASS/BLOCK verdicts
+5. Build ticket on a PASS, place it on the exchange
+6. Add to Portfolio with the stop
+7. Refresh health check daily, act on RED/AMBER
 
-### 2. Qualification gates - all six must pass
-1. Status is ACTIONABLE or BETTER_PRICE
-2. Grade is A+ or A (B only if you have room)
-3. Total open risk + 0.5% stays under 3%
-4. Fewer than 3 correlated majors already open
-5. The chart matches the written reasons
-6. The stop sits at a level you would genuinely call "I was wrong"
+### Gates (all must pass)
+ACTIONABLE/BETTER_PRICE | grade A+/A | heat under 3% | under 3 majors |
+chart matches | stop is a real invalidation
 
-### 3. Sizing
-Risk 0.5% of equity. Size is calculated for you - do not round it up.
+### Sizing
+0.5% risk, scaled by the macro and health multipliers. Never round up.
 
-### 4. Execution
-Limit order at entry. Then stop at the stop loss, TP1 for 50%,
-TP2 for the other 50%.
-
-### 5. Management
-- TP1 fills -> stop to breakeven. Non-negotiable.
-- 24 bars pass with no TP1 -> close at market
-- Price closes back through the broken level -> manual exit
-- Never widen a stop
-
-### 6. Journal every trade, including the R result and whether you
-followed the rules. The rules column is the one that matters.
-
-### 7. Weekly review, Sunday
-Re-run the backtest on BTC and ETH 4h. Compare live expectancy to
-backtest expectancy.
-
-### The experiment ladder
-Change ONE thing at a time:
-1. Backtest with Minimum grade = A+ (does the grading work?)
-2. Max stop ATR 3.5 -> 2.0
-3. config.py adx_trend_min 20 -> 30
-4. Add a hard veto for >2.5 ATR from EMA50
-5. Pool BTC + ETH + SOL for more trades
-
-### Grade
-A+ 88-100 take | A 78-87 take | B 66-77 take if room | C watch | D skip
-
-### Status
-ACTIONABLE price at entry | BETTER_PRICE pulled back past entry |
-RUNNING TP1 hit | EXTENDED ran away | INVALID stopped out
+### Never
+Widen a stop. Average down. Trade a BLOCK. Skip the journal.
 """)
 
 
 st.sidebar.divider()
-st.sidebar.caption("Not financial advice. Backtest before risking money.")
+st.sidebar.caption("Not financial advice. Paper trade first.")

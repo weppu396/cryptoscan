@@ -40,16 +40,18 @@ GRADE_ORDER = ["D", "C", "B", "A", "A+"]
 GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
+SCAN_BARS = 1200
 
-# venues ranked by perpetual depth. shallow spot-only venues go last.
 VENUE_ORDER = ["binance", "binanceusdm", "okx", "bybit", "bitget",
                "kucoinfutures", "mexc", "gateio", "binanceus"]
 MIN_PERPS = 20
 
+MAJORS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA", "AVAX", "LINK",
+          "TON", "SUI", "DOT", "NEAR", "APT", "ARB", "OP", "INJ", "SEI", "TIA"]
+
 
 # ---------------------------------------------------------------- helpers
 def _call(mod, names, *a, **k):
-    """Call the first attribute that exists. Survives module drift."""
     for n in names:
         f = getattr(mod, n, None)
         if callable(f):
@@ -61,27 +63,14 @@ def _has(mod, names) -> bool:
     return any(callable(getattr(mod, n, None)) for n in names)
 
 
-def _perps(ex) -> int:
-    """Count USDT perpetual markets. A proxy for usable depth."""
-    try:
-        ex.load_markets()
-    except Exception:
-        return 0
-    return sum(1 for s, m in ex.markets.items()
-               if ":" in s and m.get("quote") == "USDT" and m.get("active"))
-
-
 def _resolve(cfg, preferred, proxy):
-    """Pick a venue with real perp depth. Never silently lands on binanceus."""
     sig = inspect.signature(resolve_exchange).parameters
     base = {"preferred": preferred} if "preferred" in sig else {}
     if "proxy" in sig:
         base["proxy"] = proxy
 
-    if preferred and preferred != "auto":
-        order = [preferred] + [v for v in VENUE_ORDER if v != preferred]
-    else:
-        order = list(VENUE_ORDER)
+    order = ([preferred] + [v for v in VENUE_ORDER if v != preferred]
+             if preferred and preferred != "auto" else list(VENUE_ORDER))
 
     best, best_n = None, -1
     for name in order:
@@ -89,13 +78,11 @@ def _resolve(cfg, preferred, proxy):
         if "preferred" in sig:
             kw["preferred"] = name
         try:
-            ex, used = resolve_exchange(cfg, **kw)
-        except TypeError:
-            kw.pop("proxy", None)
             try:
                 ex, used = resolve_exchange(cfg, **kw)
-            except Exception:
-                continue
+            except TypeError:
+                kw.pop("proxy", None)
+                ex, used = resolve_exchange(cfg, **kw)
         except Exception:
             continue
         n = _perps(ex)
@@ -108,20 +95,82 @@ def _resolve(cfg, preferred, proxy):
     raise RuntimeError("no reachable venue")
 
 
-def _universe(ex, cfg, min_vol):
-    """build_universe with a volume floor that backs off until it fills."""
-    last = []
-    for div in (1, 5, 25, 0):
-        floor = min_vol / div if div else 0
+def _perps(ex) -> int:
+    try:
+        ex.load_markets()
+    except Exception:
+        return 0
+    return sum(1 for s, m in ex.markets.items()
+               if ":" in s and m.get("quote") == "USDT" and m.get("active"))
+
+
+def _alts(sym: str) -> list[str]:
+    """Both symbol shapes, perp first."""
+    out = [sym]
+    if ":" in sym:
+        out.append(sym.split(":")[0])
+    else:
+        out.append(f"{sym}:USDT")
+    return out
+
+
+def _universe(ex, min_vol: int, top: int) -> tuple[list[str], int, int]:
+    """
+    Build the symbol list straight from markets + tickers.
+
+    Returns (symbols, floor_used, perp_count). Perps are preferred; if the
+    venue has none, spot is used instead.
+    """
+    ex.load_markets()
+    try:
+        tickers = ex.fetch_tickers()
+    except Exception:
+        tickers = {}
+
+    rows = []
+    for sym, m in ex.markets.items():
+        if not m.get("active", True) or m.get("quote") != "USDT":
+            continue
+        qv = float((tickers.get(sym) or {}).get("quoteVolume") or 0)
+        rows.append((sym, qv, bool(m.get("swap") or m.get("contract"))))
+
+    perps = [r for r in rows if r[2]]
+    pool = perps if len(perps) >= 10 else rows
+
+    floor = min_vol
+    filtered = [r for r in pool if r[1] >= floor]
+    if len(filtered) < 15:
+        floor = 0
+        filtered = pool
+
+    filtered.sort(key=lambda r: -r[1])
+    syms = [r[0] for r in filtered[:top]]
+
+    if not syms:
+        base = "BTC/USDT:USDT" if len(perps) >= 10 else "BTC/USDT"
+        for c in MAJORS:
+            s = base.replace("BTC", c)
+            if s in ex.markets:
+                syms.append(s)
+
+    return syms, floor, len(perps)
+
+
+def _load(ex, sym: str, tf: str, limit: int):
+    """load() with alternate-symbol retry."""
+    for cand in _alts(sym):
         try:
-            u = build_universe(ex, replace(cfg, scan=replace(
-                cfg.scan, min_quote_vol_24h=floor)))
+            df = load(ex, cand, tf, limit=limit)
+        except TypeError:
+            try:
+                df = load(ex, cand, tf)
+            except Exception:
+                df = None
         except Exception:
-            u = []
-        if len(u) >= 15:
-            return u, floor
-        last = u or last
-    return last, 0
+            df = None
+        if df is not None and len(df) >= MIN_BARS:
+            return df, cand
+    return None, sym
 
 
 def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity):
@@ -178,26 +227,28 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 equity, recent_bars, min_grade, preferred, proxy):
     cfg = build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, ex_name = _resolve(cfg, preferred, proxy)
-    universe, floor = _universe(ex, cfg, min_vol)
+
+    universe, floor, perps = _universe(ex, int(min_vol), top)
     stats = load_stats()
     found = []
-    diag = {"venue": ex_name, "universe": len(universe), "floor": floor,
-            "loaded": 0, "short": 0, "raw": 0, "graded": 0}
+    diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
+            "floor": floor, "loaded": 0, "short": 0, "err": 0, "raw": 0,
+            "graded": 0}
 
     for sym in universe:
+        df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)
+        if df is None:
+            diag["err"] += 1
+            continue
+        diag["loaded"] += 1
         try:
-            df = load(ex, sym, cfg.scan.ltf)
-            if df is None or len(df) < MIN_BARS:
-                diag["short"] += 1
-                continue
-            diag["loaded"] += 1
             ind = compute_all(df, cfg)
             stt = build_structure(df, cfg.structure)
             hb = htf_bias(df, cfg)
             sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
             zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
             zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
-            raw = scan_bos_retest(sym, df, hb, ind, stt, zu, zd, cfg)
+            raw = scan_bos_retest(used_sym, df, hb, ind, stt, zu, zd, cfg)
             diag["raw"] += len(raw)
             kept = filter_setups(raw, ind, zu, zd, cfg)
             if recent_bars and kept:
@@ -213,6 +264,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     continue
                 found.append(s)
         except Exception:
+            diag["err"] += 1
             continue
 
     found.sort(key=lambda s: (-s.meta["rating"].confidence, -s.score))
@@ -224,8 +276,8 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
                     risk_pct, equity, preferred, proxy):
     cfg = build_cfg(exchange, 40, 30e6, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, _ = _resolve(cfg, preferred, proxy)
-    df = load(ex, symbol, cfg.scan.ltf, limit=limit)
-    if df is None or len(df) < MIN_BARS:
+    df, used = _load(ex, symbol, cfg.scan.ltf, int(limit))
+    if df is None:
         return None, None, 0, 0
     ind = compute_all(df, cfg)
     stt = build_structure(df, cfg.structure)
@@ -233,14 +285,14 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
     sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
     zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
     zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
-    raw = scan_bos_retest(symbol, df, hb, ind, stt, zu, zd, cfg)
+    raw = scan_bos_retest(used, df, hb, ind, stt, zu, zd, cfg)
     setups = filter_setups(raw, ind, zu, zd, cfg)
     signals = {}
     for s in setups:
         loc = df.index.get_loc(s.ts)
         signals.setdefault(loc, {"dir": s.direction, "stop": s.stop,
                                  "tp1": s.tp1, "tp2": s.tp2, "score": s.score})
-    curve, trades = engine_run(df, signals, cfg, symbol)
+    curve, trades = engine_run(df, signals, cfg, used)
     return curve, trades, len(raw), len(setups)
 
 
@@ -257,15 +309,14 @@ with st.sidebar:
     exch = st.selectbox(
         "Exchange", ["auto"] + CANDIDATES, index=0,
         help="auto scores venues by perpetual-market depth and picks the "
-             "deepest one that answers. binanceus is spot-only and thin, so "
-             "auto avoids it unless nothing else works.")
+             "deepest one that answers. Spot-only venues are avoided.")
     proxy = st.text_input(
         "Binance proxy (optional)", value="",
         placeholder="https://your-worker.workers.dev",
         help="Cloudflare Worker URL. Only needed for Binance, which returns "
              "HTTP 451 to US datacentre IPs.")
     if st.button("Test venues", use_container_width=True,
-                 help="Probe every venue and show which ones answer, with latency."):
+                 help="Probe every venue and list which ones answer, with latency."):
         with st.spinner("probing..."):
             st.session_state["health"] = probe_exchanges(proxy.strip() or None)
 
@@ -278,41 +329,32 @@ with st.sidebar:
 
     st.divider()
     ltf = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
-                       help="Bar size. 4h is the default swing horizon; 1d needs "
-                            "far more history to warm the EMA200 up.")
+                       help="Bar size. 4h is the swing default. 1d needs more "
+                            "history to warm up.")
     top = st.slider("Symbols to scan", 10, 150, 40, step=10,
-                    help="How many of the highest-volume pairs to check. "
-                         "More symbols means a slower scan.")
+                    help="How many top-volume pairs to check. More means slower.")
     min_vol = st.select_slider(
         "Min 24h volume", [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
         format_func=lambda v: f"${v/1e6:.0f}M",
-        help="Liquidity floor. The scanner lowers this automatically if it "
-             "would otherwise leave you with almost nothing to check.")
+        help="Liquidity floor. Drops to zero automatically if it would leave "
+             "you with almost nothing.")
     recent = st.slider("Signal freshness (bars)", 1, 12, 2,
-                       help="How many bars back a break may be and still count. "
-                            "Small numbers mean fresher, fewer signals.")
+                       help="How many bars back a break may be and still count.")
     min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="B",
-                                 help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52. "
-                                      "B and up is the working default.")
+                                 help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.")
     only_ok = st.checkbox("Actionable only", value=True,
-                          help="Hide setups that are already extended, invalid "
-                               "or past target.")
-    limit = st.slider("Max results", 3, 40, 10,
-                      help="Cap on cards rendered.")
+                          help="Hide extended, invalid and past-target setups.")
+    limit = st.slider("Max results", 3, 40, 10, help="Cap on cards rendered.")
 
     st.divider()
     equity = st.number_input("Account equity ($)", 100.0, 10_000_000.0, 10_000.0,
-                             step=500.0,
-                             help="Total account size. Position size is derived "
-                                  "from this and risk per trade.")
+                             step=500.0, help="Used for position sizing.")
     risk_pct = st.slider("Risk per trade (%)", 0.1, 3.0, 0.5, step=0.1,
-                         help="Percent of equity lost if the stop is hit. "
-                              "0.5% means $50 on a $10,000 account.")
+                         help="Equity lost if the stop is hit.")
     min_rr = st.slider("Minimum R:R", 1.5, 5.0, 2.0, step=0.25,
-                       help="Reward-to-risk floor. Setups below it are dropped.")
+                       help="Reward-to-risk floor. Lower means more signals.")
     max_stop_atr = st.slider("Max stop (ATR)", 1.5, 6.0, 3.5, step=0.25,
-                             help="Stop distance cap in ATR units. Wider stops "
-                                  "get skipped rather than sized down.")
+                             help="Stop distance cap in ATR units.")
 
     st.divider()
     st.caption("Not financial advice. Backtest before risking money.")
@@ -329,6 +371,7 @@ st.markdown(
 
 ov = market.overview()
 fng = ov.get("fng")
+stab = market.stable_ratio(ov)
 reg, tone = market.regime_label(fng)
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -354,8 +397,8 @@ with tab_ov:
     ui.section("Coin detail", "Candles, trend state and venue depth.")
     d1, d2 = st.columns([2, 1])
     detail_sym = d1.text_input("Symbol", "BTC/USDT", key="detail_sym",
-                               help="Unified ccxt symbol, e.g. BTC/USDT for spot "
-                                    "or BTC/USDT:USDT for a perpetual.")
+                               help="Unified ccxt symbol. BTC/USDT spot, "
+                                    "BTC/USDT:USDT perpetual.")
     detail_tf = d2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
                              key="detail_tf", help="Chart resolution.")
 
@@ -365,8 +408,8 @@ with tab_ov:
             cfg = build_cfg(exch, top, min_vol, detail_tf, min_rr,
                             max_stop_atr, risk_pct, equity)
             ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
-            df = load(ex, detail_sym, detail_tf, limit=400)
-            if df is None or len(df) < 120:
+            df, used = _load(ex, detail_sym, detail_tf, 400)
+            if df is None:
                 st.warning(f"Not enough candles for {detail_sym} on {ex_name}. "
                            f"Try the other symbol format or another venue.")
             else:
@@ -387,7 +430,7 @@ with tab_ov:
                 ui.stat(m5, "Bias", bias, "up" if bias.startswith("bull") else "dn")
                 st.caption(f"EMA50 {float(ind['ema50'].iloc[-1]):,.6g} · "
                            f"EMA200 {float(ind['ema200'].iloc[-1]):,.6g} · "
-                           f"venue {ex_name}")
+                           f"venue {ex_name} · symbol {used}")
 
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
@@ -440,13 +483,24 @@ with tab_scan:
 
     diag = st.session_state.get("diag")
     if diag:
-        st.caption(f"venue `{diag['venue']}` · universe {diag['universe']} "
-                   f"(floor ${diag['floor']/1e6:.0f}M) · loaded {diag['loaded']} · "
-                   f"too short {diag['short']} · raw {diag['raw']} · "
-                   f"graded {diag['graded']}")
-        if diag["venue"] == "binanceus":
-            st.warning("Landed on binanceus, which is spot-only and thin. "
-                       "Set Exchange to `okx` or `bybit` for a real universe.")
+        st.caption(f"venue `{diag['venue']}` · perps {diag['perps']} · "
+                   f"universe {diag['universe']} (floor ${diag['floor']/1e6:.0f}M) · "
+                   f"loaded {diag['loaded']} · failed {diag['err']} · "
+                   f"raw {diag['raw']} · graded {diag['graded']}")
+
+        if diag["universe"] < 5:
+            st.error(
+                f"Only {diag['universe']} symbols found on {diag['venue']}. "
+                f"That venue is too thin. Switch Exchange to `okx` or `bybit` "
+                f"and raise Symbols to scan.")
+        elif diag["loaded"] == 0:
+            st.error(
+                f"{diag['universe']} symbols found but none returned candles. "
+                f"The exchange is refusing history — try another venue or "
+                f"symbol format like BTC/USDT:USDT.")
+        elif diag["raw"] == 0 and diag["loaded"] > 10:
+            st.info("Pipeline healthy, no break-of-structure in this window. "
+                    "Normal in chop. Try 1h or set Minimum grade to D.")
 
     setups = st.session_state.get("setups", [])
     if not setups:
@@ -510,8 +564,7 @@ with tab_pf:
         import portfolio as pf_mod
         with st.form("add_pos"):
             a, b, c, d = st.columns(4)
-            p_sym = a.text_input("Symbol", "BTC/USDT",
-                                 help="Pair you own.")
+            p_sym = a.text_input("Symbol", "BTC/USDT", help="Pair you own.")
             p_qty = b.number_input("Qty", 0.0, 1e9, 0.0, format="%.8f",
                                    help="Units of the coin, not dollars.")
             p_px = c.number_input("Price", 0.0, 1e9, 0.0, format="%.6f",
@@ -554,14 +607,13 @@ with tab_pf:
 with tab_bt:
     ui.section("Backtest", "Same filters as the scanner, next-open fills.")
     b1, b2, b3 = st.columns(3)
-    bt_sym = b1.text_input("Symbol", "BTC/USDT", key="bt_sym",
-                           help="Use BTC/USDT:USDT on perp venues.")
+    bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym",
+                           help="Use BTC/USDT:USDT on perpetual venues.")
     bt_bars = b2.number_input("Bars", 500, 20000, 6000, step=500,
-                              help="History depth. More bars means a slower run "
-                                   "and a longer warm-up for EMA200.")
+                              help="History depth. More bars is slower but gives "
+                                   "EMA200 room to warm up.")
     bt_grade = b3.select_slider("Min grade", GRADE_ORDER, value="D",
-                                key="bt_grade",
-                                help="Grade floor applied inside the run.")
+                                key="bt_grade", help="Grade floor inside the run.")
 
     if st.button("Run backtest", type="primary",
                  help="Replay the strategy and report expectancy in R."):
@@ -589,21 +641,93 @@ with tab_bt:
 
 # ---------------------------------------------------------------- macro
 with tab_macro:
-    ui.section("Macro", "Calendar blackouts and the risk gate.")
+    ui.section("Macro", "Sentiment, dominance and dry powder — read as pictures.")
+
     try:
         import macro as macro_mod
-        state = _call(macro_mod, ["state", "macro_state", "evaluate",
-                                  "snapshot", "get_state"])
-        if isinstance(state, dict):
-            if state.get("blackout"):
-                st.warning(state.get("blackout_reason", "blackout active"))
-            st.json(state)
+        mstate = _call(macro_mod, ["state", "macro_state", "evaluate",
+                                   "snapshot", "get_state"])
+        if isinstance(mstate, dict) and mstate.get("blackout"):
+            st.warning(mstate.get("blackout_reason", "Macro blackout active."))
+    except Exception:
+        mstate = None
+
+    label, ltone, notes = market.stance(fng, ov["btc_dom"], stab)
+    s1, s2, s3 = st.columns(3)
+    ui.stat(s1, "Stance", label, ltone)
+    ui.stat(s2, "Stablecoin share", f"{stab:.1f}%" if stab is not None else "—")
+    ui.stat(s3, "Fear & Greed", f"{fng}" if fng is not None else "—", tone)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        st.caption("Fear & Greed — 0 panic, 100 euphoria")
+        gauge = go.Figure(go.Indicator(
+            mode="gauge+number", value=fng if fng is not None else 0,
+            gauge={"axis": {"range": [0, 100], "tickcolor": "#7f8798"},
+                   "bar": {"color": "#14b8a6", "thickness": .28},
+                   "steps": [
+                       {"range": [0, 25], "color": "#2a1214"},
+                       {"range": [25, 45], "color": "#2b2110"},
+                       {"range": [45, 55], "color": "#161a21"},
+                       {"range": [55, 75], "color": "#122a1c"},
+                       {"range": [75, 100], "color": "#0f3b24"}]}))
+        gauge.update_layout(height=260, template="plotly_dark",
+                            paper_bgcolor="#0f1116",
+                            margin=dict(l=18, r=18, t=10, b=10))
+        st.plotly_chart(gauge, use_container_width=True)
+
+    with g2:
+        st.caption("Market cap split — BTC vs ETH vs everything else")
+        labels, values = market.dominance_split(ov)
+        if labels:
+            pie = go.Figure(go.Pie(
+                labels=labels, values=values, hole=.55,
+                marker=dict(colors=["#f0b90b", "#627eea", "#3a4150"])))
+            pie.update_layout(height=260, template="plotly_dark",
+                              paper_bgcolor="#0f1116",
+                              margin=dict(l=18, r=18, t=10, b=10),
+                              showlegend=True)
+            st.plotly_chart(pie, use_container_width=True)
         else:
-            st.write(state)
-    except Exception as e:
-        st.warning(f"Macro unavailable: {type(e).__name__}: {e}")
-        st.caption("Expected one of: state(), macro_state(), evaluate(), "
-                   "snapshot(), get_state(). Add one of those names to macro.py.")
+            st.info("Dominance data unavailable.")
+
+    caps, _ = market.btc_history(90)
+    if caps:
+        st.caption("BTC market cap, 90 days — the direction money is actually moving")
+        xs = [pd.Timestamp(c[0], unit="ms") for c in caps]
+        ys = [c[1] / 1e9 for c in caps]
+        line = go.Figure(go.Scatter(x=xs, y=ys, fill="tozeroy",
+                                    line=dict(color="#14b8a6", width=1.8),
+                                    fillcolor="rgba(20,184,166,.12)"))
+        line.update_layout(height=260, template="plotly_dark",
+                           paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
+                           margin=dict(l=6, r=6, t=6, b=6),
+                           yaxis_title="market cap, $B")
+        st.plotly_chart(line, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### What these mean")
+    for n in notes:
+        st.write(f"- {n}")
+    st.markdown("""
+**Fear & Greed** aggregates volatility, momentum, social chatter and dominance
+into one number. It is a crowd gauge, not a timing tool. Deep fear gives better
+prices but worse follow-through, so pair it with structure rather than using it
+alone.
+
+**Dominance** is where market cap sits. Rising BTC dominance means capital is
+retreating into the largest asset and alts underperform. Falling dominance is
+rotation into alts, which is where alt breakouts actually run.
+
+**Stablecoin share** is unspent buying power sitting on the sidelines. A rising
+share is fuel, not a signal on its own.
+
+**Market cap trend** shows whether the aggregate is expanding or contracting.
+Longs work better in expansion, shorts in contraction.
+
+**Blackout** comes from the economic calendar. Rate decisions and CPI prints
+distort intraday structure, so new entries inside the window are lower quality.
+""")
 
 
 # ---------------------------------------------------------------- alerts
@@ -611,14 +735,11 @@ with tab_alert:
     ui.section("Alerts", "Telegram and email delivery.")
     try:
         import alerts as al_mod
-        configured = None
         if _has(al_mod, ["is_configured", "configured"]):
             try:
-                configured = _call(al_mod, ["is_configured", "configured"])
+                st.caption(f"configured: {_call(al_mod, ['is_configured', 'configured'])}")
             except Exception:
-                configured = None
-        if configured is not None:
-            st.caption(f"configured: {configured}")
+                pass
         if st.button("Send test alert",
                      help="Fire one test message to every configured channel."):
             ok = _call(al_mod, ["send"], "test", "test", "CryptoScan test",
@@ -661,61 +782,50 @@ with tab_guide:
     ui.section("User guide")
     st.markdown("""
 ### First run
-1. Sidebar, set **Exchange** to `okx` or `bybit`. Leave `auto` only if you want
-   the app to choose — it now refuses thin venues.
-2. Leave **Min 24h volume** at $30M. The scanner lowers it on its own if the
-   universe would be tiny.
-3. Press **Test venues** to confirm what answers from your host.
-4. Press **Run scan** in the Scan tab.
+1. Set **Exchange** to `okx` or `bybit`. `auto` also works now.
+2. Leave **Symbols to scan** at 40 and **Min 24h volume** at $30M.
+3. Press **Test venues** to see what your host can reach.
+4. Press **Run scan**.
 
 ### Reading the diagnostic line
-`venue · universe · loaded · too short · raw · graded`
+`venue · perps · universe · loaded · failed · raw · graded`
 
-- **universe 2** — venue too shallow. Switch venue.
-- **loaded 0** — nothing had enough history. Usually means a spot-only venue.
-- **raw 0** — no break-of-structure at all in the window. Normal in chop.
-- **raw > 0, graded 0** — filters rejected everything. Loosen grade or R:R.
+- **perps 0** — spot-only venue. Switch.
+- **universe under 5** — thin venue. Switch.
+- **loaded 0, failed high** — the venue refuses history. Try `BTC/USDT:USDT`.
+- **raw 0, loaded high** — healthy but no structure. Normal in chop; try `1h`.
 
 ### Grades
-A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52. The card lists positives and
-negatives so you can see exactly why. Grades are heuristic until a backtest
-calibrates them.
+A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52. Heuristic until calibrated.
 
 ### Status
-ACTIONABLE price at entry · BETTER_PRICE pulled back past entry · RUNNING TP1
-hit · EXTENDED ran away · INVALID stopped out.
+ACTIONABLE at entry · BETTER_PRICE pulled back · RUNNING TP1 hit · EXTENDED
+ran away · INVALID stopped out.
 
-### Position sizing
-`qty = (equity × risk%) ÷ (entry − stop)`. At $10,000 with 0.5% risk and a $200
-stop distance that is $50 ÷ $200 = 0.25 units. The app never sizes for you.
+### Sizing
+`qty = (equity × risk%) ÷ (entry − stop)`. $10,000 at 0.5% with a $200 stop
+distance is $50 ÷ $200 = 0.25 units.
 
 ### Daily routine
-1. Overview for context. Fear & Greed under 25 favours accumulation.
-2. Scan. Work top grade down.
-3. Check portfolio heat before adding a correlated position.
-4. Place entry, stop and TP1 together. Never a market order without a stop.
-5. Log it in the Journal the same day.
+1. Macro tab for stance. Fear under 25 favours accumulation.
+2. Scan, work top grade down.
+3. Check portfolio heat before a correlated add.
+4. Place entry, stop and TP1 together.
+5. Log it the same day.
 
-### Venues
-Binance geo-blocks US datacentre IPs with HTTP 451. Streamlit Cloud runs in the
-US. A Cloudflare Worker proxy in the sidebar unblocks it. Without one, use OKX,
-bybit or bitget.
-
-### Rules that matter more than the tool
-- Risk 0.5% per trade, 3% total heat.
-- Max two correlated positions in the same direction.
-- No new entries within 24h of a major macro print.
+### Rules
+- 0.5% risk per trade, 3% total heat.
+- Two correlated positions maximum per direction.
+- No entries within 24h of a major macro print.
 - Paper trade 30 signals before real money.
-- If expectancy in R is negative over 50 trades, stop and re-tune.
 
 ### Troubleshooting
 | Symptom | Cause | Fix |
 |---|---|---|
-| universe under 5 | thin venue | pick okx or bybit |
-| loaded 0 | spot-only venue, no perps | same |
-| macro tab warning | `macro.py` has no `state()` | add one, or ignore |
-| Nothing reachable | all venues blocked | add the proxy URL |
-| Scan very slow | too many symbols | lower to 20 |
+| universe under 5 | thin venue | okx or bybit |
+| loaded 0 | venue refuses candles | perp symbol format |
+| Macro tab empty | `macro.py` has no `state()` | ignore, charts still work |
+| Nothing reachable | all venues blocked | add proxy URL |
 """)
 
 

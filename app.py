@@ -6,11 +6,15 @@ app.py - CryptoScan dashboard.
 """
 import inspect
 import json
+import os
 import pathlib
+import smtplib
 from dataclasses import replace
+from email.mime.text import MIMEText
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 import auth
@@ -37,6 +41,7 @@ from backtest.metrics import report
 from backtest.validate import monte_carlo_drawdown, permutation_test
 
 GRADE_ORDER = ["D", "C", "B", "A", "A+"]
+GRADE_RANK = {g: i for i, g in enumerate(GRADE_ORDER)}
 GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
@@ -50,6 +55,10 @@ MIN_PERPS = 20
 MAJORS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA", "AVAX", "LINK",
           "TON", "SUI", "DOT", "NEAR", "APT", "ARB", "OP", "INJ", "SEI", "TIA"]
 
+DEFAULT_TG_TOKEN = "9144109318:AAEl1Mj2_XBqOJIImkRFH_2HAumleexDcHY"
+DEFAULT_TG_CHAT = "6193241326"
+CREDS_FILE = pathlib.Path("./state/alerts.json")
+
 
 # ---------------------------------------------------------------- helpers
 def _call(mod, names, *a, **k):
@@ -62,6 +71,10 @@ def _call(mod, names, *a, **k):
 
 def _has(mod, names) -> bool:
     return any(callable(getattr(mod, n, None)) for n in names)
+
+
+def _rank(grade) -> int:
+    return GRADE_RANK.get(str(grade).strip(), 0)
 
 
 def _resolve(cfg, preferred, proxy):
@@ -201,6 +214,86 @@ def load_stats() -> dict:
     return {}
 
 
+# ---------------------------------------------------------------- creds
+def _saved() -> dict:
+    if CREDS_FILE.exists():
+        try:
+            return json.loads(CREDS_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _cred(key: str) -> str:
+    try:
+        if key in st.secrets and st.secrets[key]:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    if os.environ.get(key):
+        return os.environ[key]
+    saved = _saved().get(key)
+    if saved:
+        return str(saved)
+    if key == "TELEGRAM_TOKEN":
+        return DEFAULT_TG_TOKEN
+    if key == "TELEGRAM_CHAT_ID":
+        return DEFAULT_TG_CHAT
+    return "587" if key == "SMTP_PORT" else ""
+
+
+def _save_creds(d: dict) -> None:
+    CREDS_FILE.parent.mkdir(exist_ok=True)
+    CREDS_FILE.write_text(json.dumps(d, indent=2))
+
+
+def _send_telegram(text: str) -> tuple[bool, str]:
+    token, chat = _cred("TELEGRAM_TOKEN"), _cred("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return False, "missing token or chat id"
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat, "text": text, "disable_web_page_preview": True},
+            timeout=15)
+        if r.ok:
+            return True, "sent"
+        return False, f"telegram {r.status_code}: {r.text[:160]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _send_email(text: str) -> tuple[bool, str]:
+    host = _cred("SMTP_HOST")
+    user = _cred("SMTP_USER")
+    pw = _cred("SMTP_PASS")
+    to = _cred("ALERT_TO")
+    if not all([host, user, pw, to]):
+        return False, "email not configured"
+    try:
+        msg = MIMEText(text)
+        msg["Subject"] = "CryptoScan alert"
+        msg["From"] = user
+        msg["To"] = to
+        with smtplib.SMTP(host, int(_cred("SMTP_PORT") or 587), timeout=20) as s:
+            s.starttls()
+            s.login(user, pw)
+            s.send_message(msg)
+        return True, "sent"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def notify(text: str) -> tuple[bool, str]:
+    ok, msg = _send_telegram(text)
+    if ok:
+        return True, "telegram sent"
+    ok2, msg2 = _send_email(text)
+    if ok2:
+        return True, "email sent"
+    return False, f"{msg} | {msg2}"
+
+
 # ---------------------------------------------------------------- pipelines
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
@@ -208,8 +301,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     if relax:
         min_rr = max(1.2, min_rr * 0.7)
         max_stop_atr = max_stop_atr * 1.4
-        idx = GRADE_ORDER.index(min_grade)
-        min_grade = GRADE_ORDER[max(0, idx - 1)]
+        min_grade = GRADE_ORDER[max(0, _rank(min_grade) - 1)]
 
     cfg = build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, ex_name = _resolve(cfg, preferred, proxy)
@@ -218,8 +310,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     found = []
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
-            "graded": 0, "below_grade": 0, "relax": relax,
-            "rr": min_rr, "stop": max_stop_atr}
+            "stale": 0, "graded": 0, "below_grade": 0, "relax": relax,
+            "rr": min_rr, "stop": max_stop_atr, "recent": recent_bars}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)
@@ -240,7 +332,9 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             diag["kept"] += len(kept)
             if recent_bars and kept:
                 cut = df.index[max(0, len(df) - 1 - recent_bars)]
-                kept = [s for s in kept if s.ts >= cut]
+                fresh = [s for s in kept if s.ts >= cut]
+                diag["stale"] += len(kept) - len(fresh)
+                kept = fresh
             for s in kept:
                 s.meta["status"] = setup_status(s, df)
                 zone = (zu[0] if zu else None) if s.direction == "long" \
@@ -248,7 +342,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 rt = rate(s, ind.loc[s.ts], zone, cfg, stats)
                 s.meta["rating"] = rt
                 diag["graded"] += 1
-                if min_grade and GRADE_ORDER.index(rt.grade) > GRADE_ORDER.index(min_grade):
+                if _rank(rt.grade) > _rank(min_grade):
                     diag["below_grade"] += 1
                     continue
                 found.append(s)
@@ -357,17 +451,21 @@ with st.sidebar:
         format_func=lambda v: f"${v/1e6:.0f}M",
         help="Liquidity floor. Drops to zero automatically if it would leave "
              "you with almost nothing.")
-    recent = st.slider("Signal freshness (bars)", 1, 12, 2,
-                       help="How many bars back a break may be and still count.")
-    min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="B",
-                                 help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.")
-    only_ok = st.checkbox("Actionable only", value=True,
-                          help="Hide extended, invalid and past-target setups.")
+    recent = st.slider(
+        "Signal freshness (bars)", 1, 24, 6,
+        help="How many bars back a break may be and still count. 2 is very "
+             "strict on 4h — most scans return almost nothing. 6 to 12 is "
+             "practical.")
+    min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="C",
+                                 help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52. "
+                                      "C is a sane starting floor.")
+    only_ok = st.checkbox("Actionable only", value=False,
+                          help="Hide extended, invalid and past-target setups. "
+                               "Off by default so you can see what exists.")
     relax = st.checkbox(
-        "Relax filters", value=False,
+        "Relax filters", value=True,
         help="Widens the R:R floor to 70% and the stop cap to 140%, and drops "
-             "the grade floor one step. Use when a scan returns raw breaks but "
-             "nothing survives filtering.")
+             "the grade floor one step.")
     limit = st.slider("Max results", 3, 40, 10, help="Cap on cards rendered.")
 
     st.divider()
@@ -517,21 +615,24 @@ with tab_scan:
         st.caption(f"venue {diag['venue']} · perps {diag['perps']} · "
                    f"universe {diag['universe']} · loaded {diag['loaded']} · "
                    f"failed {diag['err']} · raw {diag['raw']} · "
-                   f"passed filters {diag['kept']} · graded {diag['graded']} · "
-                   f"below grade {diag['below_grade']}"
+                   f"passed filters {diag['kept']} · dropped stale {diag['stale']} · "
+                   f"graded {diag['graded']} · below grade {diag['below_grade']}"
                    + (f" · RELAXED R:R {diag['rr']:.2f} stop {diag['stop']:.1f}"
                       if diag["relax"] else ""))
 
-        if diag["raw"] and not diag["kept"]:
+        if diag["stale"] > 5 and diag["stale"] > diag["graded"]:
+            st.error(f"{diag['stale']} setups were discarded for being older "
+                     f"than {diag['recent']} bars. Raise Signal freshness to "
+                     f"12 or 24.")
+        elif diag["raw"] and not diag["kept"]:
             st.error(f"{diag['raw']} breaks found, all rejected by filters. "
-                     f"Tick Relax filters in the sidebar and rerun, or lower "
-                     f"Minimum R:R.")
+                     f"Tick Relax filters or lower Minimum R:R.")
         elif diag["kept"] and not diag["graded"]:
-            st.warning("Setups passed filters but all were below your grade floor. "
-                       "Lower Minimum grade or tick Relax filters.")
+            st.warning("Setups passed filters but all were stale. Raise Signal "
+                       "freshness.")
         elif diag["below_grade"] and not st.session_state.get("setups"):
-            st.warning(f"{diag['below_grade']} setup(s) graded below {min_grade}. "
-                       f"Lower the grade floor to see them.")
+            st.warning(f"{diag['below_grade']} setup(s) graded below "
+                       f"{min_grade}. Lower the grade floor.")
         elif not diag["raw"] and diag["loaded"] > 10:
             st.info("Pipeline healthy, no break-of-structure in this window. "
                     "Normal in chop. Try 1h.")
@@ -779,50 +880,47 @@ distort intraday structure.
 # ---------------------------------------------------------------- alerts
 with tab_alert:
     ui.section("Alerts", "Telegram and email delivery.")
-    try:
-        import alerts as al_mod
-        if _has(al_mod, ["is_configured", "configured"]):
-            try:
-                st.caption(f"configured: {_call(al_mod, ['is_configured', 'configured'])}")
-            except Exception:
-                pass
-        if st.button("Send test alert",
-                     help="Fire one test message to every configured channel."):
-            ok = _call(al_mod, ["send"], "test", "test", "CryptoScan test",
-                       "If you can read this, alerts work.")
-            if ok:
-                st.success("Test sent.")
-            else:
-                st.error("Not configured yet. Follow the steps below.")
-    except Exception as e:
-        st.warning(f"Alerts unavailable: {type(e).__name__}: {e}")
+    st.caption("These fields work directly. Values are saved to "
+               "state/alerts.json. Streamlit Secrets override them if present.")
+
+    tg1, tg2 = st.columns([2, 1])
+    tg_token = tg1.text_input("Telegram bot token", value=_cred("TELEGRAM_TOKEN"),
+                              type="password", help="From @BotFather.")
+    tg_chat = tg2.text_input("Chat id", value=_cred("TELEGRAM_CHAT_ID"),
+                             help="Your numeric id from @userinfobot.")
+
+    with st.expander("Email (optional)"):
+        e1, e2 = st.columns(2)
+        smtp_host = e1.text_input("SMTP host", value=_cred("SMTP_HOST"))
+        smtp_port = e2.text_input("SMTP port", value=_cred("SMTP_PORT"))
+        smtp_user = st.text_input("SMTP user", value=_cred("SMTP_USER"))
+        smtp_pass = st.text_input("SMTP password", value=_cred("SMTP_PASS"),
+                                  type="password")
+        alert_to = st.text_input("Send to", value=_cred("ALERT_TO"))
+
+    a1, a2 = st.columns(2)
+    if a1.button("Save settings", use_container_width=True,
+                 help="Write these values to state/alerts.json."):
+        _save_creds({"TELEGRAM_TOKEN": tg_token, "TELEGRAM_CHAT_ID": tg_chat,
+                     "SMTP_HOST": smtp_host, "SMTP_PORT": smtp_port,
+                     "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass,
+                     "ALERT_TO": alert_to})
+        st.success("Saved.")
+
+    if a2.button("Send test", type="primary", use_container_width=True,
+                 help="Send one test message. Tries Telegram, then email."):
+        _save_creds({"TELEGRAM_TOKEN": tg_token, "TELEGRAM_CHAT_ID": tg_chat,
+                     "SMTP_HOST": smtp_host, "SMTP_PORT": smtp_port,
+                     "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass,
+                     "ALERT_TO": alert_to})
+        with st.spinner("sending..."):
+            ok, msg = notify("CryptoScan test — if you can read this, alerts work.")
+        st.success(msg) if ok else st.error(msg)
 
     st.divider()
-    st.markdown("#### Telegram setup")
-    st.markdown("""
-1. Open Telegram and message **@BotFather**, send /newbot, follow the prompts.
-2. Copy the token it returns.
-3. Message **@userinfobot** to get your numeric chat id.
-4. Streamlit Cloud, Settings, Secrets, add two entries:
-
-        TELEGRAM_TOKEN = "9144109318:AAEl1Mj2_XBqOJIImkRFH_2HAumleexDcHY"
-        TELEGRAM_CHAT_ID = "6193241326"
-
-5. Save, reboot the app, press **Send test alert**.
-""")
-    st.caption("Bot tokens are long-lived. If you paste one publicly, revoke it "
-               "in BotFather with /revoke and set the new one.")
-
-    st.markdown("#### Email setup")
-    st.markdown("""
-Gmail needs an app password, not your account password. Add these in Secrets:
-
-        SMTP_HOST = "smtp.gmail.com"
-        SMTP_PORT = "587"
-        SMTP_USER = "you@gmail.com"
-        SMTP_PASS = "the-16-char-app-password"
-        ALERT_TO = "you@gmail.com"
-""")
+    st.caption("Note: on Streamlit Cloud the filesystem resets on redeploy, so "
+               "state/alerts.json is lost then. Put the same keys in Settings, "
+               "Secrets to make them permanent.")
 
 
 # ---------------------------------------------------------------- journal
@@ -855,21 +953,18 @@ with tab_guide:
     ui.section("User guide")
     st.markdown("""
 ### Getting signals to appear
-1. Set Exchange to okx or bybit.
-2. Set Minimum grade to C and tick Relax filters.
-3. Press Run scan.
+Defaults are now C grade, freshness 6, Relax on. Press Run scan.
 
-A 4h scan on 40 majors produces a handful of raw breaks and few survivors.
-That is the strategy being picky, not a bug.
+If you still see nothing, read the diagnostic line.
 
 ### Reading the diagnostic line
-venue · perps · universe · loaded · failed · raw · passed filters · graded · below grade
+venue · perps · universe · loaded · failed · raw · passed filters · dropped stale · graded · below grade
 
-- raw above 0 with passed filters at 0: filters too tight, tick Relax filters.
-- passed filters above 0 with graded at 0: all below your grade floor, lower it.
-- below grade above 0 with no results: signals exist, just not at your standard.
-- loaded 0: venue refuses candles, try BTC/USDT:USDT.
-- raw 0 with high loaded: genuine chop, try 1h.
+- dropped stale high: raise Signal freshness to 12 or 24
+- raw above 0, passed filters 0: tick Relax filters or lower Minimum R:R
+- below grade above 0: lower Minimum grade
+- loaded 0: try BTC/USDT:USDT
+- raw 0 with high loaded: genuine chop, try 1h
 
 ### Grades
 A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.
@@ -882,8 +977,8 @@ ran away · INVALID stopped out.
 qty = (equity × risk percent) ÷ (entry − stop)
 
 ### Radar
-Distance to the 200-day SMA. Under 0 means multi-cycle discount territory, the
-zone to ladder into slowly rather than a single-entry signal.
+Distance to the 200-day SMA. Under 0 is multi-cycle discount territory, a zone
+to ladder into, not a single entry.
 
 ### Daily routine
 1. Macro tab for stance.

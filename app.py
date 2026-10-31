@@ -19,6 +19,7 @@ import streamlit as st
 
 import auth
 import market
+import smc
 import ui
 from config import CFG
 
@@ -297,7 +298,8 @@ def notify(text: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------- pipelines
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                equity, recent_bars, min_grade, preferred, proxy, relax):
+                equity, recent_bars, min_grade, preferred, proxy, relax,
+                need_smc):
     if relax:
         min_rr = max(1.2, min_rr * 0.7)
         max_stop_atr = max_stop_atr * 1.4
@@ -310,8 +312,9 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     found = []
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
-            "stale": 0, "graded": 0, "below_grade": 0, "relax": relax,
-            "rr": min_rr, "stop": max_stop_atr, "recent": recent_bars}
+            "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
+            "relax": relax, "rr": min_rr, "stop": max_stop_atr,
+            "recent": recent_bars, "need_smc": need_smc}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)
@@ -342,15 +345,26 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 rt = rate(s, ind.loc[s.ts], zone, cfg, stats)
                 s.meta["rating"] = rt
                 diag["graded"] += 1
-                if _rank(rt.grade) > _rank(min_grade):
+                if _rank(rt.grade) < _rank(min_grade):
                     diag["below_grade"] += 1
+                    continue
+                try:
+                    sm = smc.confluence(df, s.direction, s.entry,
+                                        float(ind["atr"].iloc[-1]))
+                except Exception:
+                    sm = {"score": 0, "flags": [], "fvg": None, "ob": None,
+                          "pd": 50.0}
+                s.meta["smc"] = sm
+                if need_smc and sm["score"] < 1:
+                    diag["smc_skip"] += 1
                     continue
                 found.append(s)
         except Exception:
             diag["err"] += 1
             continue
 
-    found.sort(key=lambda s: (-s.meta["rating"].confidence, -s.score))
+    found.sort(key=lambda s: (-s.meta.get("smc", {}).get("score", 0),
+                              -s.meta["rating"].confidence, -s.score))
     return found, diag
 
 
@@ -381,7 +395,6 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_radar(exchange, preferred, proxy):
-    """200-day SMA distance across majors. No signals.py dependency."""
     cfg = build_cfg(exchange, 40, 30e6, "1d", 2.0, 3.5, 0.5, 10000)
     ex, name = _resolve(cfg, preferred, proxy)
     out = []
@@ -452,20 +465,22 @@ with st.sidebar:
         help="Liquidity floor. Drops to zero automatically if it would leave "
              "you with almost nothing.")
     recent = st.slider(
-        "Signal freshness (bars)", 1, 24, 6,
-        help="How many bars back a break may be and still count. 2 is very "
-             "strict on 4h — most scans return almost nothing. 6 to 12 is "
+        "Signal freshness (bars)", 1, 48, 12,
+        help="How many bars back a break may be and still count. On 4h, 12 bars "
+             "is two days. Weekends produce few new breaks, so 12 to 24 is "
              "practical.")
     min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="C",
-                                 help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52. "
-                                      "C is a sane starting floor.")
+                                 help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.")
     only_ok = st.checkbox("Actionable only", value=False,
-                          help="Hide extended, invalid and past-target setups. "
-                               "Off by default so you can see what exists.")
-    relax = st.checkbox(
-        "Relax filters", value=True,
-        help="Widens the R:R floor to 70% and the stop cap to 140%, and drops "
-             "the grade floor one step.")
+                          help="Hide extended, invalid and past-target setups.")
+    relax = st.checkbox("Relax filters", value=True,
+                        help="Widens R:R to 70% and stop cap to 140%, and drops "
+                             "the grade floor one step.")
+    need_smc = st.checkbox(
+        "Require SMC confluence", value=False,
+        help="Only show setups with at least one smart money factor: an "
+             "unfilled gap, an order block, a sweep, or correct premium / "
+             "discount positioning.")
     limit = st.slider("Max results", 3, 40, 10, help="Cap on cards rendered.")
 
     st.divider()
@@ -485,8 +500,8 @@ with st.sidebar:
 st.markdown(
     f"""<div class="hero">
     <h1>Market desk</h1>
-    <p>Break-of-structure scanner with transparent grading, portfolio heat and
-    Monte Carlo validation. Signed in as <b>{USER}</b>.</p>
+    <p>Break-of-structure scanner with grading, smart money confluence,
+    portfolio heat and Monte Carlo validation. Signed in as <b>{USER}</b>.</p>
     </div>""",
     unsafe_allow_html=True,
 )
@@ -518,9 +533,9 @@ st.caption("Source: CoinGecko and alternative.me. Cached two minutes.")
 
 st.write("")
 
-tabs = st.tabs(["Overview", "Scan", "Radar", "Portfolio", "Backtest",
+tabs = st.tabs(["Overview", "Scan", "SMC", "Radar", "Portfolio", "Backtest",
                 "Macro", "Alerts", "Journal", "Guide"])
-(tab_ov, tab_scan, tab_radar, tab_pf, tab_bt,
+(tab_ov, tab_scan, tab_smc, tab_radar, tab_pf, tab_bt,
  tab_macro, tab_alert, tab_journal, tab_guide) = tabs
 
 
@@ -529,8 +544,7 @@ with tab_ov:
     ui.section("Coin detail", "Candles, trend state and venue depth.")
     d1, d2 = st.columns([2, 1])
     detail_sym = d1.text_input("Symbol", "BTC/USDT:USDT", key="detail_sym",
-                               help="Unified ccxt symbol. BTC/USDT spot, "
-                                    "BTC/USDT:USDT perpetual.")
+                               help="Unified ccxt symbol.")
     detail_tf = d2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
                              key="detail_tf", help="Chart resolution.")
 
@@ -603,7 +617,8 @@ with tab_scan:
             with st.spinner("Scanning..."):
                 found, diag = cached_scan(
                     exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                    equity, recent, min_grade, exch, proxy.strip() or None, relax)
+                    equity, recent, min_grade, exch, proxy.strip() or None,
+                    relax, need_smc)
             st.session_state["setups"] = found
             st.session_state["diag"] = diag
         except Exception as e:
@@ -616,23 +631,23 @@ with tab_scan:
                    f"universe {diag['universe']} · loaded {diag['loaded']} · "
                    f"failed {diag['err']} · raw {diag['raw']} · "
                    f"passed filters {diag['kept']} · dropped stale {diag['stale']} · "
-                   f"graded {diag['graded']} · below grade {diag['below_grade']}"
+                   f"graded {diag['graded']} · below grade {diag['below_grade']} · "
+                   f"smc rejected {diag['smc_skip']}"
                    + (f" · RELAXED R:R {diag['rr']:.2f} stop {diag['stop']:.1f}"
                       if diag["relax"] else ""))
 
-        if diag["stale"] > 5 and diag["stale"] > diag["graded"]:
-            st.error(f"{diag['stale']} setups were discarded for being older "
-                     f"than {diag['recent']} bars. Raise Signal freshness to "
-                     f"12 or 24.")
+        if diag["stale"] > 5 and diag["stale"] >= diag["graded"]:
+            st.error(f"{diag['stale']} setups were older than {diag['recent']} "
+                     f"bars. Raise Signal freshness to 24 or 48.")
         elif diag["raw"] and not diag["kept"]:
             st.error(f"{diag['raw']} breaks found, all rejected by filters. "
                      f"Tick Relax filters or lower Minimum R:R.")
-        elif diag["kept"] and not diag["graded"]:
-            st.warning("Setups passed filters but all were stale. Raise Signal "
-                       "freshness.")
         elif diag["below_grade"] and not st.session_state.get("setups"):
             st.warning(f"{diag['below_grade']} setup(s) graded below "
                        f"{min_grade}. Lower the grade floor.")
+        elif diag["smc_skip"] and not st.session_state.get("setups"):
+            st.warning(f"{diag['smc_skip']} setup(s) lacked SMC confluence. "
+                       f"Uncheck Require SMC confluence.")
         elif not diag["raw"] and diag["loaded"] > 10:
             st.info("Pipeline healthy, no break-of-structure in this window. "
                     "Normal in chop. Try 1h.")
@@ -649,6 +664,7 @@ with tab_scan:
         else:
             st.dataframe(pd.DataFrame([{
                 "grade": s.meta["rating"].grade, "coin": s.symbol,
+                "smc": s.meta.get("smc", {}).get("score", 0),
                 "dir": s.direction.upper(), "status": s.meta.get("status"),
                 "score": s.score, "entry": f"{s.entry:,.6g}",
                 "stop": f"{s.stop:,.6g}", "tp1": f"{s.tp1:,.6g}",
@@ -657,8 +673,10 @@ with tab_scan:
 
             for s in rows:
                 rt = s.meta["rating"]
+                sm = s.meta.get("smc", {})
                 with st.expander(f"{rt.grade} · {s.symbol} · "
-                                 f"{s.direction.upper()} · {s.meta.get('status')}"):
+                                 f"{s.direction.upper()} · {s.meta.get('status')}"
+                                 f" · smc {sm.get('score', 0):+d}"):
                     st.markdown(
                         f'<span class="pill {GRADE_TONE.get(rt.grade, "mut")}">'
                         f'{rt.grade} · {rt.score}/100</span>',
@@ -666,10 +684,117 @@ with tab_scan:
                     st.write(f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
                              f"**TP1** {s.tp1:,.6g} · **TP2** {s.tp2:,.6g}")
                     st.write(f"Risk **{s.risk_pct:.2f}%** · R:R **{s.rr:.2f}**")
+                    if sm.get("flags"):
+                        st.write("**Smart money** " + " · ".join(sm["flags"]))
                     for p in rt.positives:
                         st.write(f"- {p}")
                     for n in rt.negatives:
                         st.write(f"- {n}")
+
+
+# ---------------------------------------------------------------- smc
+with tab_smc:
+    ui.section("Smart money map", "Fair value gaps, order blocks, sweeps and "
+                                  "premium/discount for one symbol.")
+    s1, s2 = st.columns([2, 1])
+    smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym",
+                            help="Pair to map.")
+    smc_tf = s2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
+                          key="smc_tf", help="Chart resolution.")
+
+    if st.button("Build map", type="primary",
+                 help="Draw unfilled gaps, order blocks and sweeps."):
+        try:
+            cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
+                            risk_pct, equity)
+            ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
+            df, used = _load(ex, smc_sym, smc_tf, 400)
+            if df is None:
+                st.warning(f"No data for {smc_sym} on {ex_name}.")
+            else:
+                pd_val = smc.premium_discount(df)
+                gaps = smc.fair_value_gaps(df)
+                blocks = smc.order_blocks(df)
+                sweeps = smc.liquidity_sweeps(df)
+
+                k1, k2, k3, k4 = st.columns(4)
+                ui.stat(k1, "Range position", f"{pd_val:.0f}%",
+                        "up" if pd_val <= 35 else "dn" if pd_val >= 65 else "")
+                ui.stat(k2, "Unfilled gaps", str(len(gaps)))
+                ui.stat(k3, "Order blocks", str(len(blocks)))
+                ui.stat(k4, "Recent sweeps", str(len(sweeps)))
+
+                zone = ("discount — longs favoured" if pd_val <= 35
+                        else "premium — shorts favoured" if pd_val >= 65
+                        else "equilibrium — wait for an edge")
+                st.caption(f"{zone} · venue {ex_name} · symbol {used}")
+
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=df.index, open=df["open"], high=df["high"],
+                    low=df["low"], close=df["close"], name="price",
+                    increasing_line_color="#16c784",
+                    decreasing_line_color="#ea3943"))
+                for g in gaps:
+                    fig.add_shape(type="rect", x0=df.index[g["idx"]],
+                                  x1=df.index[-1], y0=g["bot"], y1=g["top"],
+                                  fillcolor=("rgba(22,199,132,.16)"
+                                             if g["dir"] == "bull"
+                                             else "rgba(234,57,67,.16)"),
+                                  line=dict(width=0))
+                for b in blocks:
+                    fig.add_shape(type="rect", x0=df.index[b["idx"]],
+                                  x1=df.index[min(b["idx"] + 12, len(df) - 1)],
+                                  y0=b["bot"], y1=b["top"],
+                                  fillcolor=("rgba(20,184,166,.22)"
+                                             if b["dir"] == "bull"
+                                             else "rgba(240,185,11,.22)"),
+                                  line=dict(width=1, color="#14b8a6"))
+                for sw in sweeps:
+                    fig.add_trace(go.Scatter(
+                        x=[df.index[sw["idx"]]], y=[sw["level"]],
+                        mode="markers", name="sweep",
+                        marker=dict(size=10, symbol="x", color="#f0b90b"),
+                        showlegend=False))
+                fig.update_layout(height=460, template="plotly_dark",
+                                  paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
+                                  margin=dict(l=6, r=6, t=6, b=6),
+                                  xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.caption("Green bands are bullish gaps and blocks, red are "
+                           "bearish. Yellow crosses are swept extremes.")
+                if gaps or blocks or sweeps:
+                    st.dataframe(pd.DataFrame([{
+                        "type": "gap" if g else "block",
+                        "dir": (g or b)["dir"],
+                        "top": round((g or b)["top"], 6),
+                        "bottom": round((g or b)["bot"], 6),
+                    } for g, b in [(x, None) for x in gaps]
+                        + [(None, y) for y in blocks]]),
+                        hide_index=True, use_container_width=True)
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
+
+    st.divider()
+    st.markdown("""
+**How to read it**
+
+A fair value gap is a three-candle imbalance where price moved so fast one
+side never traded. Unfilled gaps act like magnets — price often returns to
+rebalance them, which is where the retest entry lives.
+
+An order block is the last opposite candle before a displacement leg. It marks
+where a large resting order sat, so it is the zone to lean on rather than chase
+through.
+
+A sweep is a wick through a prior high or low that closes back inside. That is
+stop-hunting: liquidity taken, then reversal. Best used as confirmation, not
+alone.
+
+Premium and discount split the recent range in half. Longs in the lower third
+and shorts in the upper third mean you are not paying equilibrium prices.
+""")
 
 
 # ---------------------------------------------------------------- radar
@@ -859,29 +984,25 @@ with tab_macro:
     for n in notes:
         st.write(f"- {n}")
     st.markdown("""
-**Fear & Greed** aggregates volatility, momentum, chatter and dominance into one
-number. It is a crowd gauge, not a timing tool. Deep fear gives better prices but
-worse follow-through.
+**Fear & Greed** is a crowd gauge, not a timing tool. Deep fear gives better
+prices but worse follow-through.
 
-**Dominance** shows where market cap sits. Rising BTC dominance means capital is
-retreating into the largest asset and alts underperform. Falling dominance is
-rotation into alts, where alt breakouts actually run.
+**Dominance** shows where capital sits. Rising BTC dominance means alts bleed.
+Falling dominance is rotation into alts.
 
-**Stablecoin share** is unspent buying power. Rising is fuel, not a signal.
+**Stablecoin share** is unspent buying power.
 
-**Market cap trend** shows expansion or contraction. Longs work better in
-expansion, shorts in contraction.
+**Market cap trend** shows expansion or contraction.
 
-**Blackout** comes from the economic calendar. Rate decisions and CPI prints
-distort intraday structure.
+**Blackout** comes from the economic calendar.
 """)
 
 
 # ---------------------------------------------------------------- alerts
 with tab_alert:
     ui.section("Alerts", "Telegram and email delivery.")
-    st.caption("These fields work directly. Values are saved to "
-               "state/alerts.json. Streamlit Secrets override them if present.")
+    st.caption("These fields work directly and save to state/alerts.json. "
+               "Streamlit Secrets override them if present.")
 
     tg1, tg2 = st.columns([2, 1])
     tg_token = tg1.text_input("Telegram bot token", value=_cred("TELEGRAM_TOKEN"),
@@ -914,13 +1035,12 @@ with tab_alert:
                      "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass,
                      "ALERT_TO": alert_to})
         with st.spinner("sending..."):
-            ok, msg = notify("CryptoScan test — if you can read this, alerts work.")
+            ok, msg = notify("CryptoScan test — if this arrives, alerts work.")
         st.success(msg) if ok else st.error(msg)
 
     st.divider()
-    st.caption("Note: on Streamlit Cloud the filesystem resets on redeploy, so "
-               "state/alerts.json is lost then. Put the same keys in Settings, "
-               "Secrets to make them permanent.")
+    st.caption("If Telegram returns 400 chat not found, open your bot in "
+               "Telegram and send /start once. 401 means the token is wrong.")
 
 
 # ---------------------------------------------------------------- journal
@@ -953,18 +1073,16 @@ with tab_guide:
     ui.section("User guide")
     st.markdown("""
 ### Getting signals to appear
-Defaults are now C grade, freshness 6, Relax on. Press Run scan.
-
-If you still see nothing, read the diagnostic line.
+Defaults are C grade, freshness 12, Relax on. Press Run scan.
 
 ### Reading the diagnostic line
-venue · perps · universe · loaded · failed · raw · passed filters · dropped stale · graded · below grade
+venue · perps · universe · loaded · failed · raw · passed filters · dropped stale · graded · below grade · smc rejected
 
-- dropped stale high: raise Signal freshness to 12 or 24
-- raw above 0, passed filters 0: tick Relax filters or lower Minimum R:R
+- dropped stale high: raise freshness to 24 or 48
+- raw above 0, passed filters 0: tick Relax filters
 - below grade above 0: lower Minimum grade
+- smc rejected above 0: uncheck Require SMC confluence
 - loaded 0: try BTC/USDT:USDT
-- raw 0 with high loaded: genuine chop, try 1h
 
 ### Grades
 A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.
@@ -976,16 +1094,17 @@ ran away · INVALID stopped out.
 ### Sizing
 qty = (equity × risk percent) ÷ (entry − stop)
 
-### Radar
-Distance to the 200-day SMA. Under 0 is multi-cycle discount territory, a zone
-to ladder into, not a single entry.
+### Smart money
+The SMC tab draws unfilled gaps, order blocks and sweeps, and tells you whether
+price is in premium or discount. The scan card shows an smc score. Positive
+means structure backs the setup, negative means it fights it.
 
 ### Daily routine
 1. Macro tab for stance.
-2. Scan, work top grade down.
-3. Check heat before a correlated add.
-4. Entry, stop and TP1 together.
-5. Log it the same day.
+2. SMC tab on the coin you are considering.
+3. Scan, work top grade down, prefer positive smc scores.
+4. Check heat before a correlated add.
+5. Entry, stop and TP1 together. Log it.
 """)
 
 

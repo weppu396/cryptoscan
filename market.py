@@ -40,8 +40,21 @@ def overview() -> dict:
     return out
 
 
+def ticker_rows(limit: int = 24) -> list[dict]:
+    """Compact top-cap rows for the live strip."""
+    try:
+        rows = _get("https://api.coingecko.com/api/v3/coins/markets"
+                    "?vs_currency=usd&order=market_cap_desc"
+                    f"&per_page={limit}&page=1&price_change_percentage=24h",
+                    timeout=10)
+    except Exception:
+        return []
+    return [{"symbol": r["symbol"].upper(), "price": r["current_price"],
+             "chg": r.get("price_change_percentage_24h") or 0.0}
+            for r in rows if r.get("current_price")]
+
+
 def btc_history(days: int = 90) -> tuple[list, list]:
-    """Daily BTC market cap and price series."""
     try:
         d = _get("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
                  f"?vs_currency=usd&days={days}&interval=daily", timeout=20)
@@ -51,7 +64,6 @@ def btc_history(days: int = 90) -> tuple[list, list]:
 
 
 def dominance_split(ov: dict) -> tuple[list, list]:
-    """BTC / ETH / rest as market cap slices."""
     total = ov.get("total_mcap")
     btc, eth = ov.get("btc_dom"), ov.get("eth_dom")
     if not total or btc is None:
@@ -63,7 +75,6 @@ def dominance_split(ov: dict) -> tuple[list, list]:
 
 
 def stable_ratio(ov: dict):
-    """Stablecoin cap as a share of total. Higher means more dry powder."""
     if not ov.get("stable_mcap") or not ov.get("total_mcap"):
         return None
     return ov["stable_mcap"] / ov["total_mcap"] * 100
@@ -111,7 +122,6 @@ def regime_label(fng) -> tuple[str, str]:
 
 
 def stance(fng, btc_dom, stab) -> tuple[str, str, list[str]]:
-    """Turn the numbers into a plain position stance."""
     notes = []
     if fng is None:
         return "unknown", "mut", ["Fear & Greed unavailable."]

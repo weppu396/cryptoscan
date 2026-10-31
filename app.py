@@ -320,7 +320,7 @@ def cached_radar(exchange, preferred, proxy):
 with st.sidebar:
     st.markdown('<div class="auth-logo">◈</div>', unsafe_allow_html=True)
     st.markdown("**CryptoScan**")
-    st.caption(f"signed in as `{USER}`")
+    st.caption(f"signed in as {USER}")
     if st.button("Sign out", use_container_width=True,
                  help="End this session and return to the login screen."):
         auth.logout()
@@ -514,7 +514,7 @@ with tab_scan:
 
     diag = st.session_state.get("diag")
     if diag:
-        st.caption(f"venue `{diag['venue']}` · perps {diag['perps']} · "
+        st.caption(f"venue {diag['venue']} · perps {diag['perps']} · "
                    f"universe {diag['universe']} · loaded {diag['loaded']} · "
                    f"failed {diag['err']} · raw {diag['raw']} · "
                    f"passed filters {diag['kept']} · graded {diag['graded']} · "
@@ -524,7 +524,7 @@ with tab_scan:
 
         if diag["raw"] and not diag["kept"]:
             st.error(f"{diag['raw']} breaks found, all rejected by filters. "
-                     f"Tick **Relax filters** in the sidebar and rerun, or lower "
+                     f"Tick Relax filters in the sidebar and rerun, or lower "
                      f"Minimum R:R.")
         elif diag["kept"] and not diag["graded"]:
             st.warning("Setups passed filters but all were below your grade floor. "
@@ -800,95 +800,99 @@ with tab_alert:
     st.divider()
     st.markdown("#### Telegram setup")
     st.markdown("""
-1. Open Telegram and message **@BotFather**, send `/newbot`, follow the prompts.
+1. Open Telegram and message **@BotFather**, send /newbot, follow the prompts.
 2. Copy the token it returns.
 3. Message **@userinfobot** to get your numeric chat id.
-4. Streamlit Cloud, Settings, **Secrets**, add:
+4. Streamlit Cloud, Settings, Secrets, add two entries:
 
-```toml
-TELEGRAM_TOKEN = "your-bot-token"
-TELEGRAM_CHAT_ID = "your-numeric-id"
-Save, reboot the app, press Send test alert.
+        TELEGRAM_TOKEN = "your-bot-token"
+        TELEGRAM_CHAT_ID = "your-numeric-id"
+
+5. Save, reboot the app, press **Send test alert**.
 """)
-st.caption("Bot tokens are long-lived. If you ever paste one publicly, "
-"revoke it in BotFather with /revoke and set the new one.")
+    st.caption("Bot tokens are long-lived. If you paste one publicly, revoke it "
+               "in BotFather with /revoke and set the new one.")
 
-st.markdown("#### Email setup")
-st.markdown("""
-Gmail needs an app password, not your account password.
+    st.markdown("#### Email setup")
+    st.markdown("""
+Gmail needs an app password, not your account password. Add these in Secrets:
 
-toml
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = "587"
-SMTP_USER = "you@gmail.com"
-SMTP_PASS = "the-16-char-app-password"
-ALERT_TO = "you@gmail.com"
+        SMTP_HOST = "smtp.gmail.com"
+        SMTP_PORT = "587"
+        SMTP_USER = "you@gmail.com"
+        SMTP_PASS = "the-16-char-app-password"
+        ALERT_TO = "you@gmail.com"
 """)
 
----------------------------------------------------------------- journal
+
+# ---------------------------------------------------------------- journal
 with tab_journal:
-ui.section("Journal", "Log every trade. The rules column is the one that matters.")
-with st.form("journal", clear_on_submit=True):
-j1, j2, j3, j4 = st.columns(4)
-j_sym = j1.text_input("Symbol", help="Pair traded.")
-j_dir = j2.selectbox("Side", ["long", "short"], help="Direction.")
-j_r = j3.number_input("Result (R)", -10.0, 10.0, 0.0, step=0.1,
-help="Outcome in R. -1 means the stop was hit.")
-j_ok = j4.checkbox("Followed rules", value=True,
-help="Did you take it exactly as the card said?")
-j_note = st.text_input("Note", help="What you saw, what you did.")
-if st.form_submit_button("Log"):
-p = pathlib.Path("./state/journal.csv")
-p.parent.mkdir(exist_ok=True)
-pd.DataFrame([{"ts": pd.Timestamp.utcnow(), "symbol": j_sym,
-"dir": j_dir, "R": j_r, "followed": j_ok,
-"note": j_note}]).to_csv(
-p, mode="a", header=not p.exists(), index=False)
-st.success("Logged.")
-if pathlib.Path("./state/journal.csv").exists():
-st.dataframe(pd.read_csv("./state/journal.csv").tail(100),
-hide_index=True, use_container_width=True)
+    ui.section("Journal", "Log every trade. The rules column is the one that matters.")
+    with st.form("journal", clear_on_submit=True):
+        j1, j2, j3, j4 = st.columns(4)
+        j_sym = j1.text_input("Symbol", help="Pair traded.")
+        j_dir = j2.selectbox("Side", ["long", "short"], help="Direction.")
+        j_r = j3.number_input("Result (R)", -10.0, 10.0, 0.0, step=0.1,
+                              help="Outcome in R. -1 means the stop was hit.")
+        j_ok = j4.checkbox("Followed rules", value=True,
+                           help="Did you take it exactly as the card said?")
+        j_note = st.text_input("Note", help="What you saw, what you did.")
+        if st.form_submit_button("Log"):
+            p = pathlib.Path("./state/journal.csv")
+            p.parent.mkdir(exist_ok=True)
+            pd.DataFrame([{"ts": pd.Timestamp.utcnow(), "symbol": j_sym,
+                           "dir": j_dir, "R": j_r, "followed": j_ok,
+                           "note": j_note}]).to_csv(
+                p, mode="a", header=not p.exists(), index=False)
+            st.success("Logged.")
+    if pathlib.Path("./state/journal.csv").exists():
+        st.dataframe(pd.read_csv("./state/journal.csv").tail(100),
+                     hide_index=True, use_container_width=True)
 
----------------------------------------------------------------- guide
+
+# ---------------------------------------------------------------- guide
 with tab_guide:
-ui.section("User guide")
-st.markdown("""
+    ui.section("User guide")
+    st.markdown("""
+### Getting signals to appear
+1. Set Exchange to okx or bybit.
+2. Set Minimum grade to C and tick Relax filters.
+3. Press Run scan.
 
-Getting signals to appear
-Set Exchange to okx or bybit.
-Set Minimum grade to C and tick Relax filters.
-Press Run scan.
 A 4h scan on 40 majors produces a handful of raw breaks and few survivors.
 That is the strategy being picky, not a bug.
 
-Reading the diagnostic line
+### Reading the diagnostic line
 venue · perps · universe · loaded · failed · raw · passed filters · graded · below grade
 
-raw > 0, passed filters 0 — filters too tight. Tick Relax filters.
-passed filters > 0, graded 0 — all below your grade floor. Lower it.
-below grade > 0, no results — signals exist, just not at your standard.
-loaded 0 — venue refuses candles. Try BTC/USDT:USDT.
-raw 0, loaded high — genuine chop. Try 1h.
-Grades
+- raw above 0 with passed filters at 0: filters too tight, tick Relax filters.
+- passed filters above 0 with graded at 0: all below your grade floor, lower it.
+- below grade above 0 with no results: signals exist, just not at your standard.
+- loaded 0: venue refuses candles, try BTC/USDT:USDT.
+- raw 0 with high loaded: genuine chop, try 1h.
+
+### Grades
 A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.
 
-Status
+### Status
 ACTIONABLE at entry · BETTER_PRICE pulled back · RUNNING TP1 hit · EXTENDED
 ran away · INVALID stopped out.
 
-Sizing
-qty = (equity × risk%) ÷ (entry − stop).
+### Sizing
+qty = (equity × risk percent) ÷ (entry − stop)
 
-Radar
+### Radar
 Distance to the 200-day SMA. Under 0 means multi-cycle discount territory, the
 zone to ladder into slowly rather than a single-entry signal.
 
-Daily routine
-Macro tab for stance.
-Scan, work top grade down.
-Check heat before a correlated add.
-Entry, stop and TP1 together.
-Log it the same day.
+### Daily routine
+1. Macro tab for stance.
+2. Scan, work top grade down.
+3. Check heat before a correlated add.
+4. Entry, stop and TP1 together.
+5. Log it the same day.
 """)
+
+
 st.divider()
 st.caption("CryptoScan · not financial advice")

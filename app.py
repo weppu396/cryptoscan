@@ -132,7 +132,8 @@ def _universe(ex, min_vol: int, top: int) -> tuple[list[str], int, int]:
     syms = [r[0] for r in filtered[:top]]
     if not syms:
         base = "BTC/USDT:USDT" if len(perps) >= 10 else "BTC/USDT"
-        syms = [base.replace("BTC", c) for c in MAJORS if base.replace("BTC", c) in ex.markets]
+        syms = [base.replace("BTC", c) for c in MAJORS
+                if base.replace("BTC", c) in ex.markets]
     return syms, floor, len(perps)
 
 
@@ -242,7 +243,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 kept = [s for s in kept if s.ts >= cut]
             for s in kept:
                 s.meta["status"] = setup_status(s, df)
-                zone = (zu[0] if zu else None) if s.direction == "long" else (zd[0] if zd else None)
+                zone = (zu[0] if zu else None) if s.direction == "long" \
+                    else (zd[0] if zd else None)
                 rt = rate(s, ind.loc[s.ts], zone, cfg, stats)
                 s.meta["rating"] = rt
                 diag["graded"] += 1
@@ -363,9 +365,9 @@ with st.sidebar:
                           help="Hide extended, invalid and past-target setups.")
     relax = st.checkbox(
         "Relax filters", value=False,
-        help="Widens R:R floor to 70% and stop cap to 140%, and drops the grade "
-             "floor one step. Use when a scan returns raw breaks but nothing "
-             "survives filtering.")
+        help="Widens the R:R floor to 70% and the stop cap to 140%, and drops "
+             "the grade floor one step. Use when a scan returns raw breaks but "
+             "nothing survives filtering.")
     limit = st.slider("Max results", 3, 40, 10, help="Cap on cards rendered.")
 
     st.divider()
@@ -517,7 +519,8 @@ with tab_scan:
                    f"failed {diag['err']} · raw {diag['raw']} · "
                    f"passed filters {diag['kept']} · graded {diag['graded']} · "
                    f"below grade {diag['below_grade']}"
-                   + (f" · RELAXED R:R {diag['rr']:.2f} stop {diag['stop']:.1f}" if diag["relax"] else ""))
+                   + (f" · RELAXED R:R {diag['rr']:.2f} stop {diag['stop']:.1f}"
+                      if diag["relax"] else ""))
 
         if diag["raw"] and not diag["kept"]:
             st.error(f"{diag['raw']} breaks found, all rejected by filters. "
@@ -797,19 +800,23 @@ with tab_alert:
     st.divider()
     st.markdown("#### Telegram setup")
     st.markdown("""
-1. Open Telegram, message **@BotFather**, send `/newbot`, follow the prompts.
-2. Copy the token it gives you.
+1. Open Telegram and message **@BotFather**, send `/newbot`, follow the prompts.
+2. Copy the token it returns.
 3. Message **@userinfobot** to get your numeric chat id.
-4. Streamlit Cloud → Settings → **Secrets**, add:
+4. Streamlit Cloud, Settings, **Secrets**, add:
 
 ```toml
-TELEGRAM_TOKEN = "9144109318:AAEl1Mj2_XBqOJIImkRFH_2HAumleexDcHY"
-TELEGRAM_CHAT_ID = "6193241326"
+TELEGRAM_TOKEN = "your-bot-token"
+TELEGRAM_CHAT_ID = "your-numeric-id"
 Save, reboot the app, press Send test alert.
 """)
+st.caption("Bot tokens are long-lived. If you ever paste one publicly, "
+"revoke it in BotFather with /revoke and set the new one.")
+
 st.markdown("#### Email setup")
 st.markdown("""
-Gmail needs an app password, not your normal one.
+Gmail needs an app password, not your account password.
+
 toml
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = "587"
@@ -851,8 +858,8 @@ Getting signals to appear
 Set Exchange to okx or bybit.
 Set Minimum grade to C and tick Relax filters.
 Press Run scan.
-A 4h scan on 40 majors typically produces a handful of raw breaks and few
-survivors. That is the strategy being picky, not a bug.
+A 4h scan on 40 majors produces a handful of raw breaks and few survivors.
+That is the strategy being picky, not a bug.
 
 Reading the diagnostic line
 venue · perps · universe · loaded · failed · raw · passed filters · graded · below grade
@@ -873,8 +880,8 @@ Sizing
 qty = (equity × risk%) ÷ (entry − stop).
 
 Radar
-Distance to the 200-day SMA. Under 0 means multi-cycle discount territory — the
-zone to ladder into slowly, not a single-entry signal.
+Distance to the 200-day SMA. Under 0 means multi-cycle discount territory, the
+zone to ladder into slowly rather than a single-entry signal.
 
 Daily routine
 Macro tab for stance.

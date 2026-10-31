@@ -805,8 +805,8 @@ with tab_alert:
 3. Message **@userinfobot** to get your numeric chat id.
 4. Streamlit Cloud, Settings, Secrets, add two entries:
 
-        TELEGRAM_TOKEN = "your-bot-token"
-        TELEGRAM_CHAT_ID = "your-numeric-id"
+        TELEGRAM_TOKEN = "9144109318:AAEl1Mj2_XBqOJIImkRFH_2HAumleexDcHY"
+        TELEGRAM_CHAT_ID = "6193241326"
 
 5. Save, reboot the app, press **Send test alert**.
 """)

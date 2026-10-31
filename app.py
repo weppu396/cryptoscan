@@ -1,5 +1,5 @@
 """
-app.py - CryptoScan dashboard.
+app.py - CryptoScan. Spot mode and Bot mode.
 
     pip install -r requirements.txt
     streamlit run app.py
@@ -18,6 +18,7 @@ import requests
 import streamlit as st
 
 import auth
+import learn
 import market
 import smc
 import ui
@@ -74,8 +75,46 @@ def _has(mod, names) -> bool:
     return any(callable(getattr(mod, n, None)) for n in names)
 
 
-def _rank(grade) -> int:
-    return GRADE_RANK.get(str(grade).strip(), 0)
+def _rank(g) -> int:
+    return GRADE_RANK.get(str(g).strip(), 0)
+
+
+def _norm(rt) -> dict:
+    """Coerce whatever rate() returned into a plain dict."""
+    out = {"grade": "D", "score": 0, "confidence": 0.0,
+           "positives": [], "negatives": [], "improve": []}
+    if rt is None:
+        return out
+    if isinstance(rt, dict):
+        src = rt
+    elif isinstance(rt, (tuple, list)):
+        src = {}
+        if len(rt) > 0:
+            src["grade"] = rt[0]
+        if len(rt) > 1:
+            src["score"] = rt[1]
+    else:
+        src = {k: getattr(rt, k, None) for k in out}
+    for k in out:
+        v = src.get(k)
+        if v is not None:
+            out[k] = v
+    try:
+        out["score"] = int(out["score"] or 0)
+    except Exception:
+        out["score"] = 0
+    try:
+        out["confidence"] = float(out["confidence"] or 0)
+    except Exception:
+        out["confidence"] = 0.0
+    for k in ("positives", "negatives", "improve"):
+        try:
+            out[k] = list(out[k] or [])
+        except Exception:
+            out[k] = []
+    if str(out["grade"]) not in GRADE_RANK:
+        out["grade"] = "D"
+    return out
 
 
 def _resolve(cfg, preferred, proxy):
@@ -265,17 +304,14 @@ def _send_telegram(text: str) -> tuple[bool, str]:
 
 
 def _send_email(text: str) -> tuple[bool, str]:
-    host = _cred("SMTP_HOST")
-    user = _cred("SMTP_USER")
-    pw = _cred("SMTP_PASS")
-    to = _cred("ALERT_TO")
+    host, user = _cred("SMTP_HOST"), _cred("SMTP_USER")
+    pw, to = _cred("SMTP_PASS"), _cred("ALERT_TO")
     if not all([host, user, pw, to]):
         return False, "email not configured"
     try:
         msg = MIMEText(text)
         msg["Subject"] = "CryptoScan alert"
-        msg["From"] = user
-        msg["To"] = to
+        msg["From"], msg["To"] = user, to
         with smtplib.SMTP(host, int(_cred("SMTP_PORT") or 587), timeout=20) as s:
             s.starttls()
             s.login(user, pw)
@@ -299,7 +335,7 @@ def notify(text: str) -> tuple[bool, str]:
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 equity, recent_bars, min_grade, preferred, proxy, relax,
-                need_smc):
+                need_smc, long_only):
     if relax:
         min_rr = max(1.2, min_rr * 0.7)
         max_stop_atr = max_stop_atr * 1.4
@@ -314,7 +350,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
             "relax": relax, "rr": min_rr, "stop": max_stop_atr,
-            "recent": recent_bars, "need_smc": need_smc}
+            "recent": recent_bars}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)
@@ -332,6 +368,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             raw = scan_bos_retest(used_sym, df, hb, ind, stt, zu, zd, cfg)
             diag["raw"] += len(raw)
             kept = filter_setups(raw, ind, zu, zd, cfg)
+            if long_only:
+                kept = [s for s in kept if s.direction == "long"]
             diag["kept"] += len(kept)
             if recent_bars and kept:
                 cut = df.index[max(0, len(df) - 1 - recent_bars)]
@@ -342,20 +380,17 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 s.meta["status"] = setup_status(s, df)
                 zone = (zu[0] if zu else None) if s.direction == "long" \
                     else (zd[0] if zd else None)
-                rt = rate(s, ind.loc[s.ts], zone, cfg, stats)
-                s.meta["rating"] = rt
+                s.meta["r"] = _norm(rate(s, ind.loc[s.ts], zone, cfg, stats))
                 diag["graded"] += 1
-                if _rank(rt.grade) < _rank(min_grade):
+                if _rank(s.meta["r"]["grade"]) < _rank(min_grade):
                     diag["below_grade"] += 1
                     continue
                 try:
-                    sm = smc.confluence(df, s.direction, s.entry,
-                                        float(ind["atr"].iloc[-1]))
+                    s.meta["smc"] = smc.confluence(
+                        df, s.direction, s.entry, float(ind["atr"].iloc[-1]))
                 except Exception:
-                    sm = {"score": 0, "flags": [], "fvg": None, "ob": None,
-                          "pd": 50.0}
-                s.meta["smc"] = sm
-                if need_smc and sm["score"] < 1:
+                    s.meta["smc"] = {"score": 0, "flags": [], "warnings": []}
+                if need_smc and s.meta["smc"]["score"] < 2:
                     diag["smc_skip"] += 1
                     continue
                 found.append(s)
@@ -364,7 +399,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             continue
 
     found.sort(key=lambda s: (-s.meta.get("smc", {}).get("score", 0),
-                              -s.meta["rating"].confidence, -s.score))
+                              -s.meta["r"]["confidence"], -s.score))
     return found, diag
 
 
@@ -431,22 +466,23 @@ with st.sidebar:
     if st.button("Sign out", use_container_width=True,
                  help="End this session and return to the login screen."):
         auth.logout()
+
+    MODE = st.radio("Desk", ["Spot", "Bot"], horizontal=True, index=0,
+                    help="Spot is long-only accumulation on daily charts. "
+                         "Bot is the long and short scanner on the timeframe you "
+                         "pick. They are separate because they are different "
+                         "jobs.")
     st.divider()
 
-    exch = st.selectbox(
-        "Exchange", ["auto"] + CANDIDATES, index=0,
-        help="auto scores venues by perpetual depth and picks the deepest that "
-             "answers. Spot-only venues are avoided.")
-    proxy = st.text_input(
-        "Binance proxy (optional)", value="",
-        placeholder="https://your-worker.workers.dev",
-        help="Cloudflare Worker URL. Only needed for Binance, which returns "
-             "HTTP 451 to US datacentre IPs.")
+    exch = st.selectbox("Exchange", ["auto"] + CANDIDATES, index=0,
+                        help="auto picks the deepest venue that answers.")
+    proxy = st.text_input("Binance proxy (optional)", value="",
+                          placeholder="https://your-worker.workers.dev",
+                          help="Only needed for Binance from US servers.")
     if st.button("Test venues", use_container_width=True,
                  help="Probe every venue and list which ones answer."):
         with st.spinner("probing..."):
             st.session_state["health"] = probe_exchanges(proxy.strip() or None)
-
     h = st.session_state.get("health")
     if h:
         st.dataframe(pd.DataFrame([{
@@ -455,53 +491,51 @@ with st.sidebar:
         } for n, r in h.items()]), hide_index=True, use_container_width=True)
 
     st.divider()
-    ltf = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
-                       help="Bar size. 4h is the swing default.")
+    if MODE == "Spot":
+        ltf = st.selectbox("Timeframe", ["4h", "1d", "1w"], index=1,
+                           help="Spot accumulation is a daily and weekly job.")
+    else:
+        ltf = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
+                           help="Bar size for the scanner.")
+
     top = st.slider("Symbols to scan", 10, 150, 40, step=10,
-                    help="How many top-volume pairs to check. More means slower.")
+                    help="How many top-volume pairs to check.")
     min_vol = st.select_slider(
         "Min 24h volume", [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
-        format_func=lambda v: f"${v/1e6:.0f}M",
-        help="Liquidity floor. Drops to zero automatically if it would leave "
-             "you with almost nothing.")
-    recent = st.slider(
-        "Signal freshness (bars)", 1, 48, 12,
-        help="How many bars back a break may be and still count. On 4h, 12 bars "
-             "is two days. Weekends produce few new breaks, so 12 to 24 is "
-             "practical.")
+        format_func=lambda v: f"${v/1e6:.0f}M", help="Liquidity floor.")
+    recent = st.slider("Signal freshness (bars)", 1, 48, 12,
+                       help="How many bars back a break may be. Weekends are "
+                            "thin, so 12 to 24 is practical.")
     min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="C",
                                  help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.")
     only_ok = st.checkbox("Actionable only", value=False,
-                          help="Hide extended, invalid and past-target setups.")
+                          help="Hide extended and invalid setups.")
     relax = st.checkbox("Relax filters", value=True,
-                        help="Widens R:R to 70% and stop cap to 140%, and drops "
-                             "the grade floor one step.")
-    need_smc = st.checkbox(
-        "Require SMC confluence", value=False,
-        help="Only show setups with at least one smart money factor: an "
-             "unfilled gap, an order block, a sweep, or correct premium / "
-             "discount positioning.")
-    limit = st.slider("Max results", 3, 40, 10, help="Cap on cards rendered.")
+                        help="Widens R:R to 70% and stop cap to 140%, drops the "
+                             "grade floor one step.")
+    need_smc = st.checkbox("Require SMC confluence", value=False,
+                           help="Only show setups with at least two smart money "
+                                "factors.")
 
     st.divider()
     equity = st.number_input("Account equity ($)", 100.0, 10_000_000.0, 10_000.0,
-                             step=500.0, help="Used for position sizing.")
+                             step=500.0, help="Used for sizing.")
     risk_pct = st.slider("Risk per trade (%)", 0.1, 3.0, 0.5, step=0.1,
                          help="Equity lost if the stop is hit.")
     min_rr = st.slider("Minimum R:R", 1.5, 5.0, 2.0, step=0.25,
-                       help="Reward-to-risk floor. Lower means more signals.")
+                       help="Reward-to-risk floor.")
     max_stop_atr = st.slider("Max stop (ATR)", 1.5, 6.0, 3.5, step=0.25,
-                             help="Stop distance cap in ATR units.")
-
+                             help="Stop distance cap in ATR.")
     st.divider()
     st.caption("Not financial advice. Backtest before risking money.")
 
 # ---------------------------------------------------------------- header
 st.markdown(
     f"""<div class="hero">
-    <h1>Market desk</h1>
-    <p>Break-of-structure scanner with grading, smart money confluence,
-    portfolio heat and Monte Carlo validation. Signed in as <b>{USER}</b>.</p>
+    <h1>{'Spot accumulation desk' if MODE == 'Spot' else 'Bot swing desk'}</h1>
+    <p>{'Long-only, daily structure, laddered entries into demand.' if MODE == 'Spot'
+        else 'Long and short break-of-structure scanner with full playbook.'}
+    Signed in as <b>{USER}</b>.</p>
     </div>""",
     unsafe_allow_html=True,
 )
@@ -530,26 +564,49 @@ ui.stat(c3, "BTC dominance", f"{ov['btc_dom']:.1f}%" if ov["btc_dom"] else "—"
 ui.stat(c4, "Fear & Greed", f"{fng}" if fng is not None else "—", tone)
 ui.stat(c5, "Regime", reg, tone)
 st.caption("Source: CoinGecko and alternative.me. Cached two minutes.")
-
 st.write("")
 
-tabs = st.tabs(["Overview", "Scan", "SMC", "Radar", "Portfolio", "Backtest",
-                "Macro", "Alerts", "Journal", "Guide"])
-(tab_ov, tab_scan, tab_smc, tab_radar, tab_pf, tab_bt,
- tab_macro, tab_alert, tab_journal, tab_guide) = tabs
+if MODE == "Spot":
+    NAMES = ["Overview", "Accumulate", "SMC", "Radar", "Portfolio", "Learn", "Guide"]
+else:
+    NAMES = ["Overview", "Scan", "SMC", "Radar", "Portfolio", "Backtest",
+             "Macro", "Alerts", "Journal", "Learn", "Guide"]
+T = dict(zip(NAMES, st.tabs(NAMES)))
+
+
+# ---------------------------------------------------------------- plan card
+def render_plan(plan: dict, symbol: str, ladder: bool = False) -> None:
+    conf = plan["confluence"]
+    for label, ok in plan["checks"]:
+        st.write(("PASS  " if ok else "FAIL  ") + label)
+    st.write(f"**Verdict** {plan['verdict']} · {plan['passed']}/{len(plan['checks'])}")
+    if conf["flags"]:
+        st.write("**Supporting** " + " · ".join(conf["flags"]))
+    if conf["warnings"]:
+        st.write("**Against** " + " · ".join(conf["warnings"]))
+    st.write(f"**Entry** {plan['entry']:,.6g} · **Stop** {plan['sl']:,.6g} · "
+             f"**TP1** {plan['tp1']:,.6g} · **TP2** {plan['tp2']:,.6g}")
+    st.write(f"Risk ${plan['size_usd']:.2f} ({risk_pct}% of equity) · "
+             f"qty {plan['qty']:.6g} · R:R {plan['rr1']:.2f} / {plan['rr2']:.2f}")
+    if ladder:
+        st.write("**Ladder**")
+        st.dataframe(pd.DataFrame([{
+            "tranche": t["tranche"], "price": f"{t['price']:,.6g}",
+            "qty": f"{t['qty']:.6g}", "weight": f"{t['weight']*100:.0f}%",
+        } for t in smc.ladder(plan)]), hide_index=True, use_container_width=True)
+    st.caption(f"session {conf['session']['name']} · volatility "
+               f"{conf['session']['vol']}")
 
 
 # ---------------------------------------------------------------- overview
-with tab_ov:
-    ui.section("Coin detail", "Candles, trend state and venue depth.")
+with T["Overview"]:
+    ui.section("Coin detail", "Candles, structure state and venue depth.")
     d1, d2 = st.columns([2, 1])
     detail_sym = d1.text_input("Symbol", "BTC/USDT:USDT", key="detail_sym",
                                help="Unified ccxt symbol.")
-    detail_tf = d2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
+    detail_tf = d2.selectbox("Timeframe", ["1h", "4h", "1d", "1w"], index=2,
                              key="detail_tf", help="Chart resolution.")
-
-    if st.button("Load detail", type="primary",
-                 help="Fetch candles and render the chart with EMAs."):
+    if st.button("Load detail", type="primary", help="Fetch and chart."):
         try:
             cfg = build_cfg(exch, top, min_vol, detail_tf, min_rr,
                             max_stop_atr, risk_pct, equity)
@@ -559,22 +616,18 @@ with tab_ov:
                 st.warning(f"Not enough candles for {detail_sym} on {ex_name}.")
             else:
                 ind = compute_all(df, cfg)
-                hb = htf_bias(df, cfg)
+                trend, notes = smc.trend_state(df)
                 last = float(df["close"].iloc[-1])
                 chg = (last / float(df["close"].iloc[-25]) - 1) * 100
-                atr_pct = float(ind["atr"].iloc[-1]) / last * 100
                 rsi = float(ind["rsi"].iloc[-1])
-                bias = str(getattr(hb, "bias", hb))
-
-                m1, m2, m3, m4, m5 = st.columns(5)
+                m1, m2, m3, m4 = st.columns(4)
                 ui.stat(m1, "Last", f"{last:,.6g}")
                 ui.stat(m2, "24 bar %", f"{chg:+.2f}%", "up" if chg >= 0 else "dn")
-                ui.stat(m3, "ATR %", f"{atr_pct:.2f}%")
-                ui.stat(m4, "RSI", f"{rsi:.1f}",
+                ui.stat(m3, "RSI", f"{rsi:.1f}",
                         "dn" if rsi > 70 else "up" if rsi < 30 else "")
-                ui.stat(m5, "Bias", bias, "up" if bias.startswith("bull") else "dn")
-                st.caption(f"venue {ex_name} · symbol {used}")
-
+                ui.stat(m4, "Structure", trend,
+                        "up" if trend == "up" else "dn" if trend == "down" else "warn")
+                st.caption(" · ".join(notes) or "no clear swing sequence")
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
                     x=df.index, open=df["open"], high=df["high"],
@@ -595,115 +648,126 @@ with tab_ov:
             st.error(f"{type(e).__name__}: {e}")
 
     st.divider()
-    ui.section("Movers", "Largest 24h moves in the top 100 by market cap.")
+    ui.section("Movers", "Largest 24h moves in the top 100.")
     rows = market.movers(8)
     if rows:
         st.dataframe(pd.DataFrame([{
             "coin": f"{r['symbol']} · {r['name']}",
-            "price": f"${r['price']:,.6g}",
-            "24h": f"{r['chg']:+.2f}%",
+            "price": f"${r['price']:,.6g}", "24h": f"{r['chg']:+.2f}%",
             "volume": market.money(r["vol"]),
         } for r in rows]), hide_index=True, use_container_width=True)
     else:
-        st.info("Mover data unavailable right now.")
+        st.info("Mover data unavailable.")
+
+
+# ---------------------------------------------------------------- spot
+if MODE == "Spot":
+    with T["Accumulate"]:
+        ui.section("Accumulation plans", "Long-only, staged into demand on daily.")
+        st.caption("Deep discount majors first. Each plan is a ladder, not a "
+                   "single buy. Stop sits under the zone.")
+        if st.button("Find candidates", type="primary",
+                     help="Rank majors by distance below the 200-day average."):
+            try:
+                with st.spinner("loading..."):
+                    st.session_state["radar"] = cached_radar(
+                        exch, exch, proxy.strip() or None)
+            except Exception as e:
+                st.error(f"{type(e).__name__}: {e}")
+
+        cands = [r for r in st.session_state.get("radar", []) if r["sev"] >= 1]
+        if not cands:
+            st.info("No deep-discount majors right now, or press Find candidates.")
+        for r in cands[:6]:
+            try:
+                cfg = build_cfg(exch, top, min_vol, "1d", min_rr,
+                                max_stop_atr, risk_pct, equity)
+                ex, _ = _resolve(cfg, exch, proxy.strip() or None)
+                df, used = _load(ex, r["symbol"], "1d", 400)
+                if df is None:
+                    continue
+                plan = smc.playbook(df, "long", equity, risk_pct)
+                with st.expander(f"{used} · {r['dist']:+.1f}% vs 200d SMA · "
+                                 f"{plan['verdict']}"):
+                    render_plan(plan, used, ladder=True)
+            except Exception as e:
+                st.caption(f"{r['symbol']}: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------- scan
-with tab_scan:
-    ui.section("Live scan", f"Grade {min_grade}+ · last {recent} bars · {ltf}")
-    if st.button("Run scan", type="primary",
-                 help="Check every symbol in the universe for the setup."):
-        try:
-            with st.spinner("Scanning..."):
-                found, diag = cached_scan(
-                    exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                    equity, recent, min_grade, exch, proxy.strip() or None,
-                    relax, need_smc)
-            st.session_state["setups"] = found
-            st.session_state["diag"] = diag
-        except Exception as e:
-            st.error(f"{type(e).__name__}: {e}")
-            st.exception(e)
+if MODE == "Bot":
+    with T["Scan"]:
+        ui.section("Live scan", f"Grade {min_grade}+ · last {recent} bars · {ltf}")
+        if st.button("Run scan", type="primary", help="Check the universe."):
+            try:
+                with st.spinner("Scanning..."):
+                    found, diag = cached_scan(
+                        exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
+                        equity, recent, min_grade, exch, proxy.strip() or None,
+                        relax, need_smc, False)
+                st.session_state["setups"] = found
+                st.session_state["diag"] = diag
+            except Exception as e:
+                st.error(f"{type(e).__name__}: {e}")
+                st.exception(e)
 
-    diag = st.session_state.get("diag")
-    if diag:
-        st.caption(f"venue {diag['venue']} · perps {diag['perps']} · "
-                   f"universe {diag['universe']} · loaded {diag['loaded']} · "
-                   f"failed {diag['err']} · raw {diag['raw']} · "
-                   f"passed filters {diag['kept']} · dropped stale {diag['stale']} · "
-                   f"graded {diag['graded']} · below grade {diag['below_grade']} · "
-                   f"smc rejected {diag['smc_skip']}"
-                   + (f" · RELAXED R:R {diag['rr']:.2f} stop {diag['stop']:.1f}"
-                      if diag["relax"] else ""))
+        diag = st.session_state.get("diag")
+        if diag:
+            st.caption(f"venue {diag['venue']} · perps {diag['perps']} · "
+                       f"universe {diag['universe']} · loaded {diag['loaded']} · "
+                       f"failed {diag['err']} · raw {diag['raw']} · "
+                       f"kept {diag['kept']} · stale {diag['stale']} · "
+                       f"graded {diag['graded']} · below grade "
+                       f"{diag['below_grade']} · smc rejected {diag['smc_skip']}")
 
-        if diag["stale"] > 5 and diag["stale"] >= diag["graded"]:
-            st.error(f"{diag['stale']} setups were older than {diag['recent']} "
-                     f"bars. Raise Signal freshness to 24 or 48.")
-        elif diag["raw"] and not diag["kept"]:
-            st.error(f"{diag['raw']} breaks found, all rejected by filters. "
-                     f"Tick Relax filters or lower Minimum R:R.")
-        elif diag["below_grade"] and not st.session_state.get("setups"):
-            st.warning(f"{diag['below_grade']} setup(s) graded below "
-                       f"{min_grade}. Lower the grade floor.")
-        elif diag["smc_skip"] and not st.session_state.get("setups"):
-            st.warning(f"{diag['smc_skip']} setup(s) lacked SMC confluence. "
-                       f"Uncheck Require SMC confluence.")
-        elif not diag["raw"] and diag["loaded"] > 10:
-            st.info("Pipeline healthy, no break-of-structure in this window. "
-                    "Normal in chop. Try 1h.")
-
-    setups = st.session_state.get("setups", [])
-    if not setups:
-        st.info("No results yet. Zero setups is a normal outcome.")
-    else:
-        rows = [s for s in setups
-                if (not only_ok) or s.meta.get("status") in OK_STATUS][:limit]
-        if not rows:
-            st.warning("Signals exist but none are actionable. "
-                       "Uncheck Actionable only.")
+        setups = st.session_state.get("setups", [])
+        if not setups:
+            st.info("No results yet.")
         else:
-            st.dataframe(pd.DataFrame([{
-                "grade": s.meta["rating"].grade, "coin": s.symbol,
-                "smc": s.meta.get("smc", {}).get("score", 0),
-                "dir": s.direction.upper(), "status": s.meta.get("status"),
-                "score": s.score, "entry": f"{s.entry:,.6g}",
-                "stop": f"{s.stop:,.6g}", "tp1": f"{s.tp1:,.6g}",
-                "tp2": f"{s.tp2:,.6g}",
-            } for s in rows]), hide_index=True, use_container_width=True)
-
+            rows = [s for s in setups
+                    if (not only_ok) or s.meta.get("status") in OK_STATUS][:10]
             for s in rows:
-                rt = s.meta["rating"]
-                sm = s.meta.get("smc", {})
-                with st.expander(f"{rt.grade} · {s.symbol} · "
-                                 f"{s.direction.upper()} · {s.meta.get('status')}"
-                                 f" · smc {sm.get('score', 0):+d}"):
+                r = _norm(s.meta.get("r"))
+                sm = s.meta.get("smc", {}) or {}
+                with st.expander(f"{r['grade']} · {s.symbol} · "
+                                 f"{s.direction.upper()} · "
+                                 f"{s.meta.get('status')} · smc "
+                                 f"{int(sm.get('score', 0)):+d}"):
                     st.markdown(
-                        f'<span class="pill {GRADE_TONE.get(rt.grade, "mut")}">'
-                        f'{rt.grade} · {rt.score}/100</span>',
+                        f'<span class="pill {GRADE_TONE.get(r["grade"], "mut")}">'
+                        f'{r["grade"]} · {r["score"]}/100</span>',
                         unsafe_allow_html=True)
                     st.write(f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
                              f"**TP1** {s.tp1:,.6g} · **TP2** {s.tp2:,.6g}")
-                    st.write(f"Risk **{s.risk_pct:.2f}%** · R:R **{s.rr:.2f}**")
                     if sm.get("flags"):
-                        st.write("**Smart money** " + " · ".join(sm["flags"]))
-                    for p in rt.positives:
+                        st.write("**Supporting** " + " · ".join(sm["flags"]))
+                    if sm.get("warnings"):
+                        st.write("**Against** " + " · ".join(sm["warnings"]))
+                    for p in r["positives"]:
                         st.write(f"- {p}")
-                    for n in rt.negatives:
+                    for n in r["negatives"]:
                         st.write(f"- {n}")
+                    if st.button("Alert me", key=f"al{s.symbol}"):
+                        ok, msg = notify(
+                            f"{r['grade']} {s.symbol} {s.direction} "
+                            f"entry {s.entry:,.6g} stop {s.stop:,.6g} "
+                            f"tp1 {s.tp1:,.6g}")
+                        st.success(msg) if ok else st.error(msg)
 
 
 # ---------------------------------------------------------------- smc
-with tab_smc:
-    ui.section("Smart money map", "Fair value gaps, order blocks, sweeps and "
-                                  "premium/discount for one symbol.")
+with T["SMC"]:
+    ui.section("Smart money map", "Structure, zones, gaps, liquidity and range "
+                                  "position for one symbol.")
     s1, s2 = st.columns([2, 1])
     smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym",
                             help="Pair to map.")
     smc_tf = s2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
                           key="smc_tf", help="Chart resolution.")
+    side = st.radio("Side", ["long", "short"], horizontal=True,
+                    help="Which direction the playbook should assume.")
 
-    if st.button("Build map", type="primary",
-                 help="Draw unfilled gaps, order blocks and sweeps."):
+    if st.button("Build map", type="primary", help="Draw and plan."):
         try:
             cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
                             risk_pct, equity)
@@ -712,22 +776,23 @@ with tab_smc:
             if df is None:
                 st.warning(f"No data for {smc_sym} on {ex_name}.")
             else:
-                pd_val = smc.premium_discount(df)
+                trend, tnotes = smc.trend_state(df)
+                pdv = smc.premium_discount(df)
                 gaps = smc.fair_value_gaps(df)
                 blocks = smc.order_blocks(df)
+                zones = smc.supply_demand(df)
                 sweeps = smc.liquidity_sweeps(df)
+                events = smc.structure_events(df)
 
-                k1, k2, k3, k4 = st.columns(4)
-                ui.stat(k1, "Range position", f"{pd_val:.0f}%",
-                        "up" if pd_val <= 35 else "dn" if pd_val >= 65 else "")
-                ui.stat(k2, "Unfilled gaps", str(len(gaps)))
-                ui.stat(k3, "Order blocks", str(len(blocks)))
-                ui.stat(k4, "Recent sweeps", str(len(sweeps)))
-
-                zone = ("discount — longs favoured" if pd_val <= 35
-                        else "premium — shorts favoured" if pd_val >= 65
-                        else "equilibrium — wait for an edge")
-                st.caption(f"{zone} · venue {ex_name} · symbol {used}")
+                k = st.columns(5)
+                ui.stat(k[0], "Structure", trend,
+                        "up" if trend == "up" else "dn" if trend == "down" else "warn")
+                ui.stat(k[1], "Range position", f"{pdv:.0f}%",
+                        "up" if pdv <= 35 else "dn" if pdv >= 65 else "")
+                ui.stat(k[2], "Gaps", str(len(gaps)))
+                ui.stat(k[3], "Zones", str(len(zones)))
+                ui.stat(k[4], "Sweeps", str(len(sweeps)))
+                st.caption(" · ".join(tnotes) or "no clear swing sequence")
 
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
@@ -738,87 +803,73 @@ with tab_smc:
                 for g in gaps:
                     fig.add_shape(type="rect", x0=df.index[g["idx"]],
                                   x1=df.index[-1], y0=g["bot"], y1=g["top"],
-                                  fillcolor=("rgba(22,199,132,.16)"
+                                  fillcolor=("rgba(22,199,132,.14)"
                                              if g["dir"] == "bull"
-                                             else "rgba(234,57,67,.16)"),
+                                             else "rgba(234,57,67,.14)"),
                                   line=dict(width=0))
-                for b in blocks:
-                    fig.add_shape(type="rect", x0=df.index[b["idx"]],
-                                  x1=df.index[min(b["idx"] + 12, len(df) - 1)],
-                                  y0=b["bot"], y1=b["top"],
-                                  fillcolor=("rgba(20,184,166,.22)"
-                                             if b["dir"] == "bull"
-                                             else "rgba(240,185,11,.22)"),
+                for z in zones:
+                    fig.add_shape(type="rect", x0=df.index[z["idx"]],
+                                  x1=df.index[min(z["idx"] + 15, len(df) - 1)],
+                                  y0=z["bot"], y1=z["top"],
+                                  fillcolor=("rgba(20,184,166,.20)"
+                                             if z["dir"] == "demand"
+                                             else "rgba(240,185,11,.20)"),
                                   line=dict(width=1, color="#14b8a6"))
                 for sw in sweeps:
                     fig.add_trace(go.Scatter(
-                        x=[df.index[sw["idx"]]], y=[sw["level"]],
-                        mode="markers", name="sweep",
+                        x=[df.index[sw["idx"]]], y=[sw["level"]], mode="markers",
                         marker=dict(size=10, symbol="x", color="#f0b90b"),
                         showlegend=False))
+                for e in events[-6:]:
+                    fig.add_annotation(x=df.index[e["idx"]], y=e["level"],
+                                       text=e["kind"], showarrow=False,
+                                       font=dict(size=9, color="#e7eaf0"))
                 fig.update_layout(height=460, template="plotly_dark",
                                   paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
                                   margin=dict(l=6, r=6, t=6, b=6),
                                   xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True)
 
-                st.caption("Green bands are bullish gaps and blocks, red are "
-                           "bearish. Yellow crosses are swept extremes.")
-                if gaps or blocks or sweeps:
-                    st.dataframe(pd.DataFrame([{
-                        "type": "gap" if g else "block",
-                        "dir": (g or b)["dir"],
-                        "top": round((g or b)["top"], 6),
-                        "bottom": round((g or b)["bot"], 6),
-                    } for g, b in [(x, None) for x in gaps]
-                        + [(None, y) for y in blocks]]),
-                        hide_index=True, use_container_width=True)
+                plan = smc.playbook(df, side, equity, risk_pct)
+                st.divider()
+                ui.section(f"Playbook · {side}")
+                render_plan(plan, used, ladder=(side == "long"))
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
 
     st.divider()
     st.markdown("""
-**How to read it**
+**Reading order**
 
-A fair value gap is a three-candle imbalance where price moved so fast one
-side never traded. Unfilled gaps act like magnets — price often returns to
-rebalance them, which is where the retest entry lives.
+1. Structure. Uptrend, downtrend or range, from HH/HL and LH/LL.
+2. Where price is. A demand or supply zone, or an order block.
+3. Liquidity. Equal highs and lows, and whether a sweep just took one.
+4. Imbalance. Unfilled gaps are magnets, not entries by themselves.
+5. Premium or discount. Longs belong low in the range, shorts high.
+6. Confirmation. A CHoCH or BOS after the level is tested.
 
-An order block is the last opposite candle before a displacement leg. It marks
-where a large resting order sat, so it is the zone to lean on rather than chase
-through.
-
-A sweep is a wick through a prior high or low that closes back inside. That is
-stop-hunting: liquidity taken, then reversal. Best used as confirmation, not
-alone.
-
-Premium and discount split the recent range in half. Longs in the lower third
-and shorts in the upper third mean you are not paying equilibrium prices.
+Green bands are bullish zones and gaps, yellow are bearish. Crosses mark swept
+extremes.
 """)
 
 
 # ---------------------------------------------------------------- radar
-with tab_radar:
+with T["Radar"]:
     ui.section("Value radar", "Distance to the 200-day SMA across majors.")
-    st.caption("Negative means price is under the 200-day average — a "
-               "multi-cycle accumulation zone, not a buy signal on its own.")
-    if st.button("Refresh radar", help="Recompute distances from the venue."):
+    if st.button("Refresh radar", help="Recompute from the venue."):
         try:
             with st.spinner("loading daily candles..."):
                 st.session_state["radar"] = cached_radar(
                     exch, exch, proxy.strip() or None)
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
-
     radar = st.session_state.get("radar", [])
     if radar:
         st.dataframe(pd.DataFrame([{
             "coin": r["symbol"],
             "zone": "deep" if r["sev"] == 2 else "near" if r["sev"] == 1 else "extended",
-            "vs 200d": f"{r['dist']:+.1f}%",
-            "detail": " · ".join(r["reasons"]),
+            "vs 200d": f"{r['dist']:+.1f}%", "detail": " · ".join(r["reasons"]),
         } for r in radar]), hide_index=True, use_container_width=True)
-
         bars = go.Figure(go.Bar(
             x=[r["dist"] for r in radar], y=[r["symbol"] for r in radar],
             orientation="h",
@@ -835,7 +886,7 @@ with tab_radar:
 
 
 # ---------------------------------------------------------------- portfolio
-with tab_pf:
+with T["Portfolio"]:
     ui.section("Portfolio", "Spot positions, heat and bucket split.")
     try:
         import portfolio as pf_mod
@@ -843,17 +894,15 @@ with tab_pf:
             a, b, c, d = st.columns(4)
             p_sym = a.text_input("Symbol", "BTC/USDT", help="Pair you own.")
             p_qty = b.number_input("Qty", 0.0, 1e9, 0.0, format="%.8f",
-                                   help="Units of the coin, not dollars.")
+                                   help="Units of the coin.")
             p_px = c.number_input("Price", 0.0, 1e9, 0.0, format="%.6f",
-                                  help="Your average buy price.")
+                                  help="Average buy price.")
             p_stop = d.number_input("Stop (0 = none)", 0.0, 1e9, 0.0,
-                                    format="%.6f",
-                                    help="Price where the position is invalidated.")
+                                    format="%.6f", help="Invalidation price.")
             if st.form_submit_button("Add / increase") and p_sym and p_qty > 0 and p_px > 0:
                 _call(pf_mod, ["add", "add_position"], p_sym, p_qty, p_px,
                       p_stop or None)
                 st.rerun()
-
         book = _call(pf_mod, ["load_pf", "load", "positions", "all"])
         if isinstance(book, dict):
             book = [{"symbol": k, **v} for k, v in book.items()]
@@ -881,230 +930,182 @@ with tab_pf:
 
 
 # ---------------------------------------------------------------- backtest
-with tab_bt:
-    ui.section("Backtest", "Same filters as the scanner, next-open fills.")
-    b1, b2, b3 = st.columns(3)
-    bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym",
-                           help="Use BTC/USDT:USDT on perpetual venues.")
-    bt_bars = b2.number_input("Bars", 500, 20000, 6000, step=500,
-                              help="History depth. More bars is slower but warms "
-                                   "EMA200 properly.")
-    bt_grade = b3.select_slider("Min grade", GRADE_ORDER, value="D",
-                                key="bt_grade", help="Grade floor inside the run.")
-
-    if st.button("Run backtest", type="primary",
-                 help="Replay the strategy and report expectancy in R."):
-        try:
-            with st.spinner("Running..."):
-                curve, trades, raw_n, kept_n = cached_backtest(
-                    exch, bt_sym, ltf, int(bt_bars), min_rr, max_stop_atr,
-                    risk_pct, equity, exch, proxy.strip() or None)
-            if curve is None:
-                st.warning("Not enough history on this venue for that symbol.")
-            else:
-                st.caption(f"raw {raw_n} · after filters {kept_n} · "
-                           f"trades {len(trades)}")
-                fig = go.Figure(go.Scatter(x=curve.index, y=curve.values,
-                                           line=dict(color="#14b8a6", width=1.6)))
-                fig.update_layout(height=340, template="plotly_dark",
-                                  paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
-                                  margin=dict(l=6, r=6, t=6, b=6))
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(trades.tail(50), hide_index=True,
-                             use_container_width=True)
-        except Exception as e:
-            st.error(f"{type(e).__name__}: {e}")
+if MODE == "Bot":
+    with T["Backtest"]:
+        ui.section("Backtest", "Same filters, next-open fills.")
+        b1, b2 = st.columns(2)
+        bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym",
+                               help="Use the perp format.")
+        bt_bars = b2.number_input("Bars", 500, 20000, 6000, step=500,
+                                  help="History depth.")
+        if st.button("Run backtest", type="primary", help="Replay the strategy."):
+            try:
+                with st.spinner("Running..."):
+                    curve, trades, raw_n, kept_n = cached_backtest(
+                        exch, bt_sym, ltf, int(bt_bars), min_rr, max_stop_atr,
+                        risk_pct, equity, exch, proxy.strip() or None)
+                if curve is None:
+                    st.warning("Not enough history.")
+                else:
+                    st.caption(f"raw {raw_n} · after filters {kept_n} · "
+                               f"trades {len(trades)}")
+                    fig = go.Figure(go.Scatter(x=curve.index, y=curve.values,
+                                               line=dict(color="#14b8a6", width=1.6)))
+                    fig.update_layout(height=340, template="plotly_dark",
+                                      paper_bgcolor="#0f1116",
+                                      plot_bgcolor="#0f1116",
+                                      margin=dict(l=6, r=6, t=6, b=6))
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.dataframe(trades.tail(50), hide_index=True,
+                                 use_container_width=True)
+            except Exception as e:
+                st.error(f"{type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------- macro
-with tab_macro:
-    ui.section("Macro", "Sentiment, dominance and dry powder — read as pictures.")
-
-    try:
-        import macro as macro_mod
-        mstate = _call(macro_mod, ["state", "macro_state", "evaluate",
-                                   "snapshot", "get_state"])
-        if isinstance(mstate, dict) and mstate.get("blackout"):
-            st.warning(mstate.get("blackout_reason", "Macro blackout active."))
-    except Exception:
-        pass
-
-    label, ltone, notes = market.stance(fng, ov["btc_dom"], stab)
-    s1, s2, s3 = st.columns(3)
-    ui.stat(s1, "Stance", label, ltone)
-    ui.stat(s2, "Stablecoin share", f"{stab:.1f}%" if stab is not None else "—")
-    ui.stat(s3, "Fear & Greed", f"{fng}" if fng is not None else "—", tone)
-
-    g1, g2 = st.columns(2)
-    with g1:
-        st.caption("Fear & Greed — 0 panic, 100 euphoria")
-        gauge = go.Figure(go.Indicator(
+if MODE == "Bot":
+    with T["Macro"]:
+        ui.section("Macro", "Sentiment, dominance and dry powder.")
+        try:
+            import macro as macro_mod
+            mstate = _call(macro_mod, ["state", "macro_state", "evaluate",
+                                       "snapshot", "get_state"])
+            if isinstance(mstate, dict) and mstate.get("blackout"):
+                st.warning(mstate.get("blackout_reason", "Blackout active."))
+        except Exception:
+            pass
+        label, ltone, notes = market.stance(fng, ov["btc_dom"], stab)
+        s1, s2 = st.columns(2)
+        ui.stat(s1, "Stance", label, ltone)
+        ui.stat(s2, "Stablecoin share", f"{stab:.1f}%" if stab is not None else "—")
+        g = go.Figure(go.Indicator(
             mode="gauge+number", value=fng if fng is not None else 0,
-            gauge={"axis": {"range": [0, 100], "tickcolor": "#7f8798"},
+            gauge={"axis": {"range": [0, 100]},
                    "bar": {"color": "#14b8a6", "thickness": .28},
                    "steps": [{"range": [0, 25], "color": "#2a1214"},
                              {"range": [25, 45], "color": "#2b2110"},
                              {"range": [45, 55], "color": "#161a21"},
                              {"range": [55, 75], "color": "#122a1c"},
                              {"range": [75, 100], "color": "#0f3b24"}]}))
-        gauge.update_layout(height=260, template="plotly_dark",
-                            paper_bgcolor="#0f1116",
-                            margin=dict(l=18, r=18, t=10, b=10))
-        st.plotly_chart(gauge, use_container_width=True)
-
-    with g2:
-        st.caption("Market cap split — BTC vs ETH vs everything else")
-        labels, values = market.dominance_split(ov)
-        if labels:
-            pie = go.Figure(go.Pie(labels=labels, values=values, hole=.55,
-                                   marker=dict(colors=["#f0b90b", "#627eea", "#3a4150"])))
-            pie.update_layout(height=260, template="plotly_dark",
-                              paper_bgcolor="#0f1116",
-                              margin=dict(l=18, r=18, t=10, b=10))
-            st.plotly_chart(pie, use_container_width=True)
-        else:
-            st.info("Dominance data unavailable.")
-
-    caps, _ = market.btc_history(90)
-    if caps:
-        st.caption("BTC market cap, 90 days — the direction money is actually moving")
-        xs = [pd.Timestamp(c[0], unit="ms") for c in caps]
-        ys = [c[1] / 1e9 for c in caps]
-        line = go.Figure(go.Scatter(x=xs, y=ys, fill="tozeroy",
-                                    line=dict(color="#14b8a6", width=1.8),
-                                    fillcolor="rgba(20,184,166,.12)"))
-        line.update_layout(height=260, template="plotly_dark",
-                           paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
-                           margin=dict(l=6, r=6, t=6, b=6),
-                           yaxis_title="market cap, $B")
-        st.plotly_chart(line, use_container_width=True)
-
-    st.divider()
-    st.markdown("#### What these mean")
-    for n in notes:
-        st.write(f"- {n}")
-    st.markdown("""
-**Fear & Greed** is a crowd gauge, not a timing tool. Deep fear gives better
-prices but worse follow-through.
-
-**Dominance** shows where capital sits. Rising BTC dominance means alts bleed.
-Falling dominance is rotation into alts.
-
-**Stablecoin share** is unspent buying power.
-
-**Market cap trend** shows expansion or contraction.
-
-**Blackout** comes from the economic calendar.
-""")
+        g.update_layout(height=250, template="plotly_dark",
+                        paper_bgcolor="#0f1116",
+                        margin=dict(l=18, r=18, t=10, b=10))
+        st.plotly_chart(g, use_container_width=True)
+        for n in notes:
+            st.write(f"- {n}")
 
 
 # ---------------------------------------------------------------- alerts
-with tab_alert:
-    ui.section("Alerts", "Telegram and email delivery.")
-    st.caption("These fields work directly and save to state/alerts.json. "
-               "Streamlit Secrets override them if present.")
-
-    tg1, tg2 = st.columns([2, 1])
-    tg_token = tg1.text_input("Telegram bot token", value=_cred("TELEGRAM_TOKEN"),
-                              type="password", help="From @BotFather.")
-    tg_chat = tg2.text_input("Chat id", value=_cred("TELEGRAM_CHAT_ID"),
-                             help="Your numeric id from @userinfobot.")
-
-    with st.expander("Email (optional)"):
-        e1, e2 = st.columns(2)
-        smtp_host = e1.text_input("SMTP host", value=_cred("SMTP_HOST"))
-        smtp_port = e2.text_input("SMTP port", value=_cred("SMTP_PORT"))
-        smtp_user = st.text_input("SMTP user", value=_cred("SMTP_USER"))
-        smtp_pass = st.text_input("SMTP password", value=_cred("SMTP_PASS"),
-                                  type="password")
-        alert_to = st.text_input("Send to", value=_cred("ALERT_TO"))
-
-    a1, a2 = st.columns(2)
-    if a1.button("Save settings", use_container_width=True,
-                 help="Write these values to state/alerts.json."):
-        _save_creds({"TELEGRAM_TOKEN": tg_token, "TELEGRAM_CHAT_ID": tg_chat,
-                     "SMTP_HOST": smtp_host, "SMTP_PORT": smtp_port,
-                     "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass,
-                     "ALERT_TO": alert_to})
-        st.success("Saved.")
-
-    if a2.button("Send test", type="primary", use_container_width=True,
-                 help="Send one test message. Tries Telegram, then email."):
-        _save_creds({"TELEGRAM_TOKEN": tg_token, "TELEGRAM_CHAT_ID": tg_chat,
-                     "SMTP_HOST": smtp_host, "SMTP_PORT": smtp_port,
-                     "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass,
-                     "ALERT_TO": alert_to})
-        with st.spinner("sending..."):
-            ok, msg = notify("CryptoScan test — if this arrives, alerts work.")
-        st.success(msg) if ok else st.error(msg)
-
-    st.divider()
-    st.caption("If Telegram returns 400 chat not found, open your bot in "
-               "Telegram and send /start once. 401 means the token is wrong.")
+if MODE == "Bot":
+    with T["Alerts"]:
+        ui.section("Alerts", "Telegram and email.")
+        tg1, tg2 = st.columns([2, 1])
+        tg_token = tg1.text_input("Telegram bot token", value=_cred("TELEGRAM_TOKEN"),
+                                  type="password", help="From @BotFather.")
+        tg_chat = tg2.text_input("Chat id", value=_cred("TELEGRAM_CHAT_ID"),
+                                 help="Numeric id from @userinfobot.")
+        with st.expander("Email (optional)"):
+            e1, e2 = st.columns(2)
+            smtp_host = e1.text_input("SMTP host", value=_cred("SMTP_HOST"))
+            smtp_port = e2.text_input("SMTP port", value=_cred("SMTP_PORT"))
+            smtp_user = st.text_input("SMTP user", value=_cred("SMTP_USER"))
+            smtp_pass = st.text_input("SMTP password", value=_cred("SMTP_PASS"),
+                                      type="password")
+            alert_to = st.text_input("Send to", value=_cred("ALERT_TO"))
+        a1, a2 = st.columns(2)
+        payload = {"TELEGRAM_TOKEN": tg_token, "TELEGRAM_CHAT_ID": tg_chat,
+                   "SMTP_HOST": smtp_host, "SMTP_PORT": smtp_port,
+                   "SMTP_USER": smtp_user, "SMTP_PASS": smtp_pass,
+                   "ALERT_TO": alert_to}
+        if a1.button("Save settings", use_container_width=True):
+            _save_creds(payload)
+            st.success("Saved.")
+        if a2.button("Send test", type="primary", use_container_width=True):
+            _save_creds(payload)
+            with st.spinner("sending..."):
+                ok, msg = notify("CryptoScan test — alerts working.")
+            st.success(msg) if ok else st.error(msg)
+        st.caption("400 chat not found means message your bot /start once. "
+                   "401 means the token is wrong.")
 
 
 # ---------------------------------------------------------------- journal
-with tab_journal:
-    ui.section("Journal", "Log every trade. The rules column is the one that matters.")
-    with st.form("journal", clear_on_submit=True):
-        j1, j2, j3, j4 = st.columns(4)
-        j_sym = j1.text_input("Symbol", help="Pair traded.")
-        j_dir = j2.selectbox("Side", ["long", "short"], help="Direction.")
-        j_r = j3.number_input("Result (R)", -10.0, 10.0, 0.0, step=0.1,
-                              help="Outcome in R. -1 means the stop was hit.")
-        j_ok = j4.checkbox("Followed rules", value=True,
-                           help="Did you take it exactly as the card said?")
-        j_note = st.text_input("Note", help="What you saw, what you did.")
-        if st.form_submit_button("Log"):
-            p = pathlib.Path("./state/journal.csv")
-            p.parent.mkdir(exist_ok=True)
-            pd.DataFrame([{"ts": pd.Timestamp.utcnow(), "symbol": j_sym,
-                           "dir": j_dir, "R": j_r, "followed": j_ok,
-                           "note": j_note}]).to_csv(
-                p, mode="a", header=not p.exists(), index=False)
-            st.success("Logged.")
-    if pathlib.Path("./state/journal.csv").exists():
-        st.dataframe(pd.read_csv("./state/journal.csv").tail(100),
-                     hide_index=True, use_container_width=True)
+if MODE == "Bot":
+    with T["Journal"]:
+        ui.section("Journal", "Log every trade.")
+        with st.form("journal", clear_on_submit=True):
+            j1, j2, j3, j4 = st.columns(4)
+            j_sym = j1.text_input("Symbol", help="Pair traded.")
+            j_dir = j2.selectbox("Side", ["long", "short"], help="Direction.")
+            j_r = j3.number_input("Result (R)", -10.0, 10.0, 0.0, step=0.1,
+                                  help="-1 means stopped.")
+            j_ok = j4.checkbox("Followed rules", value=True,
+                               help="Taken exactly as planned?")
+            j_note = st.text_input("Note", help="What you saw, what you did.")
+            if st.form_submit_button("Log"):
+                p = pathlib.Path("./state/journal.csv")
+                p.parent.mkdir(exist_ok=True)
+                pd.DataFrame([{"ts": pd.Timestamp.utcnow(), "symbol": j_sym,
+                               "dir": j_dir, "R": j_r, "followed": j_ok,
+                               "note": j_note}]).to_csv(
+                    p, mode="a", header=not p.exists(), index=False)
+                st.success("Logged.")
+        if pathlib.Path("./state/journal.csv").exists():
+            st.dataframe(pd.read_csv("./state/journal.csv").tail(100),
+                         hide_index=True, use_container_width=True)
+
+
+# ---------------------------------------------------------------- learn
+with T["Learn"]:
+    ui.section("Learn", "Work the stages in order. Do not skip to stage 5.")
+    for stage, title, status, items in learn.STAGES:
+        tone = "up" if status == "started" else "warn" if status == "next" else "mut"
+        with st.expander(f"{stage} · {title}"):
+            st.markdown(f'<span class="pill {tone}">{status}</span>',
+                        unsafe_allow_html=True)
+            for it in items:
+                st.write(f"- {it}")
+    st.divider()
+    st.markdown("#### Priority order")
+    st.dataframe(pd.DataFrame([{"#": a, "concept": b, "why": c}
+                               for a, b, c in learn.PRIORITY]),
+                 hide_index=True, use_container_width=True)
+    st.divider()
+    st.markdown("#### How the concepts fit together")
+    st.markdown(learn.FRAMEWORK)
+    st.divider()
+    st.markdown("#### A daily sequence")
+    st.markdown(learn.DAILY)
 
 
 # ---------------------------------------------------------------- guide
-with tab_guide:
-    ui.section("User guide")
+with T["Guide"]:
+    ui.section("Guide")
     st.markdown("""
-### Getting signals to appear
-Defaults are C grade, freshness 12, Relax on. Press Run scan.
+### Spot vs Bot
+Spot is long-only accumulation on daily charts, laddered into demand. Bot is
+the long and short scanner. They are separate because the jobs differ: spot
+wants time and patience, bot wants structure and a tight stop.
 
-### Reading the diagnostic line
-venue · perps · universe · loaded · failed · raw · passed filters · dropped stale · graded · below grade · smc rejected
+### Getting bot signals
+Grade C, freshness 12, Relax on, then Run scan. Read the diagnostic line.
 
-- dropped stale high: raise freshness to 24 or 48
-- raw above 0, passed filters 0: tick Relax filters
-- below grade above 0: lower Minimum grade
-- smc rejected above 0: uncheck Require SMC confluence
-- loaded 0: try BTC/USDT:USDT
+### Playbook verdict
+Every SMC plan scores seven checks: trend, structure break, zone, range
+position, liquidity taken, R:R of 2 or more, stop inside 3 ATR. Six or more is
+an A, five a B at half size, four is watch only, below four skip.
 
 ### Grades
 A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.
 
-### Status
-ACTIONABLE at entry · BETTER_PRICE pulled back · RUNNING TP1 hit · EXTENDED
-ran away · INVALID stopped out.
-
 ### Sizing
 qty = (equity × risk percent) ÷ (entry − stop)
 
-### Smart money
-The SMC tab draws unfilled gaps, order blocks and sweeps, and tells you whether
-price is in premium or discount. The scan card shows an smc score. Positive
-means structure backs the setup, negative means it fights it.
-
-### Daily routine
-1. Macro tab for stance.
-2. SMC tab on the coin you are considering.
-3. Scan, work top grade down, prefer positive smc scores.
-4. Check heat before a correlated add.
-5. Entry, stop and TP1 together. Log it.
+### Rules
+- 0.5% risk per trade, 3% total heat.
+- Two correlated positions maximum per direction.
+- No entries within 24h of a major macro print.
+- Paper trade 30 signals before real money.
 """)
 
 

@@ -24,10 +24,9 @@ h1,h2,h3,h4{letter-spacing:-.02em;font-weight:650;}
 p, li, label, span{color:var(--txt);}
 small, .stCaption, [data-testid="stCaptionContainer"]{color:var(--mut)!important;}
 
-/* hero */
 .hero{
   position:relative; overflow:hidden; border:1px solid var(--line);
-  border-radius:18px; padding:22px 26px; margin-bottom:18px;
+  border-radius:18px; padding:22px 26px; margin-bottom:14px;
   background:
     radial-gradient(700px 220px at 12% -30%, rgba(20,184,166,.20), transparent 65%),
     radial-gradient(600px 200px at 88% -20%, rgba(240,185,11,.13), transparent 60%),
@@ -36,7 +35,6 @@ small, .stCaption, [data-testid="stCaptionContainer"]{color:var(--mut)!important
 .hero h1{margin:0;font-size:26px;}
 .hero p{margin:6px 0 0;color:var(--mut);font-size:13.5px;}
 
-/* cards */
 .card{
   background:linear-gradient(180deg,var(--panel2),var(--panel));
   border:1px solid var(--line); border-radius:14px; padding:14px 16px;
@@ -54,7 +52,28 @@ small, .stCaption, [data-testid="stCaptionContainer"]{color:var(--mut)!important
 .pill.dn{border-color:rgba(234,57,67,.35);color:var(--dn);background:rgba(234,57,67,.09);}
 .pill.warn{border-color:rgba(240,185,11,.35);color:var(--warn);background:rgba(240,185,11,.09);}
 
-/* controls */
+/* live strip */
+.live-bar{display:flex;align-items:center;gap:9px;margin:0 0 8px 2px;}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--up);
+  box-shadow:0 0 0 0 rgba(22,199,132,.65);animation:pulse 1.9s infinite;}
+@keyframes pulse{
+  0%{box-shadow:0 0 0 0 rgba(22,199,132,.6);}
+  70%{box-shadow:0 0 0 9px rgba(22,199,132,0);}
+  100%{box-shadow:0 0 0 0 rgba(22,199,132,0);}
+}
+.live-lbl{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--mut);}
+
+.mq-wrap{
+  overflow:hidden;border:1px solid var(--line);border-radius:12px;
+  background:#0b0e13;padding:10px 0;margin-bottom:16px;
+}
+.mq-track{display:flex;gap:30px;white-space:nowrap;width:max-content;
+  animation:scroll 52s linear infinite;}
+.mq-wrap:hover .mq-track{animation-play-state:paused;}
+@keyframes scroll{from{transform:translateX(0);}to{transform:translateX(-50%);}}
+.mq{font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--mut);}
+.mq b{color:var(--txt);font-weight:600;}
+
 .stButton>button{
   border-radius:10px;border:1px solid var(--line);background:#141821;
   color:var(--txt);font-weight:600;transition:.15s;
@@ -114,3 +133,27 @@ def section(title: str, sub: str = "") -> None:
     st.markdown(f"#### {title}")
     if sub:
         st.caption(sub)
+
+
+def live_label(text: str = "live · 30s refresh") -> None:
+    st.markdown(
+        f'<div class="live-bar"><span class="dot"></span>'
+        f'<span class="live-lbl">{text}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def marquee(rows: list[dict]) -> None:
+    if not rows:
+        st.caption("Live prices unavailable.")
+        return
+    items = "".join(
+        f'<span class="mq"><b>{r["symbol"]}</b> ${r["price"]:,.6g} '
+        f'<span class="{"up" if r["chg"] >= 0 else "dn"}">'
+        f'{r["chg"]:+.2f}%</span></span>'
+        for r in rows
+    )
+    st.markdown(
+        f'<div class="mq-wrap"><div class="mq-track">{items}{items}</div></div>',
+        unsafe_allow_html=True,
+    )

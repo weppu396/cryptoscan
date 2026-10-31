@@ -41,6 +41,7 @@ GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
 SCAN_BARS = 1200
+HAS_FRAGMENT = hasattr(st, "fragment")
 
 VENUE_ORDER = ["binance", "binanceusdm", "okx", "bybit", "bitget",
                "kucoinfutures", "mexc", "gateio", "binanceus"]
@@ -68,10 +69,8 @@ def _resolve(cfg, preferred, proxy):
     base = {"preferred": preferred} if "preferred" in sig else {}
     if "proxy" in sig:
         base["proxy"] = proxy
-
     order = ([preferred] + [v for v in VENUE_ORDER if v != preferred]
              if preferred and preferred != "auto" else list(VENUE_ORDER))
-
     best, best_n = None, -1
     for name in order:
         kw = dict(base)
@@ -105,59 +104,39 @@ def _perps(ex) -> int:
 
 
 def _alts(sym: str) -> list[str]:
-    """Both symbol shapes, perp first."""
     out = [sym]
-    if ":" in sym:
-        out.append(sym.split(":")[0])
-    else:
-        out.append(f"{sym}:USDT")
+    out.append(sym.split(":")[0] if ":" in sym else f"{sym}:USDT")
     return out
 
 
 def _universe(ex, min_vol: int, top: int) -> tuple[list[str], int, int]:
-    """
-    Build the symbol list straight from markets + tickers.
-
-    Returns (symbols, floor_used, perp_count). Perps are preferred; if the
-    venue has none, spot is used instead.
-    """
     ex.load_markets()
     try:
         tickers = ex.fetch_tickers()
     except Exception:
         tickers = {}
-
     rows = []
     for sym, m in ex.markets.items():
         if not m.get("active", True) or m.get("quote") != "USDT":
             continue
         qv = float((tickers.get(sym) or {}).get("quoteVolume") or 0)
         rows.append((sym, qv, bool(m.get("swap") or m.get("contract"))))
-
     perps = [r for r in rows if r[2]]
     pool = perps if len(perps) >= 10 else rows
-
     floor = min_vol
     filtered = [r for r in pool if r[1] >= floor]
     if len(filtered) < 15:
         floor = 0
         filtered = pool
-
     filtered.sort(key=lambda r: -r[1])
     syms = [r[0] for r in filtered[:top]]
-
     if not syms:
         base = "BTC/USDT:USDT" if len(perps) >= 10 else "BTC/USDT"
-        for c in MAJORS:
-            s = base.replace("BTC", c)
-            if s in ex.markets:
-                syms.append(s)
-
+        syms = [base.replace("BTC", c) for c in MAJORS if base.replace("BTC", c) in ex.markets]
     return syms, floor, len(perps)
 
 
 def _load(ex, sym: str, tf: str, limit: int):
-    """load() with alternate-symbol retry."""
     for cand in _alts(sym):
         try:
             df = load(ex, cand, tf, limit=limit)
@@ -224,16 +203,22 @@ def load_stats() -> dict:
 # ---------------------------------------------------------------- pipelines
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                equity, recent_bars, min_grade, preferred, proxy):
+                equity, recent_bars, min_grade, preferred, proxy, relax):
+    if relax:
+        min_rr = max(1.2, min_rr * 0.7)
+        max_stop_atr = max_stop_atr * 1.4
+        idx = GRADE_ORDER.index(min_grade)
+        min_grade = GRADE_ORDER[max(0, idx - 1)]
+
     cfg = build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, ex_name = _resolve(cfg, preferred, proxy)
-
     universe, floor, perps = _universe(ex, int(min_vol), top)
     stats = load_stats()
     found = []
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
-            "floor": floor, "loaded": 0, "short": 0, "err": 0, "raw": 0,
-            "graded": 0}
+            "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
+            "graded": 0, "below_grade": 0, "relax": relax,
+            "rr": min_rr, "stop": max_stop_atr}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)
@@ -251,6 +236,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             raw = scan_bos_retest(used_sym, df, hb, ind, stt, zu, zd, cfg)
             diag["raw"] += len(raw)
             kept = filter_setups(raw, ind, zu, zd, cfg)
+            diag["kept"] += len(kept)
             if recent_bars and kept:
                 cut = df.index[max(0, len(df) - 1 - recent_bars)]
                 kept = [s for s in kept if s.ts >= cut]
@@ -261,6 +247,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 s.meta["rating"] = rt
                 diag["graded"] += 1
                 if min_grade and GRADE_ORDER.index(rt.grade) > GRADE_ORDER.index(min_grade):
+                    diag["below_grade"] += 1
                     continue
                 found.append(s)
         except Exception:
@@ -296,6 +283,37 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
     return curve, trades, len(raw), len(setups)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_radar(exchange, preferred, proxy):
+    """200-day SMA distance across majors. No signals.py dependency."""
+    cfg = build_cfg(exchange, 40, 30e6, "1d", 2.0, 3.5, 0.5, 10000)
+    ex, name = _resolve(cfg, preferred, proxy)
+    out = []
+    for c in MAJORS[:12]:
+        df, used = _load(ex, f"{c}/USDT:USDT", "1d", 400)
+        if df is None:
+            df, used = _load(ex, f"{c}/USDT", "1d", 400)
+        if df is None:
+            continue
+        sma = df["close"].rolling(200).mean().iloc[-1]
+        if pd.isna(sma):
+            continue
+        px = float(df["close"].iloc[-1])
+        dist = (px / float(sma) - 1) * 100
+        try:
+            rsi = float(compute_all(df, cfg)["rsi"].iloc[-1])
+        except Exception:
+            rsi = None
+        sev = 2 if dist <= 0 else 1 if dist <= 6 else 0
+        reasons = [f"{dist:+.1f}% vs 200d SMA"]
+        if rsi is not None:
+            reasons.append(f"RSI {rsi:.0f}")
+        out.append({"symbol": used, "sev": sev, "dist": dist,
+                    "reasons": reasons, "venue": name})
+    out.sort(key=lambda r: r["dist"])
+    return out
+
+
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.markdown('<div class="auth-logo">◈</div>', unsafe_allow_html=True)
@@ -308,15 +326,15 @@ with st.sidebar:
 
     exch = st.selectbox(
         "Exchange", ["auto"] + CANDIDATES, index=0,
-        help="auto scores venues by perpetual-market depth and picks the "
-             "deepest one that answers. Spot-only venues are avoided.")
+        help="auto scores venues by perpetual depth and picks the deepest that "
+             "answers. Spot-only venues are avoided.")
     proxy = st.text_input(
         "Binance proxy (optional)", value="",
         placeholder="https://your-worker.workers.dev",
         help="Cloudflare Worker URL. Only needed for Binance, which returns "
              "HTTP 451 to US datacentre IPs.")
     if st.button("Test venues", use_container_width=True,
-                 help="Probe every venue and list which ones answer, with latency."):
+                 help="Probe every venue and list which ones answer."):
         with st.spinner("probing..."):
             st.session_state["health"] = probe_exchanges(proxy.strip() or None)
 
@@ -329,8 +347,7 @@ with st.sidebar:
 
     st.divider()
     ltf = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
-                       help="Bar size. 4h is the swing default. 1d needs more "
-                            "history to warm up.")
+                       help="Bar size. 4h is the swing default.")
     top = st.slider("Symbols to scan", 10, 150, 40, step=10,
                     help="How many top-volume pairs to check. More means slower.")
     min_vol = st.select_slider(
@@ -344,6 +361,11 @@ with st.sidebar:
                                  help="A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.")
     only_ok = st.checkbox("Actionable only", value=True,
                           help="Hide extended, invalid and past-target setups.")
+    relax = st.checkbox(
+        "Relax filters", value=False,
+        help="Widens R:R floor to 70% and stop cap to 140%, and drops the grade "
+             "floor one step. Use when a scan returns raw breaks but nothing "
+             "survives filtering.")
     limit = st.slider("Max results", 3, 40, 10, help="Cap on cards rendered.")
 
     st.divider()
@@ -368,6 +390,16 @@ st.markdown(
     </div>""",
     unsafe_allow_html=True,
 )
+
+
+def _strip() -> None:
+    ui.live_label()
+    ui.marquee(market.ticker_rows(24))
+
+
+if HAS_FRAGMENT:
+    _strip = st.fragment(run_every="30s")(_strip)
+_strip()
 
 ov = market.overview()
 fng = ov.get("fng")
@@ -396,7 +428,7 @@ tabs = st.tabs(["Overview", "Scan", "Radar", "Portfolio", "Backtest",
 with tab_ov:
     ui.section("Coin detail", "Candles, trend state and venue depth.")
     d1, d2 = st.columns([2, 1])
-    detail_sym = d1.text_input("Symbol", "BTC/USDT", key="detail_sym",
+    detail_sym = d1.text_input("Symbol", "BTC/USDT:USDT", key="detail_sym",
                                help="Unified ccxt symbol. BTC/USDT spot, "
                                     "BTC/USDT:USDT perpetual.")
     detail_tf = d2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
@@ -410,8 +442,7 @@ with tab_ov:
             ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
             df, used = _load(ex, detail_sym, detail_tf, 400)
             if df is None:
-                st.warning(f"Not enough candles for {detail_sym} on {ex_name}. "
-                           f"Try the other symbol format or another venue.")
+                st.warning(f"Not enough candles for {detail_sym} on {ex_name}.")
             else:
                 ind = compute_all(df, cfg)
                 hb = htf_bias(df, cfg)
@@ -428,9 +459,7 @@ with tab_ov:
                 ui.stat(m4, "RSI", f"{rsi:.1f}",
                         "dn" if rsi > 70 else "up" if rsi < 30 else "")
                 ui.stat(m5, "Bias", bias, "up" if bias.startswith("bull") else "dn")
-                st.caption(f"EMA50 {float(ind['ema50'].iloc[-1]):,.6g} · "
-                           f"EMA200 {float(ind['ema200'].iloc[-1]):,.6g} · "
-                           f"venue {ex_name} · symbol {used}")
+                st.caption(f"venue {ex_name} · symbol {used}")
 
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
@@ -474,7 +503,7 @@ with tab_scan:
             with st.spinner("Scanning..."):
                 found, diag = cached_scan(
                     exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                    equity, recent, min_grade, exch, proxy.strip() or None)
+                    equity, recent, min_grade, exch, proxy.strip() or None, relax)
             st.session_state["setups"] = found
             st.session_state["diag"] = diag
         except Exception as e:
@@ -484,23 +513,25 @@ with tab_scan:
     diag = st.session_state.get("diag")
     if diag:
         st.caption(f"venue `{diag['venue']}` · perps {diag['perps']} · "
-                   f"universe {diag['universe']} (floor ${diag['floor']/1e6:.0f}M) · "
-                   f"loaded {diag['loaded']} · failed {diag['err']} · "
-                   f"raw {diag['raw']} · graded {diag['graded']}")
+                   f"universe {diag['universe']} · loaded {diag['loaded']} · "
+                   f"failed {diag['err']} · raw {diag['raw']} · "
+                   f"passed filters {diag['kept']} · graded {diag['graded']} · "
+                   f"below grade {diag['below_grade']}"
+                   + (f" · RELAXED R:R {diag['rr']:.2f} stop {diag['stop']:.1f}" if diag["relax"] else ""))
 
-        if diag["universe"] < 5:
-            st.error(
-                f"Only {diag['universe']} symbols found on {diag['venue']}. "
-                f"That venue is too thin. Switch Exchange to `okx` or `bybit` "
-                f"and raise Symbols to scan.")
-        elif diag["loaded"] == 0:
-            st.error(
-                f"{diag['universe']} symbols found but none returned candles. "
-                f"The exchange is refusing history — try another venue or "
-                f"symbol format like BTC/USDT:USDT.")
-        elif diag["raw"] == 0 and diag["loaded"] > 10:
+        if diag["raw"] and not diag["kept"]:
+            st.error(f"{diag['raw']} breaks found, all rejected by filters. "
+                     f"Tick **Relax filters** in the sidebar and rerun, or lower "
+                     f"Minimum R:R.")
+        elif diag["kept"] and not diag["graded"]:
+            st.warning("Setups passed filters but all were below your grade floor. "
+                       "Lower Minimum grade or tick Relax filters.")
+        elif diag["below_grade"] and not st.session_state.get("setups"):
+            st.warning(f"{diag['below_grade']} setup(s) graded below {min_grade}. "
+                       f"Lower the grade floor to see them.")
+        elif not diag["raw"] and diag["loaded"] > 10:
             st.info("Pipeline healthy, no break-of-structure in this window. "
-                    "Normal in chop. Try 1h or set Minimum grade to D.")
+                    "Normal in chop. Try 1h.")
 
     setups = st.session_state.get("setups", [])
     if not setups:
@@ -539,22 +570,39 @@ with tab_scan:
 
 # ---------------------------------------------------------------- radar
 with tab_radar:
-    ui.section("Value radar", "200-day zone proximity for accumulation.")
-    try:
-        import signals as sig_mod
-        if st.button("Refresh radar", help="Scan majors for deep discount zones."):
-            st.session_state["radar"] = _call(
-                sig_mod, ["value_radar", "radar", "scan_radar"])
-        radar = st.session_state.get("radar", [])
-        if radar:
-            st.dataframe(pd.DataFrame([{
-                "coin": r.get("symbol"), "severity": r.get("sev"),
-                "note": " · ".join(r.get("reasons", [])),
-            } for r in radar]), hide_index=True, use_container_width=True)
-        else:
-            st.info("Press Refresh radar.")
-    except Exception as e:
-        st.warning(f"Radar unavailable: {type(e).__name__}: {e}")
+    ui.section("Value radar", "Distance to the 200-day SMA across majors.")
+    st.caption("Negative means price is under the 200-day average — a "
+               "multi-cycle accumulation zone, not a buy signal on its own.")
+    if st.button("Refresh radar", help="Recompute distances from the venue."):
+        try:
+            with st.spinner("loading daily candles..."):
+                st.session_state["radar"] = cached_radar(
+                    exch, exch, proxy.strip() or None)
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
+
+    radar = st.session_state.get("radar", [])
+    if radar:
+        st.dataframe(pd.DataFrame([{
+            "coin": r["symbol"],
+            "zone": "deep" if r["sev"] == 2 else "near" if r["sev"] == 1 else "extended",
+            "vs 200d": f"{r['dist']:+.1f}%",
+            "detail": " · ".join(r["reasons"]),
+        } for r in radar]), hide_index=True, use_container_width=True)
+
+        bars = go.Figure(go.Bar(
+            x=[r["dist"] for r in radar], y=[r["symbol"] for r in radar],
+            orientation="h",
+            marker_color=["#16c784" if r["dist"] <= 0 else
+                          "#f0b90b" if r["dist"] <= 6 else "#ea3943"
+                          for r in radar]))
+        bars.update_layout(height=360, template="plotly_dark",
+                           paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
+                           margin=dict(l=6, r=6, t=6, b=6),
+                           xaxis_title="% vs 200d SMA")
+        st.plotly_chart(bars, use_container_width=True)
+    else:
+        st.info("Press Refresh radar.")
 
 
 # ---------------------------------------------------------------- portfolio
@@ -610,8 +658,8 @@ with tab_bt:
     bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym",
                            help="Use BTC/USDT:USDT on perpetual venues.")
     bt_bars = b2.number_input("Bars", 500, 20000, 6000, step=500,
-                              help="History depth. More bars is slower but gives "
-                                   "EMA200 room to warm up.")
+                              help="History depth. More bars is slower but warms "
+                                   "EMA200 properly.")
     bt_grade = b3.select_slider("Min grade", GRADE_ORDER, value="D",
                                 key="bt_grade", help="Grade floor inside the run.")
 
@@ -650,7 +698,7 @@ with tab_macro:
         if isinstance(mstate, dict) and mstate.get("blackout"):
             st.warning(mstate.get("blackout_reason", "Macro blackout active."))
     except Exception:
-        mstate = None
+        pass
 
     label, ltone, notes = market.stance(fng, ov["btc_dom"], stab)
     s1, s2, s3 = st.columns(3)
@@ -665,12 +713,11 @@ with tab_macro:
             mode="gauge+number", value=fng if fng is not None else 0,
             gauge={"axis": {"range": [0, 100], "tickcolor": "#7f8798"},
                    "bar": {"color": "#14b8a6", "thickness": .28},
-                   "steps": [
-                       {"range": [0, 25], "color": "#2a1214"},
-                       {"range": [25, 45], "color": "#2b2110"},
-                       {"range": [45, 55], "color": "#161a21"},
-                       {"range": [55, 75], "color": "#122a1c"},
-                       {"range": [75, 100], "color": "#0f3b24"}]}))
+                   "steps": [{"range": [0, 25], "color": "#2a1214"},
+                             {"range": [25, 45], "color": "#2b2110"},
+                             {"range": [45, 55], "color": "#161a21"},
+                             {"range": [55, 75], "color": "#122a1c"},
+                             {"range": [75, 100], "color": "#0f3b24"}]}))
         gauge.update_layout(height=260, template="plotly_dark",
                             paper_bgcolor="#0f1116",
                             margin=dict(l=18, r=18, t=10, b=10))
@@ -680,13 +727,11 @@ with tab_macro:
         st.caption("Market cap split — BTC vs ETH vs everything else")
         labels, values = market.dominance_split(ov)
         if labels:
-            pie = go.Figure(go.Pie(
-                labels=labels, values=values, hole=.55,
-                marker=dict(colors=["#f0b90b", "#627eea", "#3a4150"])))
+            pie = go.Figure(go.Pie(labels=labels, values=values, hole=.55,
+                                   marker=dict(colors=["#f0b90b", "#627eea", "#3a4150"])))
             pie.update_layout(height=260, template="plotly_dark",
                               paper_bgcolor="#0f1116",
-                              margin=dict(l=18, r=18, t=10, b=10),
-                              showlegend=True)
+                              margin=dict(l=18, r=18, t=10, b=10))
             st.plotly_chart(pie, use_container_width=True)
         else:
             st.info("Dominance data unavailable.")
@@ -710,23 +755,21 @@ with tab_macro:
     for n in notes:
         st.write(f"- {n}")
     st.markdown("""
-**Fear & Greed** aggregates volatility, momentum, social chatter and dominance
-into one number. It is a crowd gauge, not a timing tool. Deep fear gives better
-prices but worse follow-through, so pair it with structure rather than using it
-alone.
+**Fear & Greed** aggregates volatility, momentum, chatter and dominance into one
+number. It is a crowd gauge, not a timing tool. Deep fear gives better prices but
+worse follow-through.
 
-**Dominance** is where market cap sits. Rising BTC dominance means capital is
+**Dominance** shows where market cap sits. Rising BTC dominance means capital is
 retreating into the largest asset and alts underperform. Falling dominance is
-rotation into alts, which is where alt breakouts actually run.
+rotation into alts, where alt breakouts actually run.
 
-**Stablecoin share** is unspent buying power sitting on the sidelines. A rising
-share is fuel, not a signal on its own.
+**Stablecoin share** is unspent buying power. Rising is fuel, not a signal.
 
-**Market cap trend** shows whether the aggregate is expanding or contracting.
-Longs work better in expansion, shorts in contraction.
+**Market cap trend** shows expansion or contraction. Longs work better in
+expansion, shorts in contraction.
 
 **Blackout** comes from the economic calendar. Rate decisions and CPI prints
-distort intraday structure, so new entries inside the window are lower quality.
+distort intraday structure.
 """)
 
 
@@ -747,87 +790,18 @@ with tab_alert:
             if ok:
                 st.success("Test sent.")
             else:
-                st.error("Not configured. Add Telegram or SMTP values first.")
+                st.error("Not configured yet. Follow the steps below.")
     except Exception as e:
         st.warning(f"Alerts unavailable: {type(e).__name__}: {e}")
 
-
-# ---------------------------------------------------------------- journal
-with tab_journal:
-    ui.section("Journal", "Log every trade. The rules column is the one that matters.")
-    with st.form("journal", clear_on_submit=True):
-        j1, j2, j3, j4 = st.columns(4)
-        j_sym = j1.text_input("Symbol", help="Pair traded.")
-        j_dir = j2.selectbox("Side", ["long", "short"], help="Direction.")
-        j_r = j3.number_input("Result (R)", -10.0, 10.0, 0.0, step=0.1,
-                              help="Outcome in R. -1 means the stop was hit.")
-        j_ok = j4.checkbox("Followed rules", value=True,
-                           help="Did you take it exactly as the card said?")
-        j_note = st.text_input("Note", help="What you saw, what you did.")
-        if st.form_submit_button("Log"):
-            p = pathlib.Path("./state/journal.csv")
-            p.parent.mkdir(exist_ok=True)
-            pd.DataFrame([{"ts": pd.Timestamp.utcnow(), "symbol": j_sym,
-                           "dir": j_dir, "R": j_r, "followed": j_ok,
-                           "note": j_note}]).to_csv(
-                p, mode="a", header=not p.exists(), index=False)
-            st.success("Logged.")
-    if pathlib.Path("./state/journal.csv").exists():
-        st.dataframe(pd.read_csv("./state/journal.csv").tail(100),
-                     hide_index=True, use_container_width=True)
-
-
-# ---------------------------------------------------------------- guide
-with tab_guide:
-    ui.section("User guide")
+    st.divider()
+    st.markdown("#### Telegram setup")
     st.markdown("""
-### First run
-1. Set **Exchange** to `okx` or `bybit`. `auto` also works now.
-2. Leave **Symbols to scan** at 40 and **Min 24h volume** at $30M.
-3. Press **Test venues** to see what your host can reach.
-4. Press **Run scan**.
+1. Open Telegram, message **@BotFather**, send `/newbot`, follow the prompts.
+2. Copy the token it gives you.
+3. Message **@userinfobot** to get your numeric chat id.
+4. Streamlit Cloud → Settings → **Secrets**, add:
 
-### Reading the diagnostic line
-`venue · perps · universe · loaded · failed · raw · graded`
-
-- **perps 0** — spot-only venue. Switch.
-- **universe under 5** — thin venue. Switch.
-- **loaded 0, failed high** — the venue refuses history. Try `BTC/USDT:USDT`.
-- **raw 0, loaded high** — healthy but no structure. Normal in chop; try `1h`.
-
-### Grades
-A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52. Heuristic until calibrated.
-
-### Status
-ACTIONABLE at entry · BETTER_PRICE pulled back · RUNNING TP1 hit · EXTENDED
-ran away · INVALID stopped out.
-
-### Sizing
-`qty = (equity × risk%) ÷ (entry − stop)`. $10,000 at 0.5% with a $200 stop
-distance is $50 ÷ $200 = 0.25 units.
-
-### Daily routine
-1. Macro tab for stance. Fear under 25 favours accumulation.
-2. Scan, work top grade down.
-3. Check portfolio heat before a correlated add.
-4. Place entry, stop and TP1 together.
-5. Log it the same day.
-
-### Rules
-- 0.5% risk per trade, 3% total heat.
-- Two correlated positions maximum per direction.
-- No entries within 24h of a major macro print.
-- Paper trade 30 signals before real money.
-
-### Troubleshooting
-| Symptom | Cause | Fix |
-|---|---|---|
-| universe under 5 | thin venue | okx or bybit |
-| loaded 0 | venue refuses candles | perp symbol format |
-| Macro tab empty | `macro.py` has no `state()` | ignore, charts still work |
-| Nothing reachable | all venues blocked | add proxy URL |
-""")
-
-
-st.divider()
-st.caption("CryptoScan · not financial advice")
+```toml
+TELEGRAM_TOKEN = "9144109318:AAEl1Mj2_XBqOJIImkRFH_2HAumleexDcHY"
+TELEGRAM_CHAT_ID = "6193241326"

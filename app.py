@@ -1,5 +1,3 @@
-Full app.py with the indicator-key fixes baked in. No patches needed.
-
 python
 """
 app.py - CryptoScan. Spot mode and Bot mode.

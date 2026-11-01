@@ -1,3 +1,6 @@
+Full app.py with the indicator-key fixes baked in. No patches needed.
+
+python
 """
 app.py - CryptoScan. Spot mode and Bot mode.
 
@@ -73,6 +76,28 @@ def _call(mod, names, *a, **k):
 
 def _has(mod, names) -> bool:
     return any(callable(getattr(mod, n, None)) for n in names)
+
+
+def _ind(ind, *names):
+    """First indicator column that exists, else None. Survives naming drift."""
+    for n in names:
+        try:
+            s = ind[n]
+        except Exception:
+            s = None
+        if s is not None:
+            return s
+    return None
+
+
+def _last(ind, *names, default=0.0) -> float:
+    """Last value of the first present column, else the default."""
+    s = _ind(ind, *names)
+    try:
+        v = float(s.iloc[-1])
+        return v if v == v else default
+    except Exception:
+        return default
 
 
 def _rank(g) -> int:
@@ -387,7 +412,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     continue
                 try:
                     s.meta["smc"] = smc.confluence(
-                        df, s.direction, s.entry, float(ind["atr"].iloc[-1]))
+                        df, s.direction, s.entry,
+                        _last(ind, "atr", "atr14", "atr_14", default=0.0))
                 except Exception:
                     s.meta["smc"] = {"score": 0, "flags": [], "warnings": []}
                 if need_smc and s.meta["smc"]["score"] < 2:
@@ -445,7 +471,9 @@ def cached_radar(exchange, preferred, proxy):
         px = float(df["close"].iloc[-1])
         dist = (px / float(sma) - 1) * 100
         try:
-            rsi = float(compute_all(df, cfg)["rsi"].iloc[-1])
+            rsi = _last(compute_all(df, cfg), "rsi", "rsi14", "rsi_14",
+                        default=float("nan"))
+            rsi = None if rsi != rsi else rsi
         except Exception:
             rsi = None
         sev = 2 if dist <= 0 else 1 if dist <= 6 else 0
@@ -469,9 +497,8 @@ with st.sidebar:
 
     MODE = st.radio("Desk", ["Spot", "Bot"], horizontal=True, index=0,
                     help="Spot is long-only accumulation on daily charts. "
-                         "Bot is the long and short scanner on the timeframe you "
-                         "pick. They are separate because they are different "
-                         "jobs.")
+                         "Bot is the long and short scanner. They are separate "
+                         "because they are different jobs.")
     st.divider()
 
     exch = st.selectbox("Exchange", ["auto"] + CANDIDATES, index=0,
@@ -619,7 +646,7 @@ with T["Overview"]:
                 trend, notes = smc.trend_state(df)
                 last = float(df["close"].iloc[-1])
                 chg = (last / float(df["close"].iloc[-25]) - 1) * 100
-                rsi = float(ind["rsi"].iloc[-1])
+                rsi = _last(ind, "rsi", "rsi14", "rsi_14", default=50.0)
                 m1, m2, m3, m4 = st.columns(4)
                 ui.stat(m1, "Last", f"{last:,.6g}")
                 ui.stat(m2, "24 bar %", f"{chg:+.2f}%", "up" if chg >= 0 else "dn")
@@ -634,10 +661,14 @@ with T["Overview"]:
                     low=df["low"], close=df["close"], name="price",
                     increasing_line_color="#16c784",
                     decreasing_line_color="#ea3943"))
-                fig.add_trace(go.Scatter(x=df.index, y=ind["ema50"], name="EMA50",
-                                         line=dict(color="#14b8a6", width=1.2)))
-                fig.add_trace(go.Scatter(x=df.index, y=ind["ema200"], name="EMA200",
-                                         line=dict(color="#7f8798", width=1.2)))
+                fast = _ind(ind, "ema50", "ema_50", "ema_fast", "ema20")
+                slow = _ind(ind, "ema200", "ema_200", "ema_slow")
+                if fast is not None:
+                    fig.add_trace(go.Scatter(x=df.index, y=fast, name="fast EMA",
+                                             line=dict(color="#14b8a6", width=1.2)))
+                if slow is not None:
+                    fig.add_trace(go.Scatter(x=df.index, y=slow, name="slow EMA",
+                                             line=dict(color="#7f8798", width=1.2)))
                 fig.update_layout(height=430, template="plotly_dark",
                                   paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
                                   margin=dict(l=6, r=6, t=6, b=6),

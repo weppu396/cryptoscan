@@ -1,4 +1,3 @@
-python
 """
 app.py - CryptoScan. Spot mode and Bot mode.
 

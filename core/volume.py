@@ -4,7 +4,6 @@ import pandas as pd
 
 
 def anchored_vwap(df, anchor: int) -> pd.Series:
-    """VWAP from bar `anchor` forward. NaN before the anchor."""
     out = pd.Series(np.nan, index=df.index, dtype=float)
     if anchor is None or not (0 <= anchor < len(df)):
         return out
@@ -15,9 +14,9 @@ def anchored_vwap(df, anchor: int) -> pd.Series:
     return out
 
 
-def avwap_context(df, direction: str, atr: float, anchor: int) -> dict:
-    """0-100. Rewards price on the correct side of the anchor VWAP and rewards a
-    pullback INTO it. Punishes being stretched away from it."""
+def avwap_context(df, direction: str, atr: float, anchor: int | None) -> dict:
+    """0-100. A retest entry sits just BELOW the anchor VWAP by design, so
+    proximity to value scores higher than being above it."""
     blank = {"score": 0, "flags": [], "warnings": ["no ATR"], "dist": 0.0, "line": None}
     if not atr or atr <= 0:
         return blank
@@ -26,34 +25,40 @@ def avwap_context(df, direction: str, atr: float, anchor: int) -> dict:
         return {**blank, "warnings": ["no anchor"]}
     px = float(df["close"].iloc[-1])
     dist = (px - float(line.iloc[-1])) / atr
-    flags, warns, score = [], [], 0
+    flags, warns, score, flag = [], [], 0, None
 
     if direction == "long":
-        if dist > 0:
-            score += 40
-            flags.append(f"{dist:.1f} ATR above anchor VWAP")
+        if 0 < dist <= 1.0:
+            score, flag = 80, "above AVWAP, close to value"
+        elif dist > 1.0:
+            score, flag = 45, "extended above AVWAP"
+        elif -1.0 <= dist <= 0:
+            score, flag = 65, "pullback into AVWAP value"
+        elif -2.5 <= dist < -1.0:
+            score, flag = 45, "below AVWAP, deep pullback"
         else:
-            warns.append(f"{abs(dist):.1f} ATR below anchor VWAP")
-        if 0 <= dist <= 1.0:
-            score += 30
-            flags.append("pullback into AVWAP value")
+            warns.append("far below AVWAP")
     else:
-        if dist < 0:
-            score += 40
-            flags.append(f"{abs(dist):.1f} ATR below anchor VWAP")
+        if -1.0 <= dist < 0:
+            score, flag = 80, "below AVWAP, close to value"
+        elif dist < -1.0:
+            score, flag = 45, "extended below AVWAP"
+        elif 0 <= dist <= 1.0:
+            score, flag = 65, "rally into AVWAP value"
+        elif 1.0 < dist <= 2.5:
+            score, flag = 45, "above AVWAP, deep pullback"
         else:
-            warns.append(f"{dist:.1f} ATR above anchor VWAP")
-        if -1.0 <= dist <= 0:
-            score += 30
-            flags.append("rally into AVWAP value")
-    if abs(dist) > 2.5:
+            warns.append("far above AVWAP")
+
+    if flag:
+        flags.append(flag)
+    if abs(dist) > 3.0:
         warns.append("stretched from AVWAP")
-    return {"score": min(score, 100), "flags": flags, "warnings": warns,
+    return {"score": score, "flags": flags, "warnings": warns,
             "dist": dist, "line": line}
 
 
 def volume_profile(df, lookback: int = 200, bins: int = 60) -> dict:
-    """POC and value area. Entry inside the value area = real acceptance."""
     seg = df.tail(lookback)
     if len(seg) < 20:
         return {}

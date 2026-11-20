@@ -81,7 +81,7 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                 setups.append(Setup(
                     sym, "long", "BOS_retest_long", ltf.index[t], entry, stop,
                     tp1, tp2, a, (tp2 - entry) / risk, 0.0,
-                    ["HTF bias up", f"bullish BOS above {lvl:,.2f}",
+                    ["HTF bias up", f"bullish BOS above {lvl:,.6g}",
                      f"retest held with {cname or 'rejection'} ({cq})",
                      f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
                     {"candle": cname, "candle_q": cq}))
@@ -105,7 +105,7 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                 setups.append(Setup(
                     sym, "short", "BOS_retest_short", ltf.index[t], entry, stop,
                     tp1, tp2, a, (entry - tp2) / risk, 0.0,
-                    ["HTF bias down", f"bearish BOS below {lvl:,.2f}",
+                    ["HTF bias down", f"bearish BOS below {lvl:,.6g}",
                      f"retest rejected with {cname or 'rejection'} ({cq})",
                      f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
                     {"candle": cname, "candle_q": cq}))

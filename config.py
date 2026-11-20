@@ -2,6 +2,9 @@ from dataclasses import dataclass, asdict
 import hashlib
 import json
 
+# Flip to True in Streamlit Cloud secrets to restore the login wall.
+AUTH_ENABLED = False
+
 
 @dataclass(frozen=True)
 class Risk:

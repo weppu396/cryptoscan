@@ -9,19 +9,26 @@ import ui
 
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
           exch, proxy, cfg_fn, resolve_fn, load_fn, order_card, notify):
+    conf = r["confidence"]
     with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
-                     f"{s.meta.get('status')} · {r['score']}/100"):
+                     f"{s.meta.get('status')} · conf {conf:.0f}/100"):
         try:
             cfg = cfg_fn(exch, top, min_vol, ltf, min_rr, max_stop_atr,
                          risk_pct, equity)
             ex, _ = resolve_fn(cfg, exch, proxy)
             df, _u = load_fn(ex, s.symbol, ltf, 500)
-            if df is not None:
-                st.plotly_chart(chart.build(df, cfg, s.direction),
+            if df is None:
+                st.caption("chart: not enough candles")
+            else:
+                plan = {"entry": s.entry, "sl": s.stop, "tp1": s.tp1,
+                        "tp2": s.tp2}
+                st.plotly_chart(chart.build(df, cfg, s.direction, plan),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
+                with st.expander("How to read this chart"):
+                    st.markdown(chart.legend_md())
         except Exception as e:
-            st.caption(f"chart unavailable: {type(e).__name__}")
+            st.caption(f"chart error: {type(e).__name__}: {e}")
 
         st.write(f"**Logic** {' · '.join(s.reasons) or '—'}")
         if sm.get("flags"):
@@ -39,10 +46,11 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                  f"{'yes' if s.meta.get('in_value') else 'no'} · **candle** "
                  f"{s.meta.get('candle') or '—'} ({s.meta.get('candle_q', 0)})")
 
+        rr2 = abs(s.tp2 - s.entry) / abs(s.entry - s.stop) if s.stop != s.entry else s.rr
         order_card({"qty": s.meta.get("qty", 0), "entry": s.entry, "sl": s.stop,
                     "tp1": s.tp1, "tp2": s.tp2,
                     "size_usd": s.meta.get("risk_cash", 0),
-                    "rr1": s.rr, "rr2": s.rr}, s.symbol, s.direction)
+                    "rr1": s.rr, "rr2": rr2}, s.symbol, s.direction)
 
         c1, c2 = st.columns(2)
         if c1.button("Alert me", key=f"ba{s.symbol}"):
@@ -97,6 +105,9 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
         if bd["loaded"] and bd["err"] >= bd["loaded"]:
             st.warning("Most symbols failed — rate limiting. Lower universe size "
                        "or choose a venue manually.")
+        if bd["stale"] > bd["kept"]:
+            st.caption(f"{bd['stale']} setups fell outside the {bd['recent']}-bar "
+                       f"freshness window. Raise it to see more.")
 
     board = st.session_state.get("board", [])
     if not board:
@@ -104,7 +115,8 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
         return
 
     st.dataframe(pd.DataFrame([{
-        "grade": s.meta["r"]["grade"], "score": s.meta["r"]["score"],
+        "grade": s.meta["r"]["grade"],
+        "conf": round(s.meta["r"]["confidence"]),
         "symbol": s.symbol, "side": s.direction,
         "candle": s.meta.get("candle") or "—",
         "smc": s.meta.get("smc", {}).get("score", 0),

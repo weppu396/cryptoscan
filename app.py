@@ -66,8 +66,18 @@ GRADE_RANK = {g: i for i, g in enumerate(GRADE_ORDER)}
 GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
-SCAN_BARS = 1200
 HAS_FRAGMENT = hasattr(st, "fragment")
+
+# LTF -> HTF ratio, used to size the history request so the HTF has enough bars
+# for a 200 EMA. Roughly 1:4 to 1:6, per the multi-timeframe rule.
+RATIO = {"3m": 5, "5m": 6, "15m": 4, "1h": 4, "4h": 6, "1d": 1, "1w": 1}
+HTF_BARS = 260
+
+
+def _scan_bars(ltf: str) -> int:
+    """Enough LTF bars to give the HTF HTF_BARS of history, floor 1200."""
+    return max(1200, HTF_BARS * RATIO.get(ltf, 6))
+
 
 VENUE_ORDER = ["okx", "bybit", "kucoinfutures", "mexc", "gateio", "bitget",
                "binanceusdm", "binance", "binanceus"]
@@ -261,10 +271,12 @@ def _load(ex, sym: str, tf: str, limit: int, min_bars: int = MIN_BARS):
 
 
 def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity):
+    """htf is PAIRED to ltf. Leaving it at the default is what blanked the bias
+    on every low timeframe."""
     return replace(
         CFG,
         scan=replace(CFG.scan, exchange=exchange, top_n_symbols=top,
-                     min_quote_vol_24h=min_vol, ltf=ltf),
+                     min_quote_vol_24h=min_vol, ltf=ltf, htf=htf_for(ltf)),
         risk=replace(CFG.risk, min_rr=min_rr, max_stop_atr=max_stop_atr,
                      risk_per_trade_pct=risk_pct, account_equity=equity),
     )
@@ -396,16 +408,17 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     cfg = build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, ex_name = _resolve(cfg, preferred, proxy)
     universe, floor, perps = _universe(ex, int(min_vol), top)
+    bars = _scan_bars(cfg.scan.ltf)
     stats = load_stats()
     found = []
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
-            "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0,
-            "recent": recent_bars}
+            "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0, "bias_blank": 0,
+            "htf": cfg.scan.htf, "bars": bars, "recent": recent_bars}
 
     for sym in universe:
-        df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)
+        df, used_sym = _load(ex, sym, cfg.scan.ltf, bars)
         if df is None:
             diag["err"] += 1
             continue
@@ -414,6 +427,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             ind = compute_all(df, cfg)
             stt = build_structure(df, cfg.structure)
             hb = htf_bias(df, cfg)
+            if not (hb == "up").any() and not (hb == "down").any():
+                diag["bias_blank"] += 1
             sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
             zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
             zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
@@ -463,7 +478,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     continue
 
                 if need_mtf:
-                    htf_df, _ = _load(ex, used_sym, htf_for(cfg.scan.ltf), 250, 60)
+                    htf_df, _ = _load(ex, used_sym, cfg.scan.htf, max(HTF_BARS, 250),
+                                      60)
                     hb_s = structure_bias(htf_df, cfg) if htf_df is not None else "range"
                     ok_mtf, why = aligned(hb_s, str(stt["trend"].iloc[-1]), s.direction)
                     s.meta["mtf"] = {"ok": ok_mtf, "why": why, "htf": hb_s}
@@ -577,7 +593,8 @@ with st.sidebar:
 
     st.divider()
     ltf = st.selectbox("Timeframe", ["4h", "1d"] if MODE == "Spot" else ["1h", "4h", "1d"],
-                       index=0)
+                       index=1)
+    st.caption(f"bias from {htf_for(ltf)} · {_scan_bars(ltf)} bars")
     top = st.slider("Symbols to scan", 10, 150, 25, step=5)
     min_vol = st.select_slider("Min 24h volume",
                                [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
@@ -797,7 +814,8 @@ if MODE == "Bot":
             st.caption(f"venue {diag['venue']} · universe {diag['universe']} · "
                        f"loaded {diag['loaded']} · failed {diag['err']} · raw "
                        f"{diag['raw']} · kept {diag['kept']} · graded "
-                       f"{diag['graded']} · below grade {diag['below_grade']}")
+                       f"{diag['graded']} · below grade {diag['below_grade']} · "
+                       f"blank bias {diag['bias_blank']}")
         for s in [s for s in st.session_state.get("setups", [])
                   if (not only_ok) or s.meta.get("status") in OK_STATUS][:10]:
             r = _norm(s.meta.get("r"))
@@ -820,12 +838,11 @@ with T["SMC"]:
             cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
                             risk_pct, equity)
             ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
-            df, used = _load(ex, smc_sym, smc_tf, 500)
+            df, used = _load(ex, smc_sym, smc_tf, _scan_bars(smc_tf))
             if df is None:
                 st.warning(f"No data for {smc_sym} on {ex_name}.")
             else:
-                htf_name = htf_for(smc_tf)
-                hdf, _ = _load(ex, smc_sym, htf_name, 400, 60)
+                hdf, _ = _load(ex, smc_sym, cfg.scan.htf, max(HTF_BARS, 250), 60)
                 hb = structure_bias(hdf, cfg)
                 stt_tab = build_structure(df, cfg.structure)
                 lb = str(stt_tab["trend"].iloc[-1])
@@ -848,7 +865,7 @@ with T["SMC"]:
                         "up" if av["score"] >= 40 else "dn")
                 ui.stat(k[4], "In value area", "yes" if in_va else "no",
                         "up" if in_va else "warn")
-                st.caption(f"pair {smc_tf}/{htf_name} · {why}")
+                st.caption(f"pair {smc_tf}/{cfg.scan.htf} · {why}")
                 st.plotly_chart(chart.build(df, cfg, side, plan),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
@@ -1076,6 +1093,11 @@ with T["Guide"]:
 perps. It pins that venue for the session. To stop the switching, pick one
 directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 `Reset venue` clears the pin.
+
+### Timeframes
+The bias timeframe is always paired to the entry timeframe, roughly 1:4. The
+sidebar shows the pair and the bar count. A 1h entry reads bias from 4h; a 4h
+entry reads from 1d.
 
 ### Setups vs Scan
 Setups renders a chart per result and is what you work from. Scan is the flat

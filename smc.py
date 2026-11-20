@@ -5,6 +5,21 @@ import pandas as pd
 BULL_PATTERNS = {"bullish engulfing", "hammer", "bullish pin"}
 BEAR_PATTERNS = {"bearish engulfing", "shooting star", "bearish pin"}
 
+READING_ORDER = """
+**Reading order — work top to bottom, stop at the first failure**
+
+1. HTF structure. Up, down or range. Range means drop a timeframe pair or skip.
+2. Location. Is price at a fresh demand or supply zone, or an order block?
+3. Liquidity. Did a sweep just take the prior low (long) or high (short)?
+4. Volume. Did the sweep or reclaim print 1.5x the 20-bar average? Is price
+   on the correct side of the anchored VWAP?
+5. Acceptance. Is entry inside the value area, or floating in a low-volume gap?
+6. Structure break. A BOS in trend direction, or a CHoCH after a sweep.
+7. Candle. Engulfing, hammer, or pin, closing at the level.
+8. Range position. Discount for longs, premium for shorts.
+9. Then, and only then, size and place the bracket.
+"""
+
 
 def _tr(df) -> np.ndarray:
     h = df["high"].to_numpy(float)
@@ -20,7 +35,6 @@ def atr_series(df, n: int = 14) -> pd.Series:
     return pd.Series(_tr(df), index=df.index).rolling(n).mean()
 
 
-# ---------------------------------------------------------------- structure
 def swings(df, left: int = 3, right: int = 3):
     h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float)
@@ -42,15 +56,9 @@ def trend_state(df, lookback: int = 400) -> tuple[str, list[str]]:
     lo = [i for i in lo if i >= cut]
     notes = []
     if len(hi) >= 2:
-        if hi[-1] > hi[-2]:
-            notes.append("higher highs")
-        else:
-            notes.append("lower highs")
+        notes.append("higher highs" if hi[-1] > hi[-2] else "lower highs")
     if len(lo) >= 2:
-        if lo[-1] > lo[-2]:
-            notes.append("higher lows")
-        else:
-            notes.append("lower lows")
+        notes.append("higher lows" if lo[-1] > lo[-2] else "lower lows")
     ups = sum(1 for n in notes if n.startswith("higher"))
     downs = len(notes) - ups
     if ups == 2:
@@ -71,6 +79,7 @@ def structure_events(df, lookback: int = 400) -> list[dict]:
     events = []
     trend = "range"
     hi_i = lo_i = 0
+    last_h = last_l = None
     for i in range(cut, n):
         while hi_i < len(hi) and hi[hi_i] < i - 1:
             last_h = hi[hi_i]
@@ -78,12 +87,12 @@ def structure_events(df, lookback: int = 400) -> list[dict]:
         while lo_i < len(lo) and lo[lo_i] < i - 1:
             last_l = lo[lo_i]
             lo_i += 1
-        if "last_h" in dir() and i > 0 and c[i] > h[last_h]:
+        if last_h is not None and i > 0 and c[i] > h[last_h]:
             kind = "CHoCH" if trend == "down" else "BOS"
             events.append({"kind": kind, "dir": "bull", "idx": i,
                            "level": float(h[last_h]), "age": n - 1 - i})
             trend = "up"
-        if "last_l" in dir() and i > 0 and c[i] < l[last_l]:
+        if last_l is not None and i > 0 and c[i] < l[last_l]:
             kind = "CHoCH" if trend == "up" else "BOS"
             events.append({"kind": kind, "dir": "bear", "idx": i,
                            "level": float(l[last_l]), "age": n - 1 - i})
@@ -91,7 +100,6 @@ def structure_events(df, lookback: int = 400) -> list[dict]:
     return [e for e in events if e["age"] <= 40]
 
 
-# ---------------------------------------------------------------- zones
 def supply_demand(df, lookback: int = 300, imp_atr: float = 1.2,
                   max_age: int = 80) -> list[dict]:
     """Base of small candles followed by an impulse."""
@@ -181,7 +189,6 @@ def mitigated(zone: dict, df) -> bool:
     return bool((after["high"] >= zone["bot"]).any())
 
 
-# ---------------------------------------------------------------- liquidity
 def equal_levels(df, tol_atr: float = 0.25, lookback: int = 300) -> dict:
     """Clusters of near-identical highs and lows: stop-loss pools."""
     hi, lo = swings(df)
@@ -191,6 +198,7 @@ def equal_levels(df, tol_atr: float = 0.25, lookback: int = 300) -> dict:
     l = df["low"].to_numpy(float)
     cut = len(df) - lookback
     tol = tol_atr * a if a else 0.0
+
     def cluster(idxs, arr):
         idxs = [i for i in idxs if i >= cut]
         out = []
@@ -200,6 +208,7 @@ def equal_levels(df, tol_atr: float = 0.25, lookback: int = 300) -> dict:
                     out.append({"a": idxs[x], "b": idxs[y],
                                 "level": float((arr[idxs[x]] + arr[idxs[y]]) / 2)})
         return out
+
     return {"highs": cluster(hi, h), "lows": cluster(lo, l)}
 
 
@@ -216,11 +225,9 @@ def liquidity_sweeps(df, lookback: int = 300, width: int = 20,
         ph = h[i - width:i].max()
         pl = l[i - width:i].min()
         if h[i] > ph and c[i] < ph:
-            out.append({"dir": "bear", "idx": i, "age": n - 1 - i,
-                        "level": float(ph)})
+            out.append({"dir": "bear", "idx": i, "age": n - 1 - i, "level": float(ph)})
         elif l[i] < pl and c[i] > pl:
-            out.append({"dir": "bull", "idx": i, "age": n - 1 - i,
-                        "level": float(pl)})
+            out.append({"dir": "bull", "idx": i, "age": n - 1 - i, "level": float(pl)})
     return [s for s in out if s["age"] <= max_age]
 
 
@@ -248,7 +255,6 @@ def inducement(df, lookback: int = 200) -> list[dict]:
     return out[-12:]
 
 
-# ---------------------------------------------------------------- ranges
 def premium_discount(df, lookback: int = 120) -> float:
     if len(df) < 5:
         return 50.0
@@ -271,8 +277,10 @@ def fib_levels(df, lookback: int = 120) -> dict:
             "ext_1.272": hi + rng * 0.272, "ext_1.618": hi + rng * 0.618}
 
 
-# ---------------------------------------------------------------- candles
-def patterns(df, look: int = 3) -> list[str]:
+def patterns(df, look: int = 3, end: int | None = None) -> list[str]:
+    """Simple pattern names, scored elsewhere. `end` pins the window to a bar
+    index instead of the dataframe tail, so old setups are graded on their own
+    candles rather than today's."""
     if len(df) < 3:
         return []
     o = df["open"].to_numpy(float)
@@ -280,7 +288,8 @@ def patterns(df, look: int = 3) -> list[str]:
     h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float)
     found = []
-    for i in range(len(df) - look, len(df)):
+    stop = len(df) if end is None else min(end + 1, len(df))
+    for i in range(max(1, stop - look), stop):
         body = abs(c[i] - o[i])
         rng = h[i] - l[i]
         if rng <= 0:
@@ -317,9 +326,8 @@ def session_info(ts) -> dict:
     return {"name": name, "vol": vol, "hour": hour}
 
 
-# ---------------------------------------------------------------- confluence
 def confluence(df, direction: str, entry: float, atr: float,
-               tol_atr: float = 0.6) -> dict:
+               tol_atr: float = 0.6, idx: int | None = None) -> dict:
     flags, warnings = [], []
     score = 0
     band = tol_atr * atr if atr else 0.0
@@ -342,7 +350,8 @@ def confluence(df, direction: str, entry: float, atr: float,
         score += 2 if e["kind"] == "CHoCH" else 1
         flags.append(f"{e['kind']} {e['dir']} {e['age']} bars ago")
 
-    zones = [z for z in supply_demand(df) if z["dir"] == ("demand" if want == "bull" else "supply")]
+    zones = [z for z in supply_demand(df)
+             if z["dir"] == ("demand" if want == "bull" else "supply")]
     zone = next((z for z in zones if z["bot"] - band <= entry <= z["top"] + band), None)
     if zone:
         score += 2
@@ -391,7 +400,7 @@ def confluence(df, direction: str, entry: float, atr: float,
             score -= 1
             warnings.append(f"discount {pd_:.0f}%")
 
-    pats = patterns(df)
+    pats = patterns(df, 3, idx if idx is not None else len(df) - 1)
     good = BULL_PATTERNS if want == "bull" else BEAR_PATTERNS
     if any(p in good for p in pats):
         score += 1
@@ -408,7 +417,6 @@ def confluence(df, direction: str, entry: float, atr: float,
             "session": sess}
 
 
-# ---------------------------------------------------------------- playbook
 def playbook(df, direction: str, equity: float, risk_pct: float) -> dict:
     """Full A to Z plan with a pass/fail checklist."""
     atr = float(atr_series(df).iloc[-1] or 0)
@@ -416,7 +424,7 @@ def playbook(df, direction: str, equity: float, risk_pct: float) -> dict:
     want = "bull" if direction == "long" else "bear"
     long = direction == "long"
 
-    conf = confluence(df, direction, px, atr)
+    conf = confluence(df, direction, px, atr, idx=len(df) - 1)
     fib = fib_levels(df)
 
     zone = conf["zone"] or conf["ob"]
@@ -448,11 +456,10 @@ def playbook(df, direction: str, equity: float, risk_pct: float) -> dict:
 
     checks = [
         ("Trend agrees", conf["trend"] == ("up" if long else "down")),
-        ("Structure break present", bool([e for e in structure_events(df)
-                                          if e["dir"] == want])),
+        ("Structure break present",
+         bool([e for e in structure_events(df) if e["dir"] == want])),
         ("In a zone or order block", zone is not None),
-        ("Discount/premium correct",
-         (conf["pd"] <= 45) if long else (conf["pd"] >= 55)),
+        ("Discount/premium correct", (conf["pd"] <= 45) if long else (conf["pd"] >= 55)),
         ("Liquidity taken", conf["sweep"]),
         ("R:R at least 2", rr1 >= 2),
         ("Stop inside 3 ATR", abs(entry - sl) <= 3 * atr if atr else True),

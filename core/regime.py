@@ -5,14 +5,29 @@ from .indicators import ema
 
 def htf_bias(ltf: pd.DataFrame, cfg) -> pd.Series:
     """
-    Resample to HTF, compute the bias, then shift by ONE HTF bar.
-    Only completed HTF candles may inform an LTF decision.
+    Resample to the PAIRED htf, compute the bias, then shift by ONE htf bar.
+    Only completed htf candles may inform an ltf decision.
+
+    If the resampled series is too short for the configured slow EMA, the EMA
+    pair is shortened so the bias still resolves instead of going all-NaN.
     """
-    o = ltf.resample(cfg.scan.htf).agg(
-        {"open": "first", "high": "max", "low": "min",
-         "close": "last", "volume": "sum"}).dropna()
-    ef = ema(o["close"], cfg.regime.ema_fast)
-    es = ema(o["close"], cfg.regime.ema_slow)
+    try:
+        o = ltf.resample(cfg.scan.htf).agg(
+            {"open": "first", "high": "max", "low": "min",
+             "close": "last", "volume": "sum"}).dropna()
+    except Exception:
+        return pd.Series("unclear", index=ltf.index)
+
+    if len(o) < 30:
+        return pd.Series("unclear", index=ltf.index)
+
+    fast, slow = cfg.regime.ema_fast, cfg.regime.ema_slow
+    if len(o) < slow + 5:
+        fast = max(10, min(fast, len(o) // 4))
+        slow = max(fast + 5, min(slow, len(o) // 2))
+
+    ef = ema(o["close"], fast)
+    es = ema(o["close"], slow)
     bias = pd.Series(
         np.where(ef > es, "up", np.where(ef < es, "down", "unclear")),
         index=o.index).shift(1)

@@ -1,14 +1,17 @@
 import numpy as np
 
+from core.regime import regime_ok
+
 
 def score_setup(s, ind_row, zone, cfg) -> float:
     """0-100 ranking score. Higher = cleaner confluence. Ranking beats binary."""
     pts = 0.0
-    pts += min(s.rr / 3.0, 1.0) * 25                                  # reward quality
-    pts += 25 if cfg.risk.min_stop_atr <= s.stop_atr <= 1.5 else 10    # tight-but-safe
-    pts += min(ind_row["vol_ratio"] / 2.0, 1.0) * 15                   # volume confirm
-    pts += min(ind_row["adx"] / 40.0, 1.0) * 15                        # trend strength
-    pts += min((zone["touches"] if zone else 1) / 4.0, 1.0) * 20       # zone quality
+    pts += min(s.rr / 3.0, 1.0) * 25
+    pts += 25 if cfg.risk.min_stop_atr <= s.stop_atr <= 1.5 else 10
+    pts += min(ind_row["vol_ratio"] / 2.0, 1.0) * 15
+    pts += min(ind_row["adx"] / 40.0, 1.0) * 15
+    pts += min((zone["touches"] if zone else 1) / 4.0, 1.0) * 20
+    pts += min(s.meta.get("candle_q", 0) / 100.0, 1.0) * 10
     return round(min(pts, 100.0), 1)
 
 
@@ -35,14 +38,14 @@ def gate(s, ind_row, cfg) -> tuple[bool, list[str]]:
         reasons.append(f"stop {s.stop_atr:.2f} ATR too wide")
     if s.stop_atr < cfg.risk.min_stop_atr:
         reasons.append(f"stop {s.stop_atr:.2f} ATR too tight (noise)")
+    if s.meta.get("candle_q", 0) < 60:
+        reasons.append("no valid reversal candle")
     return (len(reasons) == 0), reasons
-
-from core.regime import regime_ok
 
 
 def filter_setups(setups, ind, zones_up, zones_dn, cfg):
-    """FIX #2 + #4: one shared filter used by BOTH scanner and backtest.
-    Indicators are looked up at the setup's OWN timestamp, not the last bar."""
+    """One shared filter used by BOTH scanner and backtest. Indicators are
+    looked up at the setup's OWN timestamp. Builder meta is preserved."""
     out = []
     for s in setups:
         try:
@@ -58,6 +61,7 @@ def filter_setups(setups, ind, zones_up, zones_dn, cfg):
         zone = (zones_up[0] if zones_up else None) if s.direction == "long" \
                else (zones_dn[0] if zones_dn else None)
         s.score = score_setup(s, row, zone, cfg)
-        s.meta = size_position(s.entry, s.stop, cfg.risk.account_equity, cfg)
+        keep = dict(s.meta or {})
+        s.meta = {**keep, **size_position(s.entry, s.stop, cfg.risk.account_equity, cfg)}
         out.append(s)
     return out

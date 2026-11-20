@@ -2,6 +2,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from core.candles import quality as candle_quality
+
 
 @dataclass
 class Setup:
@@ -26,7 +28,6 @@ class Setup:
 
 def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
     htf_b = np.asarray(htf_b)
-
     setups = []
     n = len(ltf)
     pend = None
@@ -60,11 +61,11 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
         rng = float(h[t] - l[t])
         if rng <= 0:
             continue
-        body = abs(float(c[t] - o[t]))
 
         if pend["dir"] == "long":
             touched = l[t] <= lvl + tol and h[t] >= lvl - tol
-            reject = c[t] > o[t] and c[t] > lvl and (body / rng) > 0.5
+            cname, cq = candle_quality(ltf, t, a, "long")
+            reject = c[t] > lvl and cq >= 60
             if touched and (reject or not cfg.structure.require_rejection_candle):
                 entry = float(c[t])
                 stop = min(float(l[t]), lvl - tol) - cfg.risk.stop_buffer_atr * a
@@ -80,14 +81,15 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                 setups.append(Setup(
                     sym, "long", "BOS_retest_long", ltf.index[t], entry, stop,
                     tp1, tp2, a, (tp2 - entry) / risk, 0.0,
-                    ["HTF bias up",
-                     f"4H bullish BOS above {lvl:,.2f}",
-                     "retest held with bullish rejection close",
-                     f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR buffer"]))
+                    ["HTF bias up", f"bullish BOS above {lvl:,.2f}",
+                     f"retest held with {cname or 'rejection'} ({cq})",
+                     f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
+                    {"candle": cname, "candle_q": cq}))
                 pend = None
         else:
             touched = h[t] >= lvl - tol and l[t] <= lvl + tol
-            reject = c[t] < o[t] and c[t] < lvl and (body / rng) > 0.5
+            cname, cq = candle_quality(ltf, t, a, "short")
+            reject = c[t] < lvl and cq >= 60
             if touched and (reject or not cfg.structure.require_rejection_candle):
                 entry = float(c[t])
                 stop = max(float(h[t]), lvl + tol) + cfg.risk.stop_buffer_atr * a
@@ -103,10 +105,10 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                 setups.append(Setup(
                     sym, "short", "BOS_retest_short", ltf.index[t], entry, stop,
                     tp1, tp2, a, (entry - tp2) / risk, 0.0,
-                    ["HTF bias down",
-                     f"4H bearish BOS below {lvl:,.2f}",
-                     "retest rejected with bearish close",
-                     f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR buffer"]))
+                    ["HTF bias down", f"bearish BOS below {lvl:,.2f}",
+                     f"retest rejected with {cname or 'rejection'} ({cq})",
+                     f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
+                    {"candle": cname, "candle_q": cq}))
                 pend = None
 
     return setups

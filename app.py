@@ -118,10 +118,12 @@ def _rank(g) -> int:
 
 
 def _anchor(stt, direction: str):
+    """Last confirmed opposite swing within 60 bars, so AVWAP tracks the current
+    leg instead of the start of history."""
     col = "prev_swing_low" if direction == "long" else "prev_swing_high"
     try:
-        v = float(stt[col].iloc[-1])
-        return int(v) if np.isfinite(v) else None
+        s = stt[col].tail(60).dropna()
+        return int(float(s.iloc[-1])) if len(s) else None
     except Exception:
         return None
 
@@ -399,7 +401,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
-            "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0}
+            "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0,
+            "recent": recent_bars}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, SCAN_BARS)

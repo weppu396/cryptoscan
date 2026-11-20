@@ -12,29 +12,47 @@ import smtplib
 from dataclasses import replace
 from email.mime.text import MIMEText
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 
 import auth
+import chart
 import learn
 import market
+import paper
+import sizer
 import smc
 import ui
-from config import CFG
+from config import AUTH_ENABLED, CFG
 
 st.set_page_config(page_title="CryptoScan", page_icon="◈", layout="wide",
                    initial_sidebar_state="expanded")
 ui.inject()
 
-USER = auth.gate()
+
+def _auth_on() -> bool:
+    """Secrets win over config, so login can be toggled from the Cloud UI."""
+    try:
+        if "AUTH_ENABLED" in st.secrets:
+            return str(st.secrets["AUTH_ENABLED"]).lower() in ("1", "true", "yes")
+    except Exception:
+        pass
+    return bool(AUTH_ENABLED)
+
+
+AUTH_ON = _auth_on()
+USER = auth.gate() if AUTH_ON else "local"
 
 from data import CANDIDATES, build_universe, load, probe_exchanges, resolve_exchange
 from core.indicators import compute_all
 from core.levels import build_zones
+from core.mtf import aligned, htf_for, structure_bias
 from core.regime import htf_bias
 from core.structure import build_structure, find_swings
+from core.volume import avwap_context, volume_profile
 from strategy.rating import rate
 from strategy.risk import filter_setups
 from strategy.setups import scan_bos_retest
@@ -88,7 +106,6 @@ def _ind(ind, *names):
 
 
 def _last(ind, *names, default=0.0) -> float:
-    """Last value of the first present column, else the default."""
     s = _ind(ind, *names)
     try:
         v = float(s.iloc[-1])
@@ -371,6 +388,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
+            "mtf_skip": 0, "vol_skip": 0,
             "relax": relax, "rr": min_rr, "stop": max_stop_atr,
             "recent": recent_bars}
 
@@ -407,22 +425,52 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 if _rank(s.meta["r"]["grade"]) < _rank(min_grade):
                     diag["below_grade"] += 1
                     continue
+
                 try:
                     s.meta["smc"] = smc.confluence(
                         df, s.direction, s.entry,
-                        _last(ind, "atr", "atr14", "atr_14", default=0.0))
+                        _last(ind, "atr", "atr14", "atr_14", default=0.0),
+                        idx=df.index.get_loc(s.ts))
                 except Exception:
                     s.meta["smc"] = {"score": 0, "flags": [], "warnings": []}
                 if need_smc and s.meta["smc"]["score"] < 2:
                     diag["smc_skip"] += 1
                     continue
+
+                htf_df, _ = _load(ex, used_sym, htf_for(cfg.scan.ltf), 400)
+                hb_s = structure_bias(htf_df, cfg) if htf_df is not None else "range"
+                lb_s = str(stt["trend"].iloc[-1])
+                ok_mtf, mtf_why = aligned(hb_s, lb_s, s.direction)
+                s.meta["mtf"] = {"ok": ok_mtf, "why": mtf_why, "htf": hb_s}
+
+                anchor = int(stt["prev_swing_low" if s.direction == "long"
+                                 else "prev_swing_high"].iloc[-1])
+                av = (avwap_context(df, s.direction,
+                                    _last(ind, "atr", default=0.0), anchor)
+                      if np.isfinite(anchor) else
+                      {"score": 0, "flags": [], "warnings": ["no anchor"], "dist": 0.0})
+                s.meta["avwap"] = av
+                vp = volume_profile(df)
+                s.meta["vp"] = vp
+                s.meta["in_value"] = bool(vp and vp["val"] <= s.entry <= vp["vah"])
+
+                if not ok_mtf:
+                    diag["mtf_skip"] += 1
+                    continue
+                if av["score"] < 40:
+                    diag["vol_skip"] += 1
+                    continue
+
                 found.append(s)
         except Exception:
             diag["err"] += 1
             continue
 
-    found.sort(key=lambda s: (-s.meta.get("smc", {}).get("score", 0),
-                              -s.meta["r"]["confidence"], -s.score))
+    found.sort(key=lambda s: -(s.meta["r"]["confidence"]
+                               + s.meta.get("smc", {}).get("score", 0) * 3
+                               + s.meta.get("avwap", {}).get("score", 0) * 0.4
+                               + (15 if s.meta.get("in_value") else 0)
+                               + s.meta.get("candle_q", 0) * 0.2))
     return found, diag
 
 
@@ -487,9 +535,9 @@ def cached_radar(exchange, preferred, proxy):
 with st.sidebar:
     st.markdown('<div class="auth-logo">◈</div>', unsafe_allow_html=True)
     st.markdown("**CryptoScan**")
-    st.caption(f"signed in as {USER}")
-    if st.button("Sign out", use_container_width=True,
-                 help="End this session and return to the login screen."):
+    st.caption(f"signed in as {USER}" if AUTH_ON else "local mode · login disabled")
+    if AUTH_ON and st.button("Sign out", use_container_width=True,
+                             help="End this session and return to the login screen."):
         auth.logout()
 
     MODE = st.radio("Desk", ["Spot", "Bot"], horizontal=True, index=0,
@@ -559,7 +607,7 @@ st.markdown(
     <h1>{'Spot accumulation desk' if MODE == 'Spot' else 'Bot swing desk'}</h1>
     <p>{'Long-only, daily structure, laddered entries into demand.' if MODE == 'Spot'
         else 'Long and short break-of-structure scanner with full playbook.'}
-    Signed in as <b>{USER}</b>.</p>
+    {f'Signed in as <b>{USER}</b>.' if AUTH_ON else 'Local mode.'}</p>
     </div>""",
     unsafe_allow_html=True,
 )
@@ -591,10 +639,11 @@ st.caption("Source: CoinGecko and alternative.me. Cached two minutes.")
 st.write("")
 
 if MODE == "Spot":
-    NAMES = ["Overview", "Accumulate", "SMC", "Radar", "Portfolio", "Learn", "Guide"]
+    NAMES = ["Overview", "Accumulate", "SMC", "Sizer", "Radar", "Portfolio",
+             "Learn", "Guide"]
 else:
-    NAMES = ["Overview", "Scan", "SMC", "Radar", "Portfolio", "Backtest",
-             "Macro", "Alerts", "Journal", "Learn", "Guide"]
+    NAMES = ["Overview", "Scan", "SMC", "Sizer", "Radar", "Portfolio", "Paper",
+             "Backtest", "Macro", "Alerts", "Journal", "Learn", "Guide"]
 T = dict(zip(NAMES, st.tabs(NAMES)))
 
 
@@ -746,15 +795,28 @@ if MODE == "Bot":
                        f"failed {diag['err']} · raw {diag['raw']} · "
                        f"kept {diag['kept']} · stale {diag['stale']} · "
                        f"graded {diag['graded']} · below grade "
-                       f"{diag['below_grade']} · smc rejected {diag['smc_skip']}")
+                       f"{diag['below_grade']} · smc {diag['smc_skip']} · "
+                       f"mtf {diag['mtf_skip']} · volume {diag['vol_skip']}")
 
         setups = st.session_state.get("setups", [])
         if not setups:
             st.info("No results yet.")
         else:
             rows = [s for s in setups
-                    if (not only_ok) or s.meta.get("status") in OK_STATUS][:10]
-            for s in rows:
+                    if (not only_ok) or s.meta.get("status") in OK_STATUS][:15]
+            st.dataframe(pd.DataFrame([{
+                "grade": s.meta["r"]["grade"], "score": s.meta["r"]["score"],
+                "symbol": s.symbol, "side": s.direction,
+                "candle": s.meta.get("candle") or "—",
+                "smc": s.meta.get("smc", {}).get("score", 0),
+                "avwap": round(s.meta.get("avwap", {}).get("dist", 0.0), 2),
+                "in value": "yes" if s.meta.get("in_value") else "no",
+                "status": s.meta.get("status"),
+                "entry": f"{s.entry:,.6g}", "stop": f"{s.stop:,.6g}",
+                "rr": round(s.rr, 2),
+            } for s in rows]), hide_index=True, use_container_width=True)
+
+            for s in rows[:10]:
                 r = _norm(s.meta.get("r"))
                 sm = s.meta.get("smc", {}) or {}
                 with st.expander(f"{r['grade']} · {s.symbol} · "
@@ -775,110 +837,119 @@ if MODE == "Bot":
                         st.write(f"- {p}")
                     for n in r["negatives"]:
                         st.write(f"- {n}")
-                    if st.button("Alert me", key=f"al{s.symbol}"):
+                    c1, c2 = st.columns(2)
+                    if c1.button("Alert me", key=f"al{s.symbol}"):
                         ok, msg = notify(
                             f"{r['grade']} {s.symbol} {s.direction} "
                             f"entry {s.entry:,.6g} stop {s.stop:,.6g} "
                             f"tp1 {s.tp1:,.6g}")
                         st.success(msg) if ok else st.error(msg)
+                    if c2.button("Log to paper", key=f"pp{s.symbol}"):
+                        paper.open_trade(s.symbol, s.direction, s.entry, s.stop,
+                                         s.tp1, s.tp2,
+                                         s.meta.get("qty", 0), equity,
+                                         " · ".join(sm.get("flags", [])[:3]))
+                        st.success("Paper trade opened.")
 
 
 # ---------------------------------------------------------------- smc
 with T["SMC"]:
-    ui.section("Smart money map", "Structure, zones, gaps, liquidity and range "
-                                  "position for one symbol.")
-    s1, s2 = st.columns([2, 1])
-    smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym",
-                            help="Pair to map.")
-    smc_tf = s2.selectbox("Timeframe", ["1h", "4h", "1d"], index=1,
-                          key="smc_tf", help="Chart resolution.")
-    side = st.radio("Side", ["long", "short"], horizontal=True,
-                    help="Which direction the playbook should assume.")
+    ui.section("Smart money map",
+               "Structure, zones, volume, the trade and its invalidation — on one chart.")
 
-    if st.button("Build map", type="primary", help="Draw and plan."):
+    s1, s2, s3 = st.columns([2, 1, 1])
+    smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym")
+    smc_tf = s2.selectbox("Entry timeframe", ["3m", "5m", "15m", "1h", "4h", "1d"],
+                          index=2, key="smc_tf",
+                          help="Lower = earlier entries, more noise.")
+    side = s3.radio("Side", ["long", "short"], horizontal=True)
+
+    if st.button("Build map", type="primary", help="Fetch, mark and plan."):
         try:
             cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
                             risk_pct, equity)
             ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
-            df, used = _load(ex, smc_sym, smc_tf, 400)
+            df, used = _load(ex, smc_sym, smc_tf, 500)
             if df is None:
                 st.warning(f"No data for {smc_sym} on {ex_name}.")
             else:
-                trend, tnotes = smc.trend_state(df)
-                pdv = smc.premium_discount(df)
-                gaps = smc.fair_value_gaps(df)
-                blocks = smc.order_blocks(df)
-                zones = smc.supply_demand(df)
-                sweeps = smc.liquidity_sweeps(df)
-                events = smc.structure_events(df)
-
-                k = st.columns(5)
-                ui.stat(k[0], "Structure", trend,
-                        "up" if trend == "up" else "dn" if trend == "down" else "warn")
-                ui.stat(k[1], "Range position", f"{pdv:.0f}%",
-                        "up" if pdv <= 35 else "dn" if pdv >= 65 else "")
-                ui.stat(k[2], "Gaps", str(len(gaps)))
-                ui.stat(k[3], "Zones", str(len(zones)))
-                ui.stat(k[4], "Sweeps", str(len(sweeps)))
-                st.caption(" · ".join(tnotes) or "no clear swing sequence")
-
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=df.index, open=df["open"], high=df["high"],
-                    low=df["low"], close=df["close"], name="price",
-                    increasing_line_color="#16c784",
-                    decreasing_line_color="#ea3943"))
-                for g in gaps:
-                    fig.add_shape(type="rect", x0=df.index[g["idx"]],
-                                  x1=df.index[-1], y0=g["bot"], y1=g["top"],
-                                  fillcolor=("rgba(22,199,132,.14)"
-                                             if g["dir"] == "bull"
-                                             else "rgba(234,57,67,.14)"),
-                                  line=dict(width=0))
-                for z in zones:
-                    fig.add_shape(type="rect", x0=df.index[z["idx"]],
-                                  x1=df.index[min(z["idx"] + 15, len(df) - 1)],
-                                  y0=z["bot"], y1=z["top"],
-                                  fillcolor=("rgba(20,184,166,.20)"
-                                             if z["dir"] == "demand"
-                                             else "rgba(240,185,11,.20)"),
-                                  line=dict(width=1, color="#14b8a6"))
-                for sw in sweeps:
-                    fig.add_trace(go.Scatter(
-                        x=[df.index[sw["idx"]]], y=[sw["level"]], mode="markers",
-                        marker=dict(size=10, symbol="x", color="#f0b90b"),
-                        showlegend=False))
-                for e in events[-6:]:
-                    fig.add_annotation(x=df.index[e["idx"]], y=e["level"],
-                                       text=e["kind"], showarrow=False,
-                                       font=dict(size=9, color="#e7eaf0"))
-                fig.update_layout(height=460, template="plotly_dark",
-                                  paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
-                                  margin=dict(l=6, r=6, t=6, b=6),
-                                  xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True)
+                htf_name = htf_for(smc_tf)
+                hdf, _ = _load(ex, smc_sym, htf_name, 400)
+                hb = structure_bias(hdf, cfg)
+                stt_tab = build_structure(df, cfg.structure)
+                lb = str(stt_tab["trend"].iloc[-1])
+                ok_mtf, mtf_why = aligned(hb, lb, side)
 
                 plan = smc.playbook(df, side, equity, risk_pct)
+                atr = plan["atr"]
+
+                anchor = int(stt_tab["prev_swing_low" if side == "long"
+                                     else "prev_swing_high"].iloc[-1])
+                av = (avwap_context(df, side, atr, anchor) if np.isfinite(anchor)
+                      else {"score": 0, "flags": [], "warnings": ["no anchor"],
+                            "dist": 0.0})
+                vp = volume_profile(df)
+                in_va = bool(vp and vp["val"] <= plan["entry"] <= vp["vah"])
+
+                k = st.columns(5)
+                ui.stat(k[0], "HTF structure", hb,
+                        "up" if hb == "up" else "dn" if hb == "down" else "warn")
+                ui.stat(k[1], "LTF structure", lb,
+                        "up" if lb == "up" else "dn" if lb == "down" else "warn")
+                ui.stat(k[2], "MTF", "aligned" if ok_mtf else "against",
+                        "up" if ok_mtf else "dn")
+                ui.stat(k[3], "AVWAP", f"{av['dist']:+.2f} ATR",
+                        "up" if av["score"] >= 40 else "dn")
+                ui.stat(k[4], "In value area", "yes" if in_va else "no",
+                        "up" if in_va else "warn")
+                st.caption(f"pair {smc_tf}/{htf_name} · {mtf_why}")
+
+                st.plotly_chart(chart.build(df, cfg, side, plan),
+                                use_container_width=True,
+                                config={"scrollZoom": True, "displaylogo": False})
+
+                with st.expander("How to read this chart", expanded=False):
+                    st.markdown(chart.legend_md())
+
                 st.divider()
-                ui.section(f"Playbook · {side}")
+                ui.section(f"Playbook · {side.upper()}")
                 render_plan(plan, used, ladder=(side == "long"))
+
+                st.divider()
+                ui.section("Order card", "Copy to the exchange. Reduce-only on exits.")
+                st.code(
+                    f"symbol      {used}\n"
+                    f"side        {'BUY / LONG' if side == 'long' else 'SELL / SHORT'}\n"
+                    f"type        LIMIT  (post-only)\n"
+                    f"qty         {plan['qty']:.8g}\n"
+                    f"entry       {plan['entry']:,.8g}\n"
+                    f"stop        {plan['sl']:,.8g}   reduce-only\n"
+                    f"tp1 50%     {plan['tp1']:,.8g}   reduce-only\n"
+                    f"tp2 50%     {plan['tp2']:,.8g}   reduce-only\n"
+                    f"risk        ${plan['size_usd']:.2f} ({risk_pct}% of {equity:,.0f})\n"
+                    f"R:R         {plan['rr1']:.2f} / {plan['rr2']:.2f}\n"
+                    f"invalidate  {'close below' if side == 'long' else 'close above'} "
+                    f"{plan['sl']:,.8g}\n"
+                    f"time stop   {CFG.risk.time_stop_bars} bars",
+                    language="text")
+
+                if st.button("Log to paper book", key="paper_log"):
+                    paper.open_trade(used, side, plan["entry"], plan["sl"],
+                                     plan["tp1"], plan["tp2"], plan["qty"], equity,
+                                     " | ".join(plan["confluence"]["flags"][:3]))
+                    st.success("Paper trade opened. Close it from the Paper tab.")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
+            st.exception(e)
 
     st.divider()
-    st.markdown("""
-**Reading order**
+    st.markdown(smc.READING_ORDER)
 
-1. Structure. Uptrend, downtrend or range, from HH/HL and LH/LL.
-2. Where price is. A demand or supply zone, or an order block.
-3. Liquidity. Equal highs and lows, and whether a sweep just took one.
-4. Imbalance. Unfilled gaps are magnets, not entries by themselves.
-5. Premium or discount. Longs belong low in the range, shorts high.
-6. Confirmation. A CHoCH or BOS after the level is tested.
 
-Green bands are bullish zones and gaps, yellow are bearish. Crosses mark swept
-extremes.
-""")
+# ---------------------------------------------------------------- sizer
+with T["Sizer"]:
+    ui.section("Position size", "Leverage changes margin, never risk.")
+    sizer.render(equity, risk_pct)
 
 
 # ---------------------------------------------------------------- radar
@@ -955,6 +1026,51 @@ with T["Portfolio"]:
                                    file_name="portfolio.json")
     except Exception as e:
         st.warning(f"Portfolio unavailable: {type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------- paper
+if MODE == "Bot":
+    with T["Paper"]:
+        ui.section("Paper book", "Forward test. Promote to live only on the gate.")
+        cleared, why = paper.gate()
+        (st.success if cleared else st.info)(f"Promotion gate: {why}")
+
+        s = paper.stats()
+        if s.get("n"):
+            m = st.columns(5)
+            ui.stat(m[0], "Closed", str(s["n"]))
+            ui.stat(m[1], "Win rate", f"{s['win_rate']}%")
+            ui.stat(m[2], "Profit factor", str(s.get("pf") or "—"),
+                    "up" if (s.get("pf") or 0) >= 1.3 else "dn")
+            ui.stat(m[3], "Expectancy", f"{s['expectancy']:+.2f}R",
+                    "up" if s["expectancy"] > 0 else "dn")
+            ui.stat(m[4], "Avg R", f"{s['avg_r']:+.2f}")
+
+        opens = paper.open_rows()
+        if not opens:
+            st.info("No open paper trades.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "id": r["id"], "symbol": r["symbol"], "side": r["dir"],
+                "entry": f"{r['entry']:,.6g}", "stop": f"{r['stop']:,.6g}",
+                "tp1": f"{r['tp1']:,.6g}", "tp2": f"{r['tp2']:,.6g}",
+                "qty": f"{r['qty']:.6g}", "opened": r["ts"][:16],
+            } for r in opens]), hide_index=True, use_container_width=True)
+
+            with st.form("close_paper"):
+                c1, c2, c3 = st.columns(3)
+                tid = c1.selectbox("Ticket", [r["id"] for r in opens])
+                px = c2.number_input("Exit price", 0.0, 1e9, 0.0, format="%.6f")
+                tag = c3.selectbox("Reason", ["tp1", "tp2", "stop", "time_stop",
+                                              "manual"])
+                if st.form_submit_button("Close") and px > 0:
+                    paper.close_trade(tid, px, tag)
+                    st.rerun()
+
+        if paper.book():
+            st.download_button("Export paper book",
+                               json.dumps(paper.book(), indent=2),
+                               file_name="paper.json")
 
 
 # ---------------------------------------------------------------- backtest
@@ -1060,7 +1176,7 @@ if MODE == "Bot":
 # ---------------------------------------------------------------- journal
 if MODE == "Bot":
     with T["Journal"]:
-        ui.section("Journal", "Log every trade.")
+        ui.section("Journal", "Log every trade, including the ones you skipped.")
         with st.form("journal", clear_on_submit=True):
             j1, j2, j3, j4 = st.columns(4)
             j_sym = j1.text_input("Symbol", help="Pair traded.")
@@ -1116,7 +1232,9 @@ the long and short scanner. They are separate because the jobs differ: spot
 wants time and patience, bot wants structure and a tight stop.
 
 ### Getting bot signals
-Grade C, freshness 12, Relax on, then Run scan. Read the diagnostic line.
+Grade C, freshness 12, Relax on, then Run scan. Read the diagnostic line. If
+`mtf` or `volume` rejections dominate, the market is out of phase — that is
+information, not a fault.
 
 ### Playbook verdict
 Every SMC plan scores seven checks: trend, structure break, zone, range
@@ -1129,11 +1247,17 @@ A+ 88+ · A 78+ · B 66+ · C 52+ · D below 52.
 ### Sizing
 qty = (equity × risk percent) ÷ (entry − stop)
 
+### Order placement
+Entry is a post-only limit. Stop is a stop-market, reduce-only, triggered on
+mark price. TP1 and TP2 are limits, reduce-only, 50% each. Round size DOWN to
+the step size. Set isolated margin and leverage low enough that liquidation
+sits beyond the stop — the Sizer tells you the max safe leverage.
+
 ### Rules
 - 0.5% risk per trade, 3% total heat.
 - Two correlated positions maximum per direction.
 - No entries within 24h of a major macro print.
-- Paper trade 30 signals before real money.
+- Paper trade 30 signals and clear the gate before real money.
 """)
 
 

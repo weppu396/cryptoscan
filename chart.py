@@ -27,6 +27,7 @@ from core.volume import anchored_vwap, volume_profile
 
 UP, DN, MUT, WARN, TEAL = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6"
 BG = "#0f1116"
+ANCHOR_BARS = 60
 
 
 def _future(df, bars: int = 14):
@@ -35,12 +36,24 @@ def _future(df, bars: int = 14):
     return df.index[-1] + (df.index[-1] - df.index[-2]) * bars
 
 
+def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
+    """Last confirmed opposite swing, bounded to `span` bars so the VWAP stays
+    relevant to the current leg instead of the start of history."""
+    col = "prev_swing_low" if long else "prev_swing_high"
+    try:
+        s = stt[col].tail(span).dropna()
+        return int(float(s.iloc[-1])) if len(s) else None
+    except Exception:
+        return None
+
+
 def build(df, cfg, direction: str, plan: dict | None = None,
           bars: int = 260) -> go.Figure:
     view = df.tail(bars)
     ind = compute_all(df, cfg)
-    stt = build_structure(df, cfg)
-    atr = float(ind["atr"].iloc[-1] or 0)
+    stt = build_structure(df, cfg.structure)
+    a = ind["atr"].iloc[-1]
+    atr = float(a) if a == a else 0.0
     long = direction == "long"
     want = "bull" if long else "bear"
     right = _future(view)
@@ -64,7 +77,8 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     fig.add_trace(go.Scatter(x=view.index, y=vma, name="vol avg",
                              line=dict(color=MUT, width=1), showlegend=False),
                   row=2, col=1)
-    thr = float(vma.iloc[-1] or 0) * 1.5
+    lv = vma.iloc[-1]
+    thr = float(lv) * 1.5 if lv == lv else 0.0
     if thr > 0:
         fig.add_hline(y=thr, row=2, col=1, line=dict(color=WARN, width=1, dash="dot"))
         fig.add_annotation(x=view.index[min(3, len(view) - 1)], y=thr, row=2, col=1,
@@ -139,9 +153,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
         pass
 
     try:
-        _v = float(stt["prev_swing_low" if long else "prev_swing_high"].iloc[-1])
-        anchor = int(_v) if np.isfinite(_v) else None
-
+        anchor = _anchor(stt, long)
         if anchor is not None:
             line = anchored_vwap(df, anchor).tail(bars)
             fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",

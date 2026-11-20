@@ -139,7 +139,9 @@ def build(df, cfg, direction: str, plan: dict | None = None,
         pass
 
     try:
-        anchor = int(stt["prev_swing_low" if long else "prev_swing_high"].iloc[-1])
+        _v = float(stt["prev_swing_low" if long else "prev_swing_high"].iloc[-1])
+        anchor = int(_v) if np.isfinite(_v) else None
+
         if np.isfinite(anchor):
             line = anchored_vwap(df, anchor).tail(bars)
             fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",

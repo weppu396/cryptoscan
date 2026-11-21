@@ -18,6 +18,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+import analysis_page
 import auth
 import board
 import chart
@@ -68,14 +69,11 @@ OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
 HAS_FRAGMENT = hasattr(st, "fragment")
 
-# LTF -> HTF ratio, used to size the history request so the HTF has enough bars
-# for a 200 EMA. Roughly 1:4 to 1:6, per the multi-timeframe rule.
 RATIO = {"3m": 5, "5m": 6, "15m": 4, "1h": 4, "4h": 6, "1d": 1, "1w": 1}
 HTF_BARS = 260
 
 
 def _scan_bars(ltf: str) -> int:
-    """Enough LTF bars to give the HTF HTF_BARS of history, floor 1200."""
     return max(1200, HTF_BARS * RATIO.get(ltf, 6))
 
 
@@ -86,8 +84,9 @@ MIN_PERPS = 20
 MAJORS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA", "AVAX", "LINK",
           "TON", "SUI", "DOT", "NEAR", "APT", "ARB", "OP", "INJ", "SEI", "TIA"]
 
-DEFAULT_TG_TOKEN = "9144109318:AAEl1Mj2_XBqOJIImkRFH_2HAumleexDcHY"
-DEFAULT_TG_CHAT = "6193241326"
+# No literal. Secrets or env only — the old token is in public git history.
+DEFAULT_TG_TOKEN = ""
+DEFAULT_TG_CHAT = ""
 CREDS_FILE = pathlib.Path("./state/alerts.json")
 
 
@@ -128,8 +127,6 @@ def _rank(g) -> int:
 
 
 def _anchor(stt, direction: str):
-    """Last confirmed opposite swing within 60 bars, so AVWAP tracks the current
-    leg instead of the start of history."""
     col = "prev_swing_low" if direction == "long" else "prev_swing_high"
     try:
         s = stt[col].tail(60).dropna()
@@ -176,8 +173,6 @@ def _norm(rt) -> dict:
 
 
 def _resolve(cfg, preferred, proxy):
-    """An explicit venue choice is honoured, not overridden. Falls back only if
-    it cannot answer at all."""
     sig = inspect.signature(resolve_exchange).parameters
 
     def attempt(name):
@@ -271,8 +266,6 @@ def _load(ex, sym: str, tf: str, limit: int, min_bars: int = MIN_BARS):
 
 
 def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity):
-    """htf is PAIRED to ltf. Leaving it at the default is what blanked the bias
-    on every low timeframe."""
     return replace(
         CFG,
         scan=replace(CFG.scan, exchange=exchange, top_n_symbols=top,
@@ -657,11 +650,11 @@ st.write("")
 
 if MODE == "Spot":
     NAMES = ["Overview", "Accumulate", "Setups", "SMC", "Sizer", "Radar",
-             "Portfolio", "SOP", "Learn", "Guide"]
+             "Portfolio", "SOP", "Analysis", "Learn", "Guide"]
 else:
     NAMES = ["Overview", "Setups", "Scan", "SMC", "Sizer", "Radar", "Portfolio",
-             "Paper", "Backtest", "Macro", "Alerts", "Journal", "SOP", "Learn",
-             "Guide"]
+             "Paper", "Backtest", "Macro", "Alerts", "Journal", "SOP", "Analysis",
+             "Learn", "Guide"]
 T = dict(zip(NAMES, st.tabs(NAMES)))
 
 
@@ -1068,6 +1061,12 @@ with T["SOP"]:
     sop.render()
 
 
+with T["Analysis"]:
+    analysis_page.render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct,
+                         equity, proxy.strip() or None, build_cfg, _resolve,
+                         _load, CFG, notify)
+
+
 with T["Learn"]:
     ui.section("Learn", "Work the stages in order.")
     for stage, title, status, items in learn.STAGES:
@@ -1096,12 +1095,11 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 
 ### Timeframes
 The bias timeframe is always paired to the entry timeframe, roughly 1:4. The
-sidebar shows the pair and the bar count. A 1h entry reads bias from 4h; a 4h
-entry reads from 1d.
+sidebar shows the pair and the bar count.
 
-### Setups vs Scan
-Setups renders a chart per result and is what you work from. Scan is the flat
-list, for quick re-checks.
+### Setups vs Analysis
+Setups is the scanner board. Analysis is the point-in-time workflow: dual-layer
+structure, readiness, next action, three chart modes.
 
 ### Gates
 `Require MTF` and `Require AVWAP` are strict — turn them on once the board gives

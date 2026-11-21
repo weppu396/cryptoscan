@@ -1,20 +1,62 @@
 """core/alerts2.py - eligibility separated from delivery.
 
-PENDING is written before the HTTP call. SENT only after Telegram accepts.
-A failure can never suppress a later attempt.
+PENDING is written before the HTTP call. SENT only after the poster accepts.
+A failure can never suppress a later attempt. Config reads are defensive, and
+the poster may return (ok, retry) or a bare bool, with retry as int/float/str.
 """
-import json
 import time
 
 import store
-from config import CFG
 from core.models import Delivery, Stage
 
-COOLDOWN = {
-    Stage.APPROACHING: CFG.alert.cooldown_approaching,
-    Stage.IN_ZONE: CFG.alert.cooldown_in_zone,
-    Stage.READY: CFG.alert.cooldown_ready,
-}
+COOLDOWN_DEFAULT = {"APPROACHING": 900, "IN_ZONE": 600, "READY": 300}
+BACKOFF_DEFAULT = (30, 60, 120, 300, 600)
+_ATTR = {"APPROACHING": "cooldown_approaching",
+         "IN_ZONE": "cooldown_in_zone",
+         "READY": "cooldown_ready"}
+
+
+def _alert_cfg():
+    try:
+        from config import CFG
+        return getattr(CFG, "alert", None)
+    except Exception:
+        return None
+
+
+def _cooldown(stage: Stage) -> int:
+    c = _alert_cfg()
+    attr = _ATTR.get(stage.value)
+    fallback = COOLDOWN_DEFAULT.get(stage.value, 1800)
+    if c is not None and attr:
+        return int(getattr(c, attr, fallback))
+    return int(fallback)
+
+
+def _max_attempts() -> int:
+    c = _alert_cfg()
+    return int(getattr(c, "max_attempts", 5)) if c is not None else 5
+
+
+def _backoff(attempts: int) -> float:
+    c = _alert_cfg()
+    seq = getattr(c, "backoff", BACKOFF_DEFAULT) if c is not None else BACKOFF_DEFAULT
+    seq = tuple(seq) or BACKOFF_DEFAULT
+    return float(seq[min(max(attempts - 1, 0), len(seq) - 1)])
+
+
+def _retry_after(v):
+    """Posters vary. Normalise to float seconds or None."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _row(key: str):
@@ -33,24 +75,19 @@ def _set(key: str, setup_id: str, stage: Stage, gen: int, status: Delivery,
 
 def eligible(setup_id: str, stage: Stage, generation: int = 0,
              now: float | None = None) -> bool:
-    """True if this (setup, stage, generation) may be attempted now."""
     now = now or time.time()
-    key = f"{setup_id}:{stage.value}:{generation}"
-    row = _row(key)
+    row = _row(f"{setup_id}:{stage.value}:{generation}")
     if row is None:
         return True
     status, attempts, next_at = row
-    if status == Delivery.SENT.value:
+    if status in (Delivery.SENT.value, Delivery.DEAD.value):
         return False
-    if status == Delivery.DEAD.value:
-        return False
-    if attempts >= CFG.alert.max_attempts:
+    if attempts >= _max_attempts():
         return False
     return now >= (next_at or 0)
 
 
 def claim(setup_id: str, stage: Stage, generation: int = 0) -> str:
-    """Write PENDING before sending. Returns the dedup key."""
     key = f"{setup_id}:{stage.value}:{generation}"
     row = _row(key)
     attempts = (row[1] if row else 0) + 1
@@ -63,20 +100,21 @@ def sent(key: str, setup_id: str, stage: Stage, gen: int):
 
 
 def failed(key: str, setup_id: str, stage: Stage, gen: int,
-           retry_after: float | None = None):
+           retry_after=None):
     row = _row(key)
     attempts = row[1] if row else 1
-    if attempts >= CFG.alert.max_attempts:
+    if attempts >= _max_attempts():
         _set(key, setup_id, stage, gen, Delivery.DEAD, attempts, 0.0)
         return
-    delay = retry_after if retry_after is not None else \
-        CFG.alert.backoff[min(attempts - 1, len(CFG.alert.backoff) - 1)]
+    delay = _retry_after(retry_after)
+    if delay is None:
+        delay = _backoff(attempts)
     _set(key, setup_id, stage, gen, Delivery.RETRY, attempts, time.time() + delay)
 
 
 def rearm(setup_id: str, stage: Stage, generation: int):
-    key = f"{setup_id}:{stage.value}:{generation}"
-    _set(key, setup_id, stage, generation, Delivery.ARMED, 0, 0.0)
+    _set(f"{setup_id}:{stage.value}:{generation}", setup_id, stage, generation,
+         Delivery.ARMED, 0, 0.0)
 
 
 def kill(setup_id: str, stages: tuple = ()):
@@ -100,22 +138,30 @@ def replay_stale(age: float = 120.0):
 
 def send(setup_id: str, stage: Stage, text: str, generation: int = 0,
          poster=None) -> str:
-    """poster(text) -> (ok, retry_after|None). Returns final status string."""
+    """poster(text) -> (ok, retry_after) or bool. Returns final status."""
     if not eligible(setup_id, stage, generation):
         return "skipped"
     key = claim(setup_id, stage, generation)
     if poster is None:
-        from app_alerts import post
-        poster = post
+        try:
+            from app_alerts import post as poster
+        except Exception:
+            def poster(_t):
+                return False, None
     try:
-        ok, retry_after = poster(text)
+        result = poster(text)
     except Exception:
-        ok, retry_after = False, None
+        result = (False, None)
+    if isinstance(result, tuple):
+        ok, retry = (result + (None,))[:2]
+    else:
+        ok, retry = result, None
     if ok:
         sent(key, setup_id, stage, generation)
         return Delivery.SENT.value
-    failed(key, setup_id, stage, generation, retry_after)
-    return _row(key)[0]
+    failed(key, setup_id, stage, generation, retry)
+    row = _row(key)
+    return row[0] if row else Delivery.FAILED.value
 
 
 def message(stage: Stage, symbol: str, direction: str, tf: str, setup_id: str,

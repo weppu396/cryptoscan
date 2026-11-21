@@ -1,19 +1,22 @@
-"""analysis_page.py - the new analysis workflow. Spot and Bot tabs untouched."""
+"""analysis_page.py - the analysis workflow. Spot and Bot tabs untouched."""
 import pandas as pd
 import streamlit as st
 
 import chart2
 import core.lifecycle as lc
 import core.structure2 as s2
+import smc
 import ui
-from core.models import Decision, Layer, ReadinessInput, Stage, new_id
 from core import alerts2, nextaction, pit, readiness
 from core.candles import latest as latest_candle
 from core.indicators import compute_all
+from core.models import Decision, Layer, ReadinessInput, Stage, new_id
 from core.volume import avwap_context, volume_profile
 
-ROLES = {"4h": "bias", "1h": "setup", "15m": "entry", "5m": "refine"}
 MODE_LABEL = {"structure": "Structure", "analysis": "Analysis", "execution": "Execution"}
+TF_BIAS = {"4h": "1d", "1h": "4h", "15m": "1h"}
+STAGE_OF = {Decision.WAIT: Stage.NEW_SETUP, Decision.PREPARE: Stage.APPROACHING,
+            Decision.READY: Stage.READY, Decision.TRIGGERED: Stage.TRIGGERED}
 
 
 def _bias(htf, cfg) -> str:
@@ -46,7 +49,8 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
     ui.section("Analysis", "Point-in-time structure, readiness and next action.")
     c1, c2, c3 = st.columns([2, 1, 1])
     sym = c1.text_input("Symbol", "BTC/USDT:USDT", key="an_sym")
-    setup_tf = c2.selectbox("Setup timeframe", ["1h", "4h", "15m"], index=0, key="an_tf")
+    setup_tf = c2.selectbox("Setup timeframe", ["1h", "4h", "15m"], index=0,
+                            key="an_tf")
     side = c3.radio("Direction", ["short", "long"], horizontal=True, key="an_side")
 
     o1, o2, o3 = st.columns(3)
@@ -64,6 +68,13 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         st.caption("Press Analyse.")
         return
 
+    def _poster(text):
+        try:
+            ok, _msg = notify_fn(text)
+        except Exception:
+            return False, None
+        return bool(ok), None
+
     try:
         cfg = build_cfg(exch, top, min_vol, setup_tf, min_rr, max_stop_atr,
                         risk_pct, equity)
@@ -73,9 +84,10 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
             st.warning(f"No data for {sym} on {venue}.")
             return
 
-        bias_tf = "4h" if setup_tf != "4h" else "1d"
+        bias_tf = TF_BIAS.get(setup_tf, "4h")
         htf, _ = load(ex, used, bias_tf, 300, 60)
-        bias = pit.bias_at(htf, df.index[-1], lambda f: _bias(f, cfg)) if htf is not None else "unclear"
+        bias = (pit.bias_at(htf, df.index[-1], lambda f: _bias(f, cfg))
+                if htf is not None else "unclear")
 
         frame = s2.run(df, used, setup_tf, cfg)
         t = len(df) - 1
@@ -89,31 +101,41 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         want = "up" if side == "long" else "down"
         bias_ok = bias == want
         bias_reason = f"HTF {bias} vs {side}"
-        struct_ok = frame.last(Layer.INTERNAL, "bull" if side == "long" else "bear", t) is not None
+        struct = frame.last(Layer.INTERNAL, "bull" if side == "long" else "bear", t)
+        struct_ok = struct is not None
 
-        cname, cq = latest_candle(df, atr, side)
+        _, cname, cq = latest_candle(df, atr, side)
         candle_ok = cq >= 60
 
-        zones = [z for z in __import__("smc").supply_demand(df)
+        zones = [z for z in smc.supply_demand(df)
                  if z["dir"] == ("demand" if side == "long" else "supply")]
+        zones.sort(key=lambda z: -z["idx"])
         zone = (zones[0]["bot"], zones[0]["top"]) if zones else None
         if zone:
-            dist = (min(abs(price - zone[0]), abs(price - zone[1]))) / atr
+            dist = min(abs(price - zone[0]), abs(price - zone[1])) / atr
             in_zone = zone[0] <= price <= zone[1]
         else:
             dist, in_zone = 99.0, False
 
         anchor = None
         pool = [s for s in frame.swings if s.layer == Layer.EXTERNAL
-                and s.kind == ("L" if side == "long" else "H") and s.confirmed_at <= t]
+                and s.kind == ("L" if side == "long" else "H")
+                and s.confirmed_at <= t]
         if pool:
             anchor = pool[-1].idx
-        av = avwap_context(df, side, atr, anchor) if anchor is not None else \
-            {"score": 0, "dist": 0.0}
+        av = (avwap_context(df, side, atr, anchor) if anchor is not None
+              else {"score": 0, "dist": 0.0})
         vp = volume_profile(df)
         in_va = bool(vp and vp["val"] <= price <= vp["vah"])
 
-        rr = 3.0
+        if zone:
+            entry = zone[1] if side == "long" else zone[0]
+            inval = (zone[0] - 0.3 * atr) if side == "long" else (zone[1] + 0.3 * atr)
+        else:
+            entry = price
+            inval = price - 1.5 * atr if side == "long" else price + 1.5 * atr
+        risk = abs(entry - inval) or atr
+        rr = (3.0 * atr) / risk if risk else 0.0
         risk_ok = rr >= cfg.risk.min_rr
 
         optional = {}
@@ -129,23 +151,24 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
                             optional)
         decision, missing = readiness.evaluate(ri)
 
-        inval = zone[0] - 0.3 * atr if side == "long" else (zone[1] + 0.3 * atr if zone else None)
-        entry = zone[1] if side == "long" and zone else (zone[0] if zone else price)
         nav = nextaction.build(decision, used, side, price,
-                               frame.last(Layer.INTERNAL, "bull" if side == "long" else "bear", t).level
-                               if struct_ok else None, zone, missing, setup_tf, inval)
+                               struct.level if struct_ok else None, zone,
+                               missing, setup_tf, inval)
 
-        k = st.columns(4)
-        ui.stat(k[0], "HTF bias", bias, "up" if bias == "up" else "dn" if bias == "down" else "warn")
+        k = st.columns(5)
+        ui.stat(k[0], "HTF bias", bias,
+                "up" if bias == "up" else "dn" if bias == "down" else "warn")
         ui.stat(k[1], "External", ext + (" · ranging" if ranging else ""),
                 "up" if ext == "up" else "dn" if ext == "down" else "warn")
-        ui.stat(k[2], "Internal", inn, "up" if inn == "up" else "dn" if inn == "down" else "warn")
+        ui.stat(k[2], "Internal", inn,
+                "up" if inn == "up" else "dn" if inn == "down" else "warn")
         ui.stat(k[3], "Candle", f"{cname or '—'} {cq}", "up" if candle_ok else "warn")
+        ui.stat(k[4], "R:R", f"{rr:.2f}", "up" if risk_ok else "dn")
 
         _panel(nav)
 
         st.plotly_chart(chart2.build(df, frame, side,
-                                     {"entry": entry, "stop": inval or price,
+                                     {"entry": entry, "stop": inval,
                                       "tp1": entry + (3 if side == "long" else -3) * atr,
                                       "tp2": entry + (5 if side == "long" else -5) * atr},
                                      mode=mode),
@@ -153,18 +176,16 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
 
         st.divider()
         sid = st.session_state.setdefault("an_sid", new_id())
-        st.code(f"setup {sid}\nentry {entry:,.6g}\nstop {inval if inval else 0:,.6g}\n"
+        st.code(f"setup {sid}\nentry {entry:,.6g}\nstop {inval:,.6g}\n"
                 f"invalidate {'close below' if side == 'long' else 'close above'} "
-                f"{inval if inval else 0:,.6g}", language="text")
+                f"{inval:,.6g}", language="text")
 
         a1, a2, a3 = st.columns(3)
         if a1.button("Send stage alert"):
-            stg = {Decision.WAIT: Stage.NEW_SETUP, Decision.PREPARE: Stage.APPROACHING,
-                   Decision.READY: Stage.READY,
-                   Decision.TRIGGERED: Stage.TRIGGERED}.get(decision, Stage.NEW_SETUP)
+            stg = STAGE_OF.get(decision, Stage.NEW_SETUP)
             txt = alerts2.message(stg, used, side, setup_tf, sid, "—", zone, price,
                                   bias, missing, inval, nav["action"])
-            st.caption(alerts2.send(sid, stg, txt, 0, notify_fn))
+            st.caption(alerts2.send(sid, stg, txt, 0, _poster))
         if a2.button("Log lifecycle"):
             lc.transition(sid, "setup", "FORMING", str(df.index[-1]), price, "created")
             if decision in (Decision.READY, Decision.TRIGGERED):

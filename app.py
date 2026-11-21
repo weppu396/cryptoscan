@@ -18,7 +18,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-import analysis_page
 import auth
 import board
 import chart
@@ -30,6 +29,12 @@ import smc
 import sop
 import ui
 from config import AUTH_ENABLED, CFG
+
+try:
+    import analysis_page
+    ANALYSIS_OK, ANALYSIS_ERR = True, ""
+except Exception as _e:
+    ANALYSIS_OK, ANALYSIS_ERR = False, f"{type(_e).__name__}: {_e}"
 
 st.set_page_config(page_title="CryptoScan", page_icon="◈", layout="wide",
                    initial_sidebar_state="expanded")
@@ -1062,9 +1067,14 @@ with T["SOP"]:
 
 
 with T["Analysis"]:
-    analysis_page.render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct,
-                         equity, proxy.strip() or None, build_cfg, _resolve,
-                         _load, CFG, notify)
+    if not ANALYSIS_OK:
+        st.error("Analysis module failed to load. Spot and Bot are unaffected.")
+        st.code(ANALYSIS_ERR, language="text")
+        st.caption("Run `python check_install.py` locally to find the broken module.")
+    else:
+        analysis_page.render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct,
+                             equity, proxy.strip() or None, build_cfg, _resolve,
+                             _load, CFG, notify)
 
 
 with T["Learn"]:

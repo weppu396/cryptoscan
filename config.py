@@ -2,7 +2,6 @@ from dataclasses import dataclass, asdict
 import hashlib
 import json
 
-# Flip to True in Streamlit Cloud secrets to restore the login wall.
 AUTH_ENABLED = False
 
 
@@ -33,6 +32,30 @@ class Structure:
     zone_lookback: int = 400
     max_wait_bars: int = 20
     require_rejection_candle: bool = True
+
+
+@dataclass(frozen=True)
+class StructCfg:
+    """External/internal structure engine. Engineering defaults, not optimised."""
+    ext_left: int = 5
+    ext_right: int = 5
+    int_left: int = 2
+    int_right: int = 2
+    eq_tol_atr: float = 0.25
+    invalidate_bars: int = 5
+    close_based: bool = True
+
+
+@dataclass(frozen=True)
+class AlertCfg:
+    poll_seconds: int = 60
+    approach_atr: float = 1.0
+    cooldown_approaching: int = 900
+    cooldown_in_zone: int = 600
+    cooldown_ready: int = 300
+    cooldown_default: int = 1800
+    max_attempts: int = 5
+    backoff: tuple = (30, 60, 120, 300, 600)
 
 
 @dataclass(frozen=True)
@@ -72,6 +95,8 @@ class Scan:
 class Config:
     risk: Risk = Risk()
     structure: Structure = Structure()
+    struct: StructCfg = StructCfg()
+    alert: AlertCfg = AlertCfg()
     regime: Regime = Regime()
     costs: Costs = Costs()
     scan: Scan = Scan()

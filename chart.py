@@ -1,27 +1,14 @@
 """chart.py - annotated decision chart.
 
-Every mark is drawn from the engine's own state, never hand-placed:
+Layout contract: one row. Candles own 0-82% of the width on a datetime axis.
+The volume profile owns 84.5-100% on its own numeric axis, so it can never
+distort candle time, candle width or price scale. Traces reference the gutter
+as 'x2'; update_layout names it 'xaxis2'.
 
-  swing high/low   find_swings           where structure pivots
-  BOS / CHoCH      build_structure       where structure broke, and which way
-  zone rects       smc.supply_demand     where the order imbalance sits
-  gap rects        smc.fair_value_gaps   unfilled imbalance, a magnet
-  sweep crosses    smc.liquidity_sweeps  where stops were harvested
-  AVWAP line       volume.anchored_vwap  fair value of the current leg
-  POC / VAH / VAL  volume.profile_histogram  where volume actually transacted
-  volume bars      raw volume            conviction behind each bar
-  entry/stop/TP    smc.playbook          the trade, with risk and reward shaded
+Structure is drawn as short horizontal markers at the broken price, not
+full-height verticals. 30m majors are blue and labelled, 3m minors grey.
 
-Axis map, and why it matters:
-  x    price row time axis
-  x2   volume row time axis, created by make_subplots(shared_xaxes=True) and
-       therefore carrying matches="x" — it MUST keep x's domain
-  x3   the profile gutter, resolved at runtime. Never reuse x2.
-
-Two different names for the same axis: traces take a reference ("x3"),
-update_layout takes a layout property ("xaxis3"). _gutter() returns both.
-
-Green = reward, red = risk. Read-only: nothing here changes the plan.
+Read-only: nothing here changes the plan.
 """
 import numpy as np
 import pandas as pd
@@ -39,28 +26,35 @@ from core.volume import anchored_vwap, profile_histogram
 UP, DN, MUT, WARN, TEAL = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6"
 BG = "#0f1116"
 ANCHOR_BARS = 60
+DEFAULT_BARS = 110
+MARK_BARS = 6
 
-MAJOR_LINE = "rgba(96,152,255,0.30)"
-MINOR_LINE = "rgba(140,148,160,0.16)"
-MAJOR_TEXT = "rgba(96,152,255,0.75)"
+MAJOR_LINE = "rgba(96,152,255,0.60)"
+MINOR_LINE = "rgba(140,148,160,0.32)"
+MAJOR_TEXT = "rgba(96,152,255,0.90)"
 ZONE_FILL = {"long": "rgba(20,184,166,0.085)", "short": "rgba(240,185,11,0.085)"}
 ZONE_EDGE = {"long": "rgba(20,184,166,0.30)", "short": "rgba(240,185,11,0.30)"}
 FVG_FILL = {"long": "rgba(22,199,132,0.055)", "short": "rgba(234,57,67,0.055)"}
-VP_HTF = "rgba(96,152,255,0.17)"
-VP_LTF = "rgba(20,184,166,0.12)"
-PROFILE_DOMAIN = [0.0, 0.20]
-PRICE_DOMAIN = [0.235, 1.0]
+VP_HTF = "rgba(96,152,255,0.20)"
+VP_LTF = "rgba(20,184,166,0.14)"
+
+PRICE_DOMAIN = [0.0, 0.82]
+PROFILE_DOMAIN = [0.845, 1.0]
 
 
-def _future(df, bars: int = 14):
+def _future(df, bars: int = 6):
     if len(df) < 2:
         return df.index[-1]
     return df.index[-1] + (df.index[-1] - df.index[-2]) * bars
 
 
+def _step(df) -> pd.Timedelta:
+    if len(df) < 2:
+        return pd.Timedelta(0)
+    return df.index[-1] - df.index[-2]
+
+
 def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
-    """Last confirmed opposite swing, bounded to `span` bars so the VWAP stays
-    relevant to the current leg instead of the start of history."""
     col = "prev_swing_low" if long else "prev_swing_high"
     try:
         s = stt[col].tail(span).dropna()
@@ -70,11 +64,7 @@ def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
 
 
 def _gutter(fig) -> tuple[str, str]:
-    """(trace reference, layout property) for a free x axis.
-
-    make_subplots already owns 'x'/'x2' and 'xaxis'/'xaxis2', so the profile
-    must take neither. Traces use the short form, update_layout the long one.
-    """
+    """(trace reference, layout property) for a free numeric x axis."""
     used = {k for k in fig.layout.to_plotly_json() if k.startswith("xaxis")}
     i = 2
     while f"xaxis{i}" in used:
@@ -84,8 +74,6 @@ def _gutter(fig) -> tuple[str, str]:
 
 
 def _draw_profile(fig, df, bars: int, color: str, axis: str) -> None:
-    """Horizontal volume profile in the left gutter, on its own axis.
-    Estimate, not tick data."""
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
     if not vp or not len(vp["centers"]):
         return
@@ -101,37 +89,43 @@ def _draw_profile(fig, df, bars: int, color: str, axis: str) -> None:
                                  (vp["vah"], MUT, "VAH", "dot"),
                                  (vp["val"], MUT, "VAL", "dot")):
         fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=1,
-                      y0=lvl, y1=lvl,
-                      line=dict(color=tone, width=1, dash=dash))
-        fig.add_annotation(xref="paper", yref="y", x=PRICE_DOMAIN[0], y=lvl,
-                           text=tag, showarrow=False, xanchor="left",
-                           font=dict(size=7, color=tone), opacity=0.75)
+                      y0=lvl, y1=lvl, line=dict(color=tone, width=1, dash=dash))
+        fig.add_annotation(xref="paper", yref="y", x=PRICE_DOMAIN[1], y=lvl,
+                           text=tag, showarrow=False, xanchor="right",
+                           font=dict(size=7, color=tone), opacity=0.8)
 
     for lvl in vp["hvn"][:2]:
         fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.45,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.30)", width=1))
+                      line=dict(color="rgba(150,150,160,0.32)", width=1))
     for lvl in vp["lvn"][:2]:
         fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.22,
                       y0=lvl, y1=lvl,
                       line=dict(color="rgba(150,150,160,0.18)", width=1))
 
 
-def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
-          chart_tf: str | None = None, analysis_df=None,
-          htf_df=None) -> go.Figure:
-    """`df` is what gets drawn. `analysis_df` is what the engine read — the
-    plan passed in was built from it. Changing `chart_tf` therefore cannot
-    change the trade."""
+def _mark(fig, ts, level, step, color, width, label=None, yshift=0):
+    fig.add_shape(type="line", row=1, col=1, x0=ts, x1=ts + step * MARK_BARS,
+                  y0=level, y1=level, line=dict(color=color, width=width))
+    if label:
+        fig.add_annotation(x=ts, y=level, row=1, col=1, text=label,
+                           showarrow=False, xanchor="left", yshift=yshift,
+                           font=dict(size=8, color=color))
+
+
+def build(df, cfg, direction: str, plan: dict | None = None,
+          bars: int = DEFAULT_BARS, chart_tf: str | None = None,
+          analysis_df=None, htf_df=None) -> go.Figure:
     adf = analysis_df if analysis_df is not None else df
     view = df.tail(bars)
+    step = _step(view)
     ind = compute_all(adf, cfg)
     stt = build_structure(adf, cfg.structure)
     a = ind["atr"].iloc[-1]
     atr = float(a) if a == a else 0.0
     long = direction == "long"
     want = "bull" if long else "bear"
-    right = _future(view)
+    right = _future(view, 6)
     last_x = view.index[-1]
 
     if htf_df is None:
@@ -140,70 +134,46 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
         except Exception:
             htf_df = None
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        row_heights=[0.78, 0.22], vertical_spacing=0.03)
+    fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
 
     fig.add_trace(go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"],
         close=view["close"], name="price",
-        increasing_line_color=UP, decreasing_line_color=DN,
-        increasing_fillcolor=UP, decreasing_fillcolor=DN,
+        increasing_line_color=UP, increasing_line_width=1.2,
+        increasing_fillcolor=UP,
+        decreasing_line_color=DN, decreasing_line_width=1.2,
+        decreasing_fillcolor=DN, whiskerwidth=0.6,
         showlegend=False), row=1, col=1)
-
-    cols = [UP if c >= o else DN for o, c in zip(view["open"], view["close"])]
-    fig.add_trace(go.Bar(x=view.index, y=view["volume"], marker_color=cols,
-                         marker_line_width=0, opacity=.65, name="volume",
-                         showlegend=False), row=2, col=1)
-    vma = view["volume"].rolling(20).mean()
-    fig.add_trace(go.Scatter(x=view.index, y=vma, name="vol avg",
-                             line=dict(color=MUT, width=1), showlegend=False),
-                  row=2, col=1)
-    lv = vma.iloc[-1]
-    thr = float(lv) * 1.5 if lv == lv else 0.0
-    if thr > 0:
-        fig.add_hline(y=thr, row=2, col=1, line=dict(color=WARN, width=1, dash="dot"))
-        fig.add_annotation(x=view.index[min(3, len(view) - 1)], y=thr, row=2, col=1,
-                           yshift=9, text="1.5x = conviction", showarrow=False,
-                           font=dict(size=9, color=WARN))
 
     try:
         sw = find_swings(adf, cfg.structure.swing_left, cfg.structure.swing_right)
-        start = adf.index[max(0, len(adf) - bars)] if len(adf) > bars else adf.index[0]
+        start = view.index[0]
         for kind, sym in (("H", "triangle-down"), ("L", "triangle-up")):
             pts = [s for s in sw if s["type"] == kind and adf.index[s["idx"]] >= start]
             if pts:
                 fig.add_trace(go.Scatter(
                     x=[adf.index[s["idx"]] for s in pts],
                     y=[s["price"] for s in pts], mode="markers",
-                    marker=dict(symbol=sym, size=7, color=MUT, opacity=.55),
+                    marker=dict(symbol=sym, size=6, color=MUT, opacity=.5),
                     name="swing", showlegend=False), row=1, col=1)
     except Exception:
         pass
 
-    # structure: two 30m majors labelled, three 3m minors as bare lines
     try:
-        gap = atr * 0.5
-        majors, minors = marks(adf, cfg, htf_df, gap)
+        majors, minors = marks(adf, cfg, htf_df, atr * 0.5)
         for m in minors:
-            fig.add_vline(x=m["ts"], row=1, col=1,
-                          line=dict(color=MINOR_LINE, width=1, dash="dot"))
+            _mark(fig, m["ts"], m["level"], step, MINOR_LINE, 1)
         for m in majors:
-            fig.add_vline(x=m["ts"], row=1, col=1,
-                          line=dict(color=MAJOR_LINE, width=1, dash="dot"))
-            fig.add_annotation(x=m["ts"], y=m["level"], row=1, col=1,
-                               text=m["kind"], showarrow=False, xanchor="right",
-                               yshift=15 if m["dir"] == "bull" else -15,
-                               font=dict(size=8, color=MAJOR_TEXT))
+            side = "Bullish" if m["dir"] == "bull" else "Bearish"
+            _mark(fig, m["ts"], m["level"], step, MAJOR_LINE, 1.6,
+                  f"{side} {m['kind']}", 9 if m["dir"] == "bull" else -9)
     except Exception:
         pass
 
     try:
-        for z in live_zones(smc.supply_demand(adf),
-                            adf, direction, keep=2):
-            x0 = adf.index[z["idx"]]
-            if x0 < start:
-                x0 = start
+        for z in live_zones(smc.supply_demand(adf), adf, direction, keep=2):
+            x0 = max(adf.index[z["idx"]], view.index[0])
             fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=right,
                           y0=z["bot"], y1=z["top"],
                           fillcolor=ZONE_FILL[direction],
@@ -214,7 +184,7 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
     try:
         for g in [g for g in smc.fair_value_gaps(adf) if g["dir"] == want][:3]:
             x0 = adf.index[g["idx"]]
-            if x0 < start:
+            if x0 < view.index[0]:
                 continue
             fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=right,
                           y0=g["bot"], y1=g["top"],
@@ -224,11 +194,11 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
 
     try:
         for s in [s for s in smc.liquidity_sweeps(adf) if s["dir"] == want][:3]:
-            if adf.index[s["idx"]] < start:
+            if adf.index[s["idx"]] < view.index[0]:
                 continue
             fig.add_trace(go.Scatter(
                 x=[adf.index[s["idx"]]], y=[s["level"]], mode="markers",
-                marker=dict(symbol="x", size=10, color=WARN, opacity=.8),
+                marker=dict(symbol="x", size=9, color=WARN, opacity=.75),
                 name="sweep", showlegend=False), row=1, col=1)
     except Exception:
         pass
@@ -238,12 +208,11 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
         if anchor is not None:
             line = anchored_vwap(adf, anchor).tail(bars)
             fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",
-                                     line=dict(color=TEAL, width=1.4, dash="dash"),
-                                     opacity=.8), row=1, col=1)
+                                     line=dict(color=TEAL, width=1.2, dash="dash"),
+                                     opacity=.75), row=1, col=1)
     except Exception:
         pass
 
-    # two profiles, two colours, both labelled as estimates
     try:
         if htf_df is not None and len(htf_df) >= 30:
             _draw_profile(fig, htf_df, bars * 2, VP_HTF, gutter_ref)
@@ -259,71 +228,57 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
         for y, col, txt in ((entry, "#e7eaf0", "ENTRY"), (sl, DN, "STOP"),
                             (tp1, UP, "TP1 50%"), (tp2, UP, "TP2")):
             fig.add_shape(type="line", row=1, col=1, x0=last_x, x1=right, y0=y, y1=y,
-                          line=dict(color=col, width=1.2))
+                          line=dict(color=col, width=1.1))
             fig.add_annotation(x=right, y=y, row=1, col=1, xanchor="left",
                                text=f" {txt} {y:,.6g}", showarrow=False,
                                font=dict(size=9, color=col))
         fig.add_shape(type="rect", row=1, col=1, x0=last_x, x1=right,
                       y0=min(entry, sl), y1=max(entry, sl),
-                      fillcolor="rgba(234,57,67,0.15)", line=dict(width=0))
+                      fillcolor="rgba(234,57,67,0.13)", line=dict(width=0))
         fig.add_shape(type="rect", row=1, col=1, x0=last_x, x1=right,
                       y0=min(entry, tp1), y1=max(entry, tp1),
-                      fillcolor="rgba(22,199,132,0.13)", line=dict(width=0))
-        fig.add_shape(type="rect", row=1, col=1, x0=last_x, x1=right,
-                      y0=min(tp1, tp2), y1=max(tp1, tp2),
-                      fillcolor="rgba(22,199,132,0.07)", line=dict(width=0))
+                      fillcolor="rgba(22,199,132,0.11)", line=dict(width=0))
 
     try:
         ci, cname, cq = latest_candle(adf, atr, direction)
-        if ci is not None and cq >= 60 and adf.index[ci] >= start:
+        if ci is not None and cq >= 60 and adf.index[ci] >= view.index[0]:
             fig.add_annotation(x=adf.index[ci],
                                y=float(adf["low"].iat[ci]) if long
                                else float(adf["high"].iat[ci]),
                                row=1, col=1, text=f" {cname} {cq} ", showarrow=True,
-                               arrowhead=2, yshift=-22 if long else 22,
+                               arrowhead=2, yshift=-20 if long else 20,
                                font=dict(size=9, color="#0f1116"),
                                bgcolor=UP if long else DN, borderpad=3)
     except Exception:
         pass
 
-    # pin the price scale to the visible candles so the gutter cannot stretch it
     try:
         lo = float(view["low"].min())
         hi = float(view["high"].max())
-        pad = (hi - lo) * 0.02 or max(abs(hi), 1.0) * 0.001
+        pad = (hi - lo) * 0.03 or max(abs(hi), 1.0) * 0.001
         y_range = [lo - pad, hi + pad]
     except Exception:
         y_range = None
 
-    shown_tf = chart_tf or ""
     fig.update_layout(
-        height=640, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
-        margin=dict(l=6, r=76, t=34, b=6), xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", y=1.05, x=0, font=dict(size=9)),
+        height=620, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+        margin=dict(l=62, r=10, t=34, b=22), showlegend=False,
         hovermode="x unified", dragmode="pan",
-        title=dict(text=f"chart {shown_tf} · structure 30m/3m · "
+        title=dict(text=f"chart {chart_tf or ''} · structure 30m/3m · "
                         f"profile = OHLCV estimate",
-                   x=0, xanchor="left", font=dict(size=10, color=MUT)))
-    # x and x2 are a matched pair: identical domains, or plotly rejects them
-    fig.update_layout(xaxis=dict(domain=PRICE_DOMAIN),
-                      xaxis2=dict(domain=PRICE_DOMAIN))
-    # gutter: layout property name, not the trace reference
+                   x=0, xanchor="left", font=dict(size=10, color=MUT)),
+        xaxis=dict(domain=PRICE_DOMAIN, type="date", showgrid=False,
+                   rangeslider=dict(visible=False)))
     fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
-                                           range=[0, 1], showgrid=False,
-                                           showticklabels=False, zeroline=False,
-                                           fixedrange=True)})
+                                          range=[0, 1], type="linear",
+                                          showgrid=False, showticklabels=False,
+                                          zeroline=False, fixedrange=True)})
     if y_range:
         fig.update_layout(yaxis=dict(range=y_range))
     fig.update_xaxes(showgrid=False, gridcolor="#1b1f28")
-    fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="right")
+    fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
+                     tickformat=",.6g")
     return fig
-
-
-def timeframe_control(key: str, current: str, default: str = "15m") -> str:
-    """One selectbox. Display only — the engine keeps its own pair."""
-    idx = CHART_TFS.index(current) if current in CHART_TFS else \
-        (CHART_TFS.index(default) if default in CHART_TFS else 3)
-    return st_selectbox(key, idx)
 
 
 def st_selectbox(key: str, idx: int) -> str:
@@ -335,24 +290,28 @@ def st_selectbox(key: str, idx: int) -> str:
 
 def legend_md() -> str:
     return """
+**How to read this chart**
+
 | mark | meaning |
 |---|---|
-| blue dotted vertical + `BOS` / `CHoCH` | **30m** structural break — major, labelled |
-| grey dotted vertical, no text | **3m** structural break — minor, unlabelled on purpose |
+| blue horizontal marker, `Bullish BOS` / `Bearish CHOCH` | **30m major** structural break, at the broken price |
+| short grey horizontal marker, no text | **3m minor** structural break |
 | grey triangles | confirmed swing high / low |
-| teal box | demand zone (long side). Amber box: supply zone (short side) |
-| faint box, no border | unfilled fair value gap — a magnet, not an entry |
-| amber ✕ | liquidity sweep — stops harvested, then closed back inside |
+| teal box | demand zone. Amber box: supply zone |
+| faint box, no border | unfilled fair value gap |
+| amber ✕ | liquidity sweep — stops taken, closed back inside |
 | teal dashed line | anchored VWAP from the origin of the leg |
-| left gutter bars | volume profile — **OHLCV estimate**, 30m blue / 3m teal |
+| right-hand gutter | volume profile — **OHLCV estimate**, 30m blue / 3m teal |
 | amber line in gutter | POC — most-traded price |
 | grey dotted in gutter | VAH / VAL — 70% of volume sits between them |
 | short grey ticks | HVN (longer) and LVN (shorter) |
-| green box | reward to TP1 / TP2 |
-| red box | risk to stop |
-| candle callout | the reversal candle and its ATR-normalised score |
+| green / red boxes | reward to TP1/TP2 and risk to stop |
 
-Only the newest two 30m and three 3m marks survive, and anything within half
-an ATR of a newer mark is dropped. The gutter is an estimate: candles carry
-no trade direction, so volume is spread evenly across each bar's range.
+Markers are 6 bars long so they never cut the chart in half. Only the newest
+two 30m and three 3m marks survive, and anything within half an ATR of a newer
+one is dropped. Only closed bars produce a mark.
+
+The gutter is an estimate: candles carry no trade direction, so volume is
+spread evenly across each bar's range. Total volume is conserved; the split
+inside a bar is not exact.
 """

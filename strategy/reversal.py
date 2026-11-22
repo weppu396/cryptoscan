@@ -1,9 +1,8 @@
-"""strategy/reversal.py - auto-selected pair, HTF capped at 1h.
+"""strategy/reversal.py - auto-selected pair. HTF 30m/1h, LTF 3m/5m.
 
-The higher timeframe is chosen from 15m / 30m / 1h by structure quality, never
-above 1h. The lower timeframe is then chosen from the legal triggers for that
-HTF — 3m, 5m or 15m depending on the HTF — by running the full assessment on
-each and keeping the best setup.
+The higher timeframe is chosen from 30m or 1h by structure quality, never
+slower than 1h. The lower timeframe is chosen from 3m or 5m — never slower than
+5m — by running the full assessment on each and keeping the best setup.
 
 30m and 1h are resampled from the loaded 15m frame, so a lower timeframe is
 never invented. Confirmation reuses core.candles.quality, the existing ATR
@@ -15,7 +14,7 @@ from core.candles import quality as candle_quality
 from core.indicators import compute_all
 from core.levels import build_zones
 from core.structure import build_structure, find_swings
-from core.tfs import MINUTES, cap_htf, resample
+from core.tfs import MINUTES, cap_htf, cap_ltf, resample
 
 APPROACH_ATR = 1.5
 WATCH_ATR = 6.0
@@ -30,9 +29,10 @@ BASE = "15m"          # context frame, also the parent for 30m / 1h
 FAST = "5m"
 SCALP = "3m"
 
-# HTF is capped at 1h by cap_htf(). LTFs are the legal triggers per HTF.
-HTF_CHOICES = ("15m", "30m", "1h")
-LTF_FOR = {"15m": ("3m",), "30m": ("3m", "5m"), "1h": ("5m", "15m")}
+# HTF capped at 1h, LTF capped at 5m. Nothing else is allowed.
+HTF_CHOICES = ("30m", "1h")
+LTF_CHOICES = ("3m", "5m")
+LTF_FOR = {"30m": LTF_CHOICES, "1h": LTF_CHOICES}
 COARSE = ("30m", "1h")
 
 STATUSES = ("APPROACHING", "DEVELOPING", "CONFIRMED", "ACTIVE_ENTRY",
@@ -88,15 +88,29 @@ def quality(hdf, ldf, cfg) -> float:
 
 
 def choose_htf(src: dict, cfg) -> str | None:
-    """Highest-scoring HTF, never above the 1h ceiling."""
+    """Highest-scoring HTF from 30m / 1h. Never slower than 1h."""
     best, best_q = None, -1.0
     for htf in HTF_CHOICES:
         htf = cap_htf(htf)
-        ltf = LTF_FOR[htf][0]
-        q = quality(_frame(src, htf), _frame(src, ltf), cfg)
+        q = quality(_frame(src, htf), _frame(src, LTF_CHOICES[0]), cfg)
         if q > best_q:
             best, best_q = htf, q
     return best if best_q >= 0 else None
+
+
+def choose_pair(src: dict, cfg) -> tuple:
+    """(htf, ltf, quality). HTF in 30m/1h, LTF in 3m/5m, best structure wins.
+
+    Used for display so a card title can never show 4h on the trigger side.
+    """
+    best = (HTF_CHOICES[0], LTF_CHOICES[0], -1.0)
+    for htf in HTF_CHOICES:
+        hdf = _frame(src, cap_htf(htf))
+        for ltf in LTF_CHOICES:
+            q = quality(hdf, _frame(src, ltf), cfg)
+            if q > best[2]:
+                best = (cap_htf(htf), ltf, q)
+    return best
 
 
 def _candidate(zones, price, atr, long):
@@ -198,8 +212,6 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
     else:
         status = "APPROACHING"
 
-    # executable from here forward: not already played, not extended,
-    # reward still worth taking, and not already in the book
     future = (status in FUTURE_STATUSES and rr >= cfg.risk.min_rr
               and not extended and not already)
 
@@ -210,7 +222,7 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
     if not future:
         score -= 12.0
 
-    reasons = [f"pair {htf}/{ltf}"]
+    reasons = [f"pair {cap_htf(htf)}/{cap_ltf(ltf)}"]
     if sweep:
         reasons.append(f"{ltf} CHoCH")
     if cq:
@@ -227,8 +239,9 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
             "status": status, "zone": (zone["low"], zone["high"]),
             "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2, "rr": rr,
             "score": round(score, 1), "is_new": not already, "future": future,
-            "htf": htf, "ltf": ltf, "pair_q": round(max(q, 0.0), 1),
-            "eta_min": (round(dist * MINUTES.get(htf, 60), 1)
+            "htf": cap_htf(htf), "ltf": cap_ltf(ltf),
+            "pair_q": round(max(q, 0.0), 1),
+            "eta_min": (round(dist * MINUTES.get(cap_htf(htf), 60), 1)
                         if status == "APPROACHING" else None),
             "bias": bias, "dist_atr": round(dist, 2),
             "reasons": reasons, "ts": ldf.index[-1]}
@@ -242,9 +255,9 @@ def evaluate(symbol, src: dict, cfg, already: bool = False):
     hdf = _frame(src, htf)
     if hdf is None or len(hdf) < 60:
         return None
-    q = quality(hdf, _frame(src, LTF_FOR[htf][0]), cfg)
+    q = quality(hdf, _frame(src, LTF_CHOICES[0]), cfg)
     best = None
-    for ltf in LTF_FOR[htf]:
+    for ltf in LTF_CHOICES:
         r = _assess(symbol, hdf, _frame(src, ltf), htf, ltf, cfg, already, q)
         if r is None:
             continue

@@ -16,7 +16,10 @@ Axis map, and why it matters:
   x    price row time axis
   x2   volume row time axis, created by make_subplots(shared_xaxes=True) and
        therefore carrying matches="x" — it MUST keep x's domain
-  x3   the profile gutter, a fresh axis resolved at runtime. Never reuse x2.
+  x3   the profile gutter, resolved at runtime. Never reuse x2.
+
+Two different names for the same axis: traces take a reference ("x3"),
+update_layout takes a layout property ("xaxis3"). _gutter() returns both.
 
 Green = reward, red = risk. Read-only: nothing here changes the plan.
 """
@@ -66,14 +69,18 @@ def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
         return None
 
 
-def _gutter_axis(fig) -> str:
-    """First x-axis name not already used by the subplot grid. make_subplots
-    owns 'x' and 'x2', so the profile must never take either."""
+def _gutter(fig) -> tuple[str, str]:
+    """(trace reference, layout property) for a free x axis.
+
+    make_subplots already owns 'x'/'x2' and 'xaxis'/'xaxis2', so the profile
+    must take neither. Traces use the short form, update_layout the long one.
+    """
     used = {k for k in fig.layout.to_plotly_json() if k.startswith("xaxis")}
     i = 2
     while f"xaxis{i}" in used:
         i += 1
-    return f"x{i}"
+    prop = f"xaxis{i}"
+    return prop.replace("axis", ""), prop
 
 
 def _draw_profile(fig, df, bars: int, color: str, axis: str) -> None:
@@ -135,7 +142,7 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.78, 0.22], vertical_spacing=0.03)
-    gutter = _gutter_axis(fig)
+    gutter_ref, gutter_prop = _gutter(fig)
 
     fig.add_trace(go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"],
@@ -239,11 +246,11 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
     # two profiles, two colours, both labelled as estimates
     try:
         if htf_df is not None and len(htf_df) >= 30:
-            _draw_profile(fig, htf_df, bars * 2, VP_HTF, gutter)
+            _draw_profile(fig, htf_df, bars * 2, VP_HTF, gutter_ref)
     except Exception:
         pass
     try:
-        _draw_profile(fig, adf, bars, VP_LTF, gutter)
+        _draw_profile(fig, adf, bars, VP_LTF, gutter_ref)
     except Exception:
         pass
 
@@ -300,10 +307,11 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
     # x and x2 are a matched pair: identical domains, or plotly rejects them
     fig.update_layout(xaxis=dict(domain=PRICE_DOMAIN),
                       xaxis2=dict(domain=PRICE_DOMAIN))
-    fig.update_layout(**{gutter: dict(domain=PROFILE_DOMAIN, anchor="y",
-                                      range=[0, 1], showgrid=False,
-                                      showticklabels=False, zeroline=False,
-                                      fixedrange=True)})
+    # gutter: layout property name, not the trace reference
+    fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
+                                           range=[0, 1], showgrid=False,
+                                           showticklabels=False, zeroline=False,
+                                           fixedrange=True)})
     if y_range:
         fig.update_layout(yaxis=dict(range=y_range))
     fig.update_xaxes(showgrid=False, gridcolor="#1b1f28")

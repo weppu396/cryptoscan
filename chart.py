@@ -5,8 +5,9 @@ The volume profile owns 84.5-100% on its own numeric axis, so it can never
 distort candle time, candle width or price scale. Traces reference the gutter
 as 'x2'; update_layout names it 'xaxis2'.
 
-Structure is drawn as short horizontal markers at the broken price, not
-full-height verticals. 30m majors are blue and labelled, 3m minors grey.
+Spacing rule: bar width comes from the MEDIAN gap, never the last two bars.
+A cache hole or session break at the tail must not stretch the axis. The x
+range is then pinned so nothing can widen it again.
 
 Read-only: nothing here changes the plan.
 """
@@ -40,18 +41,44 @@ VP_LTF = "rgba(20,184,166,0.14)"
 
 PRICE_DOMAIN = [0.0, 0.82]
 PROFILE_DOMAIN = [0.845, 1.0]
+OHLC = ("open", "high", "low", "close")
 
 
-def _future(df, bars: int = 6):
-    if len(df) < 2:
-        return df.index[-1]
-    return df.index[-1] + (df.index[-1] - df.index[-2]) * bars
+def _clean(df):
+    """Sorted, de-duplicated, numeric, gap-free index. Bad rows dropped."""
+    if df is None or not len(df):
+        return df
+    d = df.copy()
+    if not isinstance(d.index, pd.DatetimeIndex):
+        d.index = pd.to_datetime(d.index, utc=True, errors="coerce")
+    elif d.index.tz is None:
+        d.index = d.index.tz_localize("UTC")
+    d = d[~d.index.isna()]
+    d = d[~d.index.duplicated(keep="last")].sort_index()
+    for c in OHLC:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    keep = [c for c in OHLC if c in d.columns]
+    d = d.dropna(subset=keep)
+    if keep:
+        d = d[np.isfinite(d[keep].to_numpy(float)).all(axis=1)]
+    return d
 
 
 def _step(df) -> pd.Timedelta:
-    if len(df) < 2:
+    """Median positive bar gap. Robust to holes; the last-two-bars delta is
+    not, and that is what used to stretch the axis by months."""
+    if len(df) < 3:
         return pd.Timedelta(0)
-    return df.index[-1] - df.index[-2]
+    d = pd.Series(df.index).diff().dropna()
+    d = d[d > pd.Timedelta(0)]
+    return d.median() if len(d) else pd.Timedelta(0)
+
+
+def _future(last, step: pd.Timedelta, bars: int = 6):
+    if step <= pd.Timedelta(0):
+        return last + pd.Timedelta(minutes=1)
+    return last + step * bars
 
 
 def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
@@ -61,6 +88,15 @@ def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
         return int(float(s.iloc[-1])) if len(s) else None
     except Exception:
         return None
+
+
+def _tick(tf: str | None) -> str:
+    m = chart_minutes(tf) if tf else 15
+    if m < 60:
+        return "%H:%M"
+    if m < 1440:
+        return "%d %b %H:%M"
+    return "%d %b"
 
 
 def _gutter(fig) -> tuple[str, str]:
@@ -116,7 +152,18 @@ def _mark(fig, ts, level, step, color, width, label=None, yshift=0):
 def build(df, cfg, direction: str, plan: dict | None = None,
           bars: int = DEFAULT_BARS, chart_tf: str | None = None,
           analysis_df=None, htf_df=None) -> go.Figure:
-    adf = analysis_df if analysis_df is not None else df
+    df = _clean(df)
+    adf = _clean(analysis_df) if analysis_df is not None else df
+    htf_df = _clean(htf_df) if htf_df is not None else None
+    if df is None or not len(df):
+        fig = go.Figure()
+        fig.update_layout(template="plotly_dark", paper_bgcolor=BG,
+                          plot_bgcolor=BG, height=620,
+                          annotations=[dict(text="no candles", showarrow=False,
+                                            xref="paper", yref="paper",
+                                            x=0.5, y=0.5)])
+        return fig
+
     view = df.tail(bars)
     step = _step(view)
     ind = compute_all(adf, cfg)
@@ -125,8 +172,8 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     atr = float(a) if a == a else 0.0
     long = direction == "long"
     want = "bull" if long else "bear"
-    right = _future(view, 6)
     last_x = view.index[-1]
+    right = _future(last_x, step, 6)
 
     if htf_df is None:
         try:
@@ -260,6 +307,11 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     except Exception:
         y_range = None
 
+    # x range is pinned: nothing added later can widen it
+    x_lo = view.index[0]
+    if x_lo >= right:
+        right = x_lo + (step or pd.Timedelta(minutes=1)) * 6
+
     fig.update_layout(
         height=620, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
         margin=dict(l=62, r=10, t=34, b=22), showlegend=False,
@@ -268,7 +320,8 @@ def build(df, cfg, direction: str, plan: dict | None = None,
                         f"profile = OHLCV estimate",
                    x=0, xanchor="left", font=dict(size=10, color=MUT)),
         xaxis=dict(domain=PRICE_DOMAIN, type="date", showgrid=False,
-                   rangeslider=dict(visible=False)))
+                   range=[x_lo, right], nticks=8, tickformat=_tick(chart_tf),
+                   rangeslider=dict(visible=False), fixedrange=False))
     fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
                                           range=[0, 1], type="linear",
                                           showgrid=False, showticklabels=False,
@@ -311,7 +364,7 @@ Markers are 6 bars long so they never cut the chart in half. Only the newest
 two 30m and three 3m marks survive, and anything within half an ATR of a newer
 one is dropped. Only closed bars produce a mark.
 
-The gutter is an estimate: candles carry no trade direction, so volume is
-spread evenly across each bar's range. Total volume is conserved; the split
-inside a bar is not exact.
+Bar spacing comes from the median gap across the window, so a cache hole or a
+session break cannot stretch the axis. The gutter is an estimate: candles carry
+no trade direction, so volume is spread evenly across each bar's range.
 """

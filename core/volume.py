@@ -82,3 +82,78 @@ def volume_profile(df, lookback: int = 200, bins: int = 60) -> dict:
     return {"poc": float((edges[poc_i] + edges[poc_i + 1]) / 2),
             "val": float(edges[min(keep)]), "vah": float(edges[max(keep) + 1]),
             "node": bool(hist[poc_i] >= 0.15 * total)}
+
+
+def profile_histogram(df, lookback: int = 200, bins: int = 48,
+                      value_area: float = 0.70) -> dict:
+    """Horizontal volume-at-price histogram for the chart gutter.
+
+    ESTIMATE: OHLCV has no tick data, so each bar's volume is spread evenly
+    across the price bins its high-low range overlaps. Direction of trade
+    inside the bar is unknown. Good enough to see where value sits; never
+    call it exact.
+
+    Returns {} when there is too little data. Never raises.
+    """
+    if df is None or len(df) < 20:
+        return {}
+    seg = df.tail(max(20, int(lookback)))
+    lo, hi = float(seg["low"].min()), float(seg["high"].max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return {}
+
+    edges = np.linspace(lo, hi, bins + 1)
+    hist = np.zeros(bins)
+    lows = seg["low"].to_numpy(float)
+    highs = seg["high"].to_numpy(float)
+    vols = np.nan_to_num(seg["volume"].to_numpy(float), nan=0.0)
+
+    for i in range(len(seg)):
+        v = vols[i]
+        if v <= 0:
+            continue
+        span = highs[i] - lows[i]
+        if span <= 0:
+            k = min(bins - 1, max(0, int((lows[i] - lo) / (hi - lo) * bins)))
+            hist[k] += v
+            continue
+        for k in range(bins):
+            ov = min(highs[i], edges[k + 1]) - max(lows[i], edges[k])
+            if ov > 0:
+                hist[k] += v * (ov / span)
+
+    total = float(hist.sum())
+    if total <= 0:
+        return {}
+
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    poc_i = int(hist.argmax())
+    target = total * value_area
+    acc, left, right = hist[poc_i], poc_i, poc_i
+    while acc < target and (left > 0 or right < bins - 1):
+        lv = hist[left - 1] if left > 0 else -1.0
+        rv = hist[right + 1] if right < bins - 1 else -1.0
+        if rv >= lv:
+            right += 1
+            acc += hist[right]
+        else:
+            left -= 1
+            acc += hist[left]
+
+    kern = np.array([1, 2, 3, 2, 1], float)
+    smooth = np.convolve(hist, kern / kern.sum(), mode="same")
+    live = smooth[smooth > 0]
+    hvn, lvn = [], []
+    if len(live) >= 8:
+        hi_cut = float(np.quantile(live, 0.82))
+        lo_cut = float(np.quantile(live, 0.18))
+        hvn = [float(centers[i]) for i in np.argsort(smooth)[::-1][:6]
+               if smooth[i] >= hi_cut]
+        lvn = [float(centers[i]) for i in np.argsort(smooth)[:6]
+               if smooth[i] <= lo_cut]
+
+    return {"centers": centers, "hist": hist / total,
+            "poc": float(centers[poc_i]),
+            "val": float(edges[left]), "vah": float(edges[right + 1]),
+            "hvn": hvn, "lvn": lvn, "estimate": True,
+            "anchor": seg.index[0], "bars": len(seg)}

@@ -7,6 +7,8 @@ The final bar is dropped so a forming break never shows as confirmed.
 """
 import numpy as np
 
+from core.indicators import compute_all
+from core.levels import build_zones
 from core.structure import build_structure, find_swings
 
 KEYS = (("bos_up", "BOS", "bull"), ("choch_up", "CHoCH", "bull"),
@@ -135,19 +137,19 @@ def volume_zones(df, cfg, tf_label: str, grade: str, direction: str,
                  min_ratio: float = 1.3, keep: int = 1) -> list[dict]:
     """Unmitigated zones with above-average volume behind the touch.
 
-    Supply for longs' exits and shorts' entries, demand for the reverse; only
-    the side that matters for `direction` is returned.
+    Supply for short entries and long exits, demand for the reverse; only the
+    side that matters for `direction` is returned.
     """
-    from core.levels import build_zones
-    from core.indicators import atr as atr_fn
-
     d = _closed(df)
     if len(d) < 60:
         return []
     sw = find_swings(d, cfg.structure.swing_left, cfg.structure.swing_right)
     if not sw:
         return []
-    atr_s = atr_fn(d, 14)
+    try:
+        atr_s = compute_all(d, cfg)["atr"]
+    except Exception:
+        return []
     kind = "sup" if direction == "long" else "res"
     zones = build_zones(d, sw, atr_s, cfg.structure, kind)
     vol = d["volume"].to_numpy(float)

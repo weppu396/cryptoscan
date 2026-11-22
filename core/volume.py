@@ -2,6 +2,9 @@
 import numpy as np
 import pandas as pd
 
+AVWAP_MAX_AGE = 80
+AVWAP_MAX_DIST = 25.0
+
 
 def anchored_vwap(df, anchor: int) -> pd.Series:
     out = pd.Series(np.nan, index=df.index, dtype=float)
@@ -15,11 +18,17 @@ def anchored_vwap(df, anchor: int) -> pd.Series:
 
 
 def avwap_context(df, direction: str, atr: float, anchor: int | None) -> dict:
-    """0-100. A retest entry sits just BELOW the anchor VWAP by design, so
-    proximity to value scores higher than being above it."""
-    blank = {"score": 0, "flags": [], "warnings": ["no ATR"], "dist": 0.0, "line": None}
+    """0-100. usable=False when the anchor is stale or the distance is
+    meaningless, so the UI can print n/a instead of -116.61 ATR."""
+    blank = {"score": 0, "flags": [], "warnings": ["no ATR"], "dist": 0.0,
+             "line": None, "usable": False}
     if not atr or atr <= 0:
         return blank
+    if anchor is None or not (0 <= anchor < len(df)):
+        return {**blank, "warnings": ["no anchor"]}
+    age = len(df) - 1 - anchor
+    if age > AVWAP_MAX_AGE:
+        return {**blank, "warnings": [f"anchor {age} bars old - too stale"]}
     line = anchored_vwap(df, anchor)
     if not line.notna().any():
         return {**blank, "warnings": ["no anchor"]}
@@ -50,12 +59,16 @@ def avwap_context(df, direction: str, atr: float, anchor: int | None) -> dict:
         else:
             warns.append("far above AVWAP")
 
+    usable = abs(dist) <= AVWAP_MAX_DIST
+    if not usable:
+        score = 0
+        warns.append(f"distance {dist:+.0f} ATR - unreliable")
     if flag:
         flags.append(flag)
     if abs(dist) > 3.0:
         warns.append("stretched from AVWAP")
     return {"score": score, "flags": flags, "warnings": warns,
-            "dist": dist, "line": line}
+            "dist": dist, "line": line, "usable": usable}
 
 
 def volume_profile(df, lookback: int = 200, bins: int = 60) -> dict:
@@ -86,14 +99,11 @@ def volume_profile(df, lookback: int = 200, bins: int = 60) -> dict:
 
 def profile_histogram(df, lookback: int = 200, bins: int = 48,
                       value_area: float = 0.70) -> dict:
-    """Horizontal volume-at-price histogram for the chart gutter.
+    """Horizontal volume-at-price for the chart gutter.
 
-    ESTIMATE: OHLCV has no tick data, so each bar's volume is spread evenly
-    across the price bins its high-low range overlaps. Direction of trade
-    inside the bar is unknown. Good enough to see where value sits; never
-    call it exact.
-
-    Returns {} when there is too little data. Never raises.
+    ESTIMATE. OHLCV carries no trade direction, so each bar's volume is
+    spread evenly across the bins its range overlaps. Total volume is
+    conserved; distribution inside a bar is a guess.
     """
     if df is None or len(df) < 20:
         return {}
@@ -156,4 +166,4 @@ def profile_histogram(df, lookback: int = 200, bins: int = 48,
             "poc": float(centers[poc_i]),
             "val": float(edges[left]), "vah": float(edges[right + 1]),
             "hvn": hvn, "lvn": lvn, "estimate": True,
-            "anchor": seg.index[0], "bars": len(seg)}
+            "anchor": seg.index[0], "bars": len(seg), "total": total}

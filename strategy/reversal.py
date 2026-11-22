@@ -29,6 +29,12 @@ BASE = "15m"          # context frame, also the parent for 30m / 1h
 FAST = "5m"
 SCALP = "3m"
 
+# load budgets. 250 HTF / 400 LTF is a starting point, not a result.
+HTF_BARS = 250
+LTF_BARS = 400
+MIN_HTF_BARS = 60
+MIN_LTF_BARS = 120
+
 # HTF capped at 1h, LTF capped at 5m. Nothing else is allowed.
 HTF_CHOICES = ("30m", "1h")
 LTF_CHOICES = ("3m", "5m")
@@ -67,7 +73,8 @@ def _frame(src: dict, name: str):
 
 def quality(hdf, ldf, cfg) -> float:
     """Higher = cleaner structure. -1 means unusable."""
-    if hdf is None or ldf is None or len(hdf) < 60 or len(ldf) < 120:
+    if hdf is None or ldf is None or len(hdf) < MIN_HTF_BARS \
+            or len(ldf) < MIN_LTF_BARS:
         return -1.0
     atr = _atr(hdf, cfg)
     if atr <= 0:
@@ -143,7 +150,8 @@ def _targets(zones, entry, risk, long, cap_r):
 
 def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
     """One HTF/LTF combination. Dict, or None when not worth a row."""
-    if hdf is None or ldf is None or len(hdf) < 60 or len(ldf) < 120:
+    if hdf is None or ldf is None or len(hdf) < MIN_HTF_BARS \
+            or len(ldf) < MIN_LTF_BARS:
         return None
     ah, al = _atr(hdf, cfg), _atr(ldf, cfg)
     if ah <= 0 or al <= 0:
@@ -253,7 +261,7 @@ def evaluate(symbol, src: dict, cfg, already: bool = False):
     if htf is None:
         return None
     hdf = _frame(src, htf)
-    if hdf is None or len(hdf) < 60:
+    if hdf is None or len(hdf) < MIN_HTF_BARS:
         return None
     q = quality(hdf, _frame(src, LTF_CHOICES[0]), cfg)
     best = None

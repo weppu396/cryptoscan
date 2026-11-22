@@ -1,8 +1,8 @@
 """chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
 
-Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves, full
-history in the trace with a short initial window, all marks to the right edge,
-both axes free for independent zoom.
+Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves,
+bounded history with a short initial window, all marks to the right edge, both
+axes free for independent zoom.
 """
 import numpy as np
 import pandas as pd
@@ -177,7 +177,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         ltf_df = adf
 
     on = set(layers) if layers else LAYERS[mode]
-    hist = df.tail(MAX_TRACE)
+    hist = df.tail(min(MAX_TRACE, max(bars * 8, bars)))
     view = hist.tail(bars)
     step = _step(hist)
     t = len(adf) - 1
@@ -307,7 +307,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                       f"gutter blue = HTF, orange = LTF",
                                  x=0, xanchor="left", font=dict(size=10, color=MUT)),
                       xaxis=dict(domain=PRICE_DOMAIN, type="date",
-                                 showgrid=False, range=[x_lo, right], nticks=8,
+                                 showgrid=False, range=[x_lo, right],
+                                 autorange=False, nticks=8,
                                  tickformat=_tick(chart_tf),
                                  rangeslider=dict(visible=False),
                                  fixedrange=False, constrain="range"))
@@ -316,7 +317,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                           showgrid=False, showticklabels=False,
                                           zeroline=False, fixedrange=True)})
     if y_range:
-        fig.update_layout(yaxis=dict(range=y_range, fixedrange=False))
+        fig.update_layout(yaxis=dict(range=y_range, autorange=False,
+                                     fixedrange=False))
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
                      tickformat=",.6g", fixedrange=False)

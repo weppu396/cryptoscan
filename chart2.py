@@ -1,8 +1,8 @@
 """chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
 
-Same contract as chart.py. Pivots come from the frame's own swings; exactly two
-per layer, four total, HTF yellow / LTF cyan, each starting on the wick and
-running right.
+Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves, full
+history in the trace with a short initial window, all marks to the right edge,
+both axes free for independent zoom.
 """
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 import smc
 from core.models import Layer
 from core.structure_map import thin, volume_zones
-from core.tfs import chart_minutes, resample
+from core.tfs import cap_htf, chart_minutes, resample
 from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL, BLUE = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6", "#3b82f6"
@@ -38,6 +38,7 @@ PROFILE_DOMAIN = [0.785, 1.0]
 HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
 MAX_MARKS = {Layer.EXTERNAL: 2, Layer.INTERNAL: 2}
 DEFAULT_BARS = 110
+MAX_TRACE = 1200
 OHLC = ("open", "high", "low", "close")
 
 
@@ -103,7 +104,7 @@ def _profile(fig, df, bars, color, axis, side):
     fig.add_trace(go.Bar(y=vp["centers"], x=vp["hist"] * span, base=b0,
                          orientation="h",
                          marker=dict(color=color, line=dict(width=0)),
-                         width=step * 1.6 if step else None,
+                         width=step * 3.0 if step else None,
                          hoverinfo="skip", showlegend=False), row=1, col=1)
     fig.data[-1].xaxis = axis
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
@@ -166,6 +167,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         return fig
 
     htf_label, ltf_label = (pair if pair else ("30m", "3m"))
+    htf_label = cap_htf(htf_label)
     if htf_df is None:
         try:
             htf_df = resample(adf, htf_label) if len(adf) > 60 else None
@@ -175,20 +177,21 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         ltf_df = adf
 
     on = set(layers) if layers else LAYERS[mode]
-    view = df.tail(bars)
-    step = _step(view)
+    hist = df.tail(MAX_TRACE)
+    view = hist.tail(bars)
+    step = _step(hist)
     t = len(adf) - 1
     long = direction == "long"
-    last_x = view.index[-1]
+    last_x = hist.index[-1]
     right = _future(last_x, step, 6)
-    start = view.index[0]
+    start = hist.index[0]
 
     fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
 
     fig.add_trace(go.Candlestick(
-        x=view.index, open=view["open"], high=view["high"], low=view["low"],
-        close=view["close"],
+        x=hist.index, open=hist["open"], high=hist["high"], low=hist["low"],
+        close=hist["close"],
         increasing_line_color=UP, increasing_line_width=1.2, increasing_fillcolor=UP,
         decreasing_line_color=DN, decreasing_line_width=1.2, decreasing_fillcolor=DN,
         whiskerwidth=0.6, showlegend=False), row=1, col=1)
@@ -213,7 +216,6 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             live = thin([{"ts": adf.index[e.break_idx], "level": e.level, "e": e}
                          for e in live], 0.0)
             w, col = STYLE[layer]
-            label = "HTF" if layer == Layer.EXTERNAL else "LTF"
             for row in live[-MAX_MARKS[layer]:]:
                 e = row["e"]
                 c = WARN if (e.label.value == "CHoCH"
@@ -223,14 +225,10 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     if "zones" in on:
         try:
-            for z in volume_zones(htf_df, cfg_or_default(), htf_label, "HTF",
-                                  direction, keep=1):
+            from config import CFG as _CFG
+            for z in volume_zones(htf_df, _CFG, htf_label, "HTF", direction, keep=1):
                 _zone(fig, z, max(z["ts"], start), right, "HTF " + htf_label)
-        except Exception:
-            pass
-        try:
-            for z in volume_zones(ltf_df, cfg_or_default(), ltf_label, "LTF",
-                                  direction, keep=1):
+            for z in volume_zones(ltf_df, _CFG, ltf_label, "LTF", direction, keep=1):
                 _zone(fig, z, max(z["ts"], start), right, "LTF " + ltf_label)
         except Exception:
             pass
@@ -260,7 +258,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             pool = [s for s in frame.swings if s.layer == Layer.EXTERNAL
                     and s.kind == ("L" if long else "H") and s.confirmed_at <= t]
             if pool:
-                line = anchored_vwap(adf, pool[-1].idx).tail(bars)
+                line = anchored_vwap(adf, pool[-1].idx).tail(len(hist))
                 fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",
                                          line=dict(color=TEAL, width=1.2, dash="dash"),
                                          opacity=.75), row=1, col=1)
@@ -288,8 +286,9 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                font=dict(size=8, color=col))
 
     try:
-        lo = float(view["low"].min())
-        hi = float(view["high"].max())
+        y_ref = hist.tail(min(len(hist), max(bars * 4, bars)))
+        lo = float(y_ref["low"].min())
+        hi = float(y_ref["high"].max())
         pad = (hi - lo) * 0.03 or max(abs(hi), 1.0) * 0.001
         y_range = [lo - pad, hi + pad]
     except Exception:
@@ -302,6 +301,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=62, r=10, t=42, b=22),
                       showlegend=False, hovermode="x unified", dragmode="zoom",
+                      uirevision="cryptoscan",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
                                       f"gutter blue = HTF, orange = LTF",
@@ -321,8 +321,3 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
                      tickformat=",.6g", fixedrange=False)
     return fig
-
-
-def cfg_or_default():
-    from config import CFG
-    return CFG

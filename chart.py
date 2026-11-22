@@ -3,6 +3,8 @@
 Candles 0-76% on a datetime axis. Profile gutter 78.5-100% in two halves,
 HTF left-in-gutter blue, LTF right-in-gutter orange, own numeric axis.
 
+Pair rules: HTF is capped at 1h, LTF at 5m. Nothing else can reach a label.
+
 History: the trace carries ZOOM_TRACE bars and only the initial view is
 DEFAULT_BARS, so zooming out reveals real earlier candles. The trace is bounded
 so overlays like the anchored VWAP cannot stretch the axis back to old data.
@@ -30,7 +32,8 @@ from core.candles import latest as latest_candle
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.structure_map import structure_lines, volume_zones
-from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf, resample
+from core.tfs import (CHART_TFS, cap_htf, cap_ltf, chart_minutes, data_tf,
+                      resample)
 from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6"
@@ -101,6 +104,8 @@ def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
 
 def _tick(tf: str | None) -> str:
     m = chart_minutes(tf) if tf else 15
+    if m < 1:
+        return "%H:%M:%S"
     if m < 60:
         return "%H:%M"
     if m < 1440:
@@ -196,7 +201,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
         return fig
 
     htf_label, ltf_label = (pair if pair else ("30m", "3m"))
-    htf_label = cap_htf(htf_label)
+    htf_label, ltf_label = cap_htf(htf_label), cap_ltf(ltf_label)
     if htf_df is None:
         try:
             htf_df = resample(adf, htf_label) if len(adf) > 60 else None
@@ -380,9 +385,8 @@ def build(df, cfg, direction: str, plan: dict | None = None,
 def st_selectbox(key: str, idx: int, default: str = "30m") -> str:
     import streamlit as st
     return st.selectbox("Chart timeframe", CHART_TFS, index=idx, key=key,
-                        help=f"Display only, default {default}. Structure and "
-                             "the plan use the auto-selected pair, HTF never "
-                             "above 1h.")
+                        help=f"Display only, default {default}. Structure uses "
+                             "an auto pair: HTF 30m or 1h, LTF 3m or 5m.")
 
 
 def legend_md() -> str:
@@ -391,8 +395,8 @@ def legend_md() -> str:
 
 | mark | meaning |
 |---|---|
-| yellow level + `HH 0.00362 BOS` | **HTF** pivot. HH/HL in an uptrend, LH/LL in a downtrend |
-| cyan level + `LL 0.00340 CHoCH` | **LTF** pivot, same labels |
+| yellow level + `HH 0.00362 BOS` | **HTF** pivot, 30m or 1h. HH/HL up, LH/LL down |
+| cyan level + `LL 0.00340 CHoCH` | **LTF** pivot, 3m or 5m, same labels |
 | dusty rose box | **supply** zone, labelled `HTF 1h supply 2.4x 0.00351–0.00356` |
 | mint box | **demand** zone, same label format |
 | faint box, no border | unfilled fair value gap |
@@ -404,10 +408,11 @@ def legend_md() -> str:
 | grey dotted in gutter | VAH / VAL |
 | green / red boxes | reward to TP1/TP2 and risk to stop |
 
-The HTF is picked from 15m, 30m or 1h — never above 1h — by how cleanly the
-market is structured. The LTF is then picked from the legal triggers for that
-HTF (3m, 5m or 15m depending on the HTF) by running the full assessment on each
-and keeping the best setup. Both are printed in the chart title.
+The HTF is picked from 30m or 1h by how cleanly the market is structured —
+never slower than 1h. The LTF is picked from 3m or 5m by running the full
+assessment on each and keeping the better setup — never slower than 5m. Both are
+printed in the chart title, and both are clamped so a stale label cannot leak
+through.
 
 Exactly two pivots per timeframe, four total. The `x` in a zone label is the
 touch-bar volume against its 20-bar average; anything under 1.3x is dropped, so

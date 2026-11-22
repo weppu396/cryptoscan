@@ -8,6 +8,11 @@ Structure lines are BOS only. A BOS line sits on the pivot that broke — HH/HL 
 an uptrend, LH/LL in a downtrend — and the pivot tag is printed in the label.
 CHoCH is not given a horizontal line; the pivot labels carry that information.
 
+Window: the visible span is derived from the structure timeframes, not from a
+fixed bar count, so a 30m pivot (which needs right+1 HTF bars to confirm) is
+always on screen at any display timeframe without zooming out. HTF_VISIBLE and
+LTF_VISIBLE set the guaranteed bars of each.
+
 History: the trace carries the whole loaded frame (up to MAX_TRACE bars), so
 panning left always finds candles. The initial window is only an initial range,
 and uirevision is keyed to the view so zoom survives reruns but not a timeframe
@@ -54,6 +59,9 @@ HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
 MAX_MARKS = 2
 LABEL_KEEP = 4
 DEFAULT_BARS = 70
+HTF_VISIBLE = 45
+LTF_VISIBLE = 60
+WINDOW_CAP = 900
 MAX_TRACE = 6000
 OHLC = ("open", "high", "low", "close")
 EQ_TOL_ATR = 0.25
@@ -305,8 +313,13 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     on = set(layers) if layers else LAYERS[mode]
     hist = df.tail(MAX_TRACE)
-    view = hist.tail(bars)
     step = _step(hist)
+    step_min = step.total_seconds() / 60.0 if step and step > pd.Timedelta(0) else 1.0
+    need = max(chart_minutes(htf_label) * HTF_VISIBLE,
+               chart_minutes(ltf_label) * LTF_VISIBLE)
+    bars = int(min(WINDOW_CAP, max(int(bars), round(need / max(step_min, 1e-4)))))
+    bars = max(20, min(bars, len(hist)))
+    view = hist.tail(bars)
     long = direction == "long"
     last_x = hist.index[-1]
     right = _future(last_x, step, 6)
@@ -374,18 +387,13 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             bos = thin([{"ts": f.index[int(_sv(e, "break_idx", 0))],
                          "level": float(_sv(e, "level")), "e": e} for e in bos],
                        0.0)
-            w, col = STYLE[layer]
+            w, col_line = STYLE[layer]
             tags = tags_by_layer[layer]
             by_idx = idx_by_layer[layer]
             for row in bos[-keep:]:
                 e = row["e"]
-                s_idx = int(_sv(e, "swing_idx", -1))
-                pivot = by_idx.get(s_idx)
+                pivot = by_idx.get(int(_sv(e, "swing_idx", -1)))
                 tag = tags.get(id(pivot), "") if pivot is not None else ""
-                if _sv(e, "direction") == "bull":
-                    col_line = HTF_LINE if layer == Layer.EXTERNAL else LTF_LINE
-                else:
-                    col_line = HTF_LINE if layer == Layer.EXTERNAL else LTF_LINE
                 _struct(fig, row["ts"], row["level"], right, col_line, w,
                         f"{_sv(e, 'direction', '').upper()} BOS", tag)
 

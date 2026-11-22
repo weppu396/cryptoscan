@@ -84,56 +84,49 @@ TF_MIN = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
 OHLC = ("open", "high", "low", "close")
 
 LOGIC_MD = """
-### The two timeframes, and why
+### The timeframe pair is chosen, not fixed
 
-**30m is the higher timeframe. 3m is the lower timeframe.** They are fixed
-constants (`strategy/reversal.py`, `HTF` / `LTF`). Changing the chart timeframe
-never changes them.
+Three candidate pairs are scored per coin: `15m/3m`, `30m/15m`, `1h/30m`. The
+score is swing separation measured in ATR, swing density, and whether
+volatility sits in a workable band. The clearest pair wins and is printed on
+every card, alert and chart title. 30m and 1h are resampled from 15m, so a
+lower timeframe is never invented.
 
-| timeframe | role | what it produces |
+| role | higher timeframe | lower timeframe |
 |---|---|---|
-| **30m** | context | trend state, major BOS / CHOCH, supply and demand zones, the reversal candidate |
-| **3m** | trigger | minor BOS / CHOCH, liquidity sweep, confirmation candle, volume |
+| what it decides | trend, major pivots, zones, the candidate | trigger, minor pivots, sweep, candle |
+| why | context: are we at a reversal location at all | timing: is the reversal actually starting |
 
-### Sequence, in order
+### Sequence
 
-1. **30m trend.** `build_structure` returns up, down or range. A long candidate
-   needs the 30m trend not-up; a short needs it not-down. Continuation is
-   skipped — this is a reversal desk.
-2. **30m location.** `core.levels.build_zones` clusters swing prices into
-   demand or supply. The nearest unmitigated zone within 6 ATR becomes the
-   candidate. Zones are ATR-scaled and touch-scored; a level tested many times
-   scores higher.
-3. **Proximity.** Distance to the zone edge is measured in 30m ATR.
-   Beyond 6 ATR the coin drops off the radar. Inside 1.5 ATR it is
-   `APPROACHING`.
-4. **3m trigger.** Inside the zone, the 3m frame must print a CHOCH or BOS in
-   the reversal direction within the last 15 bars, **and** a candle grading at
-   least 60 from `core.candles.quality` — the same ATR-normalised engulfing /
-   hammer / pin grader the scanner uses.
-5. **Entry, stop, targets.** Entry is the zone edge facing price. Stop is the
-   far zone edge plus 0.35 × 3m ATR. TP1 is the next opposing zone or 1.5R,
-   TP2 the next one beyond that or 3.0R, capped by `max_tp_r`.
+1. **HTF trend.** `build_structure` returns up, down or range. A long needs the
+   HTF not-up, a short not-down. Continuation is skipped.
+2. **HTF location.** `core.levels.build_zones` clusters swing prices. The
+   nearest unmitigated zone within 6 ATR becomes the candidate.
+3. **Proximity.** Measured in HTF ATR. Past 6 ATR the coin drops off. Inside
+   1.5 ATR it is `APPROACHING`.
+4. **LTF trigger.** In the zone, the LTF must print a CHOCH or BOS in the
+   reversal direction within 15 bars **and** a candle scoring 60+ from
+   `core.candles.quality` — the same ATR grader the scanner uses.
+5. **Bracket.** Entry is the zone edge facing price. Stop is the far edge plus
+   0.35 × LTF ATR. TP1 is the next opposing zone or 1.5R, TP2 the next one or
+   3.0R, capped by `max_tp_r`.
 6. **Gates.** `ACTIVE_ENTRY` needs R:R ≥ `min_rr`, stop ≤ `max_stop_atr`,
-   travel over the last 12 bars ≤ 4 ATR, and no open paper position on the
-   symbol. Failing any gate downgrades to `CONFIRMED` — it is still shown, just
-   not as a new entry.
-7. **Status.** `APPROACHING` → `DEVELOPING` (in zone) → `CONFIRMED` (triggered)
-   → `ACTIVE_ENTRY` (triggered and still in range). `MISSED` once price leaves
-   by more than 1 ATR or runs 4 ATR. `INVALIDATED` when the stop is breached.
+   travel over 12 bars ≤ 4 ATR, and no open paper position. Failing a gate
+   downgrades to `CONFIRMED` — still visible, not a new entry.
 
-### What each status means
+### Statuses
 
 | status | meaning |
 |---|---|
-| `APPROACHING` | inside 1.5 ATR of the zone, no trigger yet. ETA is a linear projection, never a promise |
-| `DEVELOPING` | price is in the zone, trigger not satisfied |
-| `CONFIRMED` | trigger fired, but entry is gone, R:R fails, or you are already in |
-| `ACTIVE_ENTRY` | new, confirmed, still in range, gates pass |
+| `APPROACHING` | inside 1.5 ATR, no trigger. ETA is a projection, not a promise |
+| `DEVELOPING` | in the zone, trigger not satisfied |
+| `CONFIRMED` | triggered, but entry gone, R:R fails, or already in |
+| `ACTIVE_ENTRY` | new, confirmed, in range, gates pass |
 | `MISSED` | ran past the zone |
 | `INVALIDATED` | stop breached |
 
-Every reading uses closed candles. The forming bar never produces a claim.
+Closed candles only. The forming bar never produces a claim.
 """
 
 
@@ -203,7 +196,6 @@ def _closed(df):
 
 
 def _tidy(df):
-    """Sorted, de-duplicated, numeric frame. Used by the plain detail chart."""
     if df is None or not len(df):
         return df
     d = df.copy()
@@ -224,12 +216,7 @@ def _tidy(df):
 
 
 def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
-    """Plain candle chart that collapses only REAL holes.
-
-    Returns (figure, collapsed_gap_count). No candle is invented: gaps larger
-    than three median bars are collapsed with rangebreaks, which is what the
-    venue's missing bars actually are.
-    """
+    """Plain candle chart collapsing only real holes. No candle is invented."""
     d = _tidy(df)
     view = d.tail(bars)
     diffs = pd.Series(view.index).diff().dropna()
@@ -254,11 +241,11 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
     fig.update_layout(height=460, template="plotly_dark",
                       paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
                       margin=dict(l=58, r=10, t=26, b=22), showlegend=False,
-                      dragmode="pan",
+                      dragmode="zoom",
                       title=dict(text=f"{tf} · {len(view)} bars · "
                                       f"{len(breaks)} real gap(s) collapsed",
-                                 x=0, xanchor="left", font=dict(size=10,
-                                                               color="#7f8798")),
+                                 x=0, xanchor="left",
+                                 font=dict(size=10, color="#7f8798")),
                       xaxis=dict(type="date", showgrid=False, nticks=8,
                                  tickformat=tick, rangeslider=dict(visible=False),
                                  rangebreaks=breaks, fixedrange=False,
@@ -572,6 +559,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 kept = fresh
             for s in kept:
                 s.meta["status"] = setup_status(s, df)
+                s.meta["htf"] = cfg.scan.htf
+                s.meta["ltf"] = cfg.scan.ltf
                 zone = (zu[0] if zu else None) if s.direction == "long" \
                     else (zd[0] if zd else None)
                 s.meta["r"] = _norm(rate(s, ind.loc[s.ts], zone, cfg, stats))
@@ -689,7 +678,8 @@ def cached_radar(exchange, preferred, proxy):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_reversal(exchange, preferred, proxy, symbols):
-    cfg = build_cfg(exchange, 40, 30e6, reversal.LTF, 2.0, 3.5, 0.5, 10000)
+    """Two requests per symbol: 3m and 15m. The pair is then auto-selected."""
+    cfg = build_cfg(exchange, 40, 30e6, "15m", 2.0, 3.5, 0.5, 10000)
     ex, name = _resolve(cfg, preferred, proxy)
     try:
         held = {r["symbol"] for r in paper.open_rows()}
@@ -698,14 +688,14 @@ def cached_reversal(exchange, preferred, proxy, symbols):
     rows = []
     for c in symbols:
         try:
-            hdf, used = _load(ex, f"{c}/USDT:USDT", reversal.HTF, 500, 120)
-            if hdf is None:
-                continue
-            ldf, _ = _load(ex, used, reversal.LTF, 500, 200)
+            ldf, used = _load(ex, f"{c}/USDT:USDT", "3m", 500, 200)
             if ldf is None:
                 continue
-            r = reversal.evaluate(used, _closed(hdf), _closed(ldf), cfg,
-                                  already=used in held)
+            mdf, _ = _load(ex, used, "15m", 500, 200)
+            if mdf is None:
+                continue
+            r = reversal.evaluate(used, {"3m": _closed(ldf), "15m": _closed(mdf)},
+                                  cfg, already=used in held)
             if r:
                 rows.append(r)
         except Exception:
@@ -909,9 +899,9 @@ with T["Overview"]:
                                         "displaylogo": False})
                 st.caption(
                     f"{used} · {detail_tf} · real venue holes collapsed: {gaps}. "
-                    "No candle is invented — the axis hides dead space, the "
-                    "count is printed so you know how much is hidden. "
-                    "Scroll to zoom, drag to pan, double-click to reset.")
+                    "No candle is invented — the axis hides dead space and the "
+                    "count is printed. Drag to zoom, right-drag to pan, "
+                    "double-click to reset.")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
 
@@ -985,7 +975,8 @@ if MODE == "Bot":
             r = _norm(s.meta.get("r"))
             with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
                              f"{s.meta.get('status')}"):
-                st.write(f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
+                st.write(f"**Pair** {s.meta.get('htf')}/{s.meta.get('ltf')} · "
+                         f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
                          f"**TP1** {s.tp1:,.6g} ({s.rr1:.2f}R) · "
                          f"**TP2** {s.tp2:,.6g} ({s.rr2:.2f}R) · "
                          f"weighted {s.weighted_rr:.2f}R")
@@ -994,9 +985,9 @@ if MODE == "Bot":
 with T["SMC"]:
     ui.section("Smart money map",
                "Structure, zones, volume, the trade and its invalidation.")
-    st.caption("Structure is read on **30m (higher timeframe)** and confirmed on "
-               "**3m (lower timeframe)**. The chart timeframe below is display "
-               "only. Scroll to zoom, drag to pan; axes scale independently.")
+    st.caption("Two pivots per timeframe are drawn — yellow HTF, cyan LTF — "
+               "each from the wick to the right edge. Drag horizontally to "
+               "compress/expand time, vertically for price; right-drag to pan.")
     s1, s2, s3 = st.columns([2, 1, 1])
     smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym")
     smc_tf = s2.selectbox("Entry timeframe", ["3m", "5m", "15m", "1h", "4h", "1d"],
@@ -1042,7 +1033,7 @@ with T["SMC"]:
                 ui.stat(k[4], "In value area", "yes" if in_va else "no",
                         "up" if in_va else "warn")
                 st.caption(f"HTF {cfg.scan.htf} · LTF {smc_tf} · {why} · "
-                           f"all claims on closed candles")
+                           f"closed candles only")
 
                 disp = df
                 if chart_minutes(chart_tf) < chart_minutes(smc_tf):
@@ -1051,12 +1042,12 @@ with T["SMC"]:
                         disp = d2
                 st.plotly_chart(chart.build(disp, cfg, side, plan,
                                             chart_tf=chart_tf, analysis_df=cdf,
-                                            htf_df=hdf_c),
+                                            htf_df=hdf_c, ltf_df=cdf,
+                                            pair=(cfg.scan.htf, smc_tf)),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
-                st.caption("Structure, swings and active zones run to the right "
-                           "edge. Gutter: blue = 30m HTF profile, orange = 3m "
-                           "LTF profile, both estimates.")
+                st.caption("Gutter: blue = HTF profile (left half), orange = "
+                           "LTF profile (right half), both estimates.")
                 with st.expander("How to read this chart"):
                     st.markdown(chart.legend_md())
                 st.divider()
@@ -1072,7 +1063,7 @@ with T["SMC"]:
             st.error(f"{type(e).__name__}: {e}")
             st.exception(e)
     st.divider()
-    with st.expander("Full trading logic — the exact timeframes and sequence"):
+    with st.expander("Full trading logic — how the pair is chosen and used"):
         st.markdown(LOGIC_MD)
     st.markdown(smc.READING_ORDER)
 
@@ -1105,17 +1096,16 @@ with T["Radar"]:
 
     st.divider()
     ui.section("Reversal radar",
-               "30m context, 3m trigger. Approaching coins first. Active "
-               "entries are new, confirmed and still in range.")
-    st.caption("Zones from the 30m engine. Confirmation from the existing 3m "
-               "CHoCH/BOS plus the ATR candle grader. Extended moves and coins "
-               "already in the paper book are kept out of the new-entry list. "
-               "All readings use closed candles.")
-    with st.expander("How the statuses are produced"):
+               "Pair auto-selected per coin. Approaching first. Active entries "
+               "are new, confirmed and still in range.")
+    st.caption("Zones from the HTF engine. Confirmation from the LTF CHoCH/BOS "
+               "plus the ATR candle grader. Extended moves and coins already in "
+               "the paper book are kept out. Closed candles only.")
+    with st.expander("How the pair and the statuses are produced"):
         st.markdown(LOGIC_MD)
     if st.button("Scan reversals", key="rev_scan", type="primary"):
         try:
-            with st.spinner("reading 30m context and 3m triggers..."):
+            with st.spinner("scoring pairs and reading structure..."):
                 rows, venue = cached_reversal(exch, exch, proxy.strip() or None,
                                               MAJORS[:12])
             st.session_state["rev_rows"] = rows
@@ -1130,8 +1120,8 @@ with T["Radar"]:
                    f"{len(live)} live · {len(dead)} stale")
         if live:
             st.dataframe(pd.DataFrame([{
-                "status": r["status"], "symbol": r["symbol"],
-                "side": r["direction"],
+                "status": r["status"], "pair": f"{r['htf']}/{r['ltf']}",
+                "symbol": r["symbol"], "side": r["direction"],
                 "zone": f"{r['zone'][0]:,.6g}–{r['zone'][1]:,.6g}",
                 "dist ATR": r["dist_atr"], "entry": f"{r['entry']:,.6g}",
                 "stop": f"{r['stop']:,.6g}", "tp1": f"{r['tp1']:,.6g}",
@@ -1146,15 +1136,15 @@ with T["Radar"]:
             st.info("No new confirmed reversal is still in its entry range.")
         else:
             for r in entries:
-                st.write(f"**{r['symbol']} {r['direction'].upper()}** · entry "
-                         f"{r['entry']:,.6g} · stop {r['stop']:,.6g} · tp1 "
-                         f"{r['tp1']:,.6g} · tp2 {r['tp2']:,.6g} · R:R "
-                         f"{r['rr']:.2f}")
+                st.write(f"**{r['symbol']} {r['direction'].upper()}** "
+                         f"({r['htf']}/{r['ltf']}) · entry {r['entry']:,.6g} · "
+                         f"stop {r['stop']:,.6g} · tp1 {r['tp1']:,.6g} · "
+                         f"tp2 {r['tp2']:,.6g} · R:R {r['rr']:.2f}")
 
         with st.expander(f"Missed / invalidated ({len(dead)})"):
             st.dataframe(pd.DataFrame([{
-                "status": r["status"], "symbol": r["symbol"],
-                "side": r["direction"],
+                "status": r["status"], "pair": f"{r['htf']}/{r['ltf']}",
+                "symbol": r["symbol"], "side": r["direction"],
                 "zone": f"{r['zone'][0]:,.6g}–{r['zone'][1]:,.6g}",
                 "rr": round(r["rr"], 2)} for r in dead]),
                 hide_index=True, use_container_width=True)
@@ -1292,11 +1282,10 @@ if MODE == "Bot":
         ui.section("Reversal alerts",
                    "Early warning 5-10 minutes out, then a separate confirmed "
                    "entry. Reuses the same Telegram credentials.")
-        st.caption("ETA comes from distance divided by the 30m ATR per bar. It "
-                   "is an estimate and drifts when volatility changes. Duplicate "
-                   "and stale alerts are suppressed. Nothing is auto-traded. "
-                   "Polling runs while this tab is open or on button press — "
-                   "there is no background worker.")
+        st.caption("ETA comes from distance divided by the HTF ATR per bar. It "
+                   "is an estimate. Duplicate and stale alerts are suppressed. "
+                   "Nothing is auto-traded. Polling runs while this tab is open "
+                   "or on button press — there is no background worker.")
         a1, a2 = st.columns(2)
         auto = a1.checkbox("Poll automatically", value=False,
                            help="Re-scans every 90s while this tab is open.")
@@ -1307,7 +1296,7 @@ if MODE == "Bot":
             try:
                 rows, _v = cached_reversal(exch, exch, proxy.strip() or None,
                                            MAJORS[:12])
-                cfg = build_cfg(exch, top, min_vol, reversal.LTF, min_rr,
+                cfg = build_cfg(exch, top, min_vol, "15m", min_rr,
                                 max_stop_atr, risk_pct, equity)
                 batch = state.due(rows, cfg.risk.min_rr)
                 state.prune()
@@ -1394,21 +1383,19 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 
 ### Chart timeframes
 The chart selector (1m to 4H) is display-only. It re-reads candles, never the
-strategy. Lower timeframes are fetched directly; higher ones are resampled from
-what is loaded. Structure marks stay 30m major / 3m minor.
+strategy. Lower timeframes are fetched directly, higher ones are resampled.
 
 ### Coin detail gaps
-Sparse history on 1H, 4H and 1D is a venue fact, not a bug. The detail chart
-collapses only the real holes and prints how many it hid, so nothing is
-invented.
+Sparse history on 1H, 4H and 1D is a venue fact. The detail chart collapses
+only real holes and prints how many it hid.
+
+### Chart interaction
+Drag horizontally to compress or expand time. Drag vertically to compress or
+expand price. Right-drag to pan. Double-click to reset. All marks are in
+price/time space and stay locked while you move.
 
 ### Setups vs Analysis
-Setups is the scanner board. Analysis is the point-in-time workflow: dual-layer
-structure, readiness, next action, three chart modes.
-
-### Gates
-`Require MTF` and `Require AVWAP` are strict — turn them on once the board gives
-you more than you can take.
+Setups is the scanner board. Analysis is the point-in-time workflow.
 
 ### Reading a card
 Chart top to bottom: structure, location, liquidity, volume, acceptance, break,
@@ -1427,9 +1414,8 @@ reduce-only at 50% each. Round down to step size. Isolated margin, leverage low
 enough that liquidation sits past the stop.
 
 ### Volume profile
-The right-hand gutter is an OHLCV estimate, not tick data. Blue is 30m context,
-orange is 3m trigger. Bars carry no trade direction, so volume is spread evenly
-across each bar's range.
+The right-hand gutter is an OHLCV estimate. Blue is HTF context, orange is LTF
+trigger.
 """)
 
 st.divider()

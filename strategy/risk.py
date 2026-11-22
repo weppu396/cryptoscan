@@ -3,8 +3,23 @@ import numpy as np
 from core.regime import regime_ok
 
 
+def plan_rr(entry, stop, tp1, tp2, split=0.5) -> dict:
+    """Per-target and weighted R. Direction-agnostic: BUY and SELL both work.
+
+    `split` is the fraction taken at TP1. The weighted figure is the R you
+    actually expect if both legs fill, and is the honest headline number.
+    """
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return {"risk": 0.0, "rr1": 0.0, "rr2": 0.0, "weighted": 0.0}
+    rr1 = abs(tp1 - entry) / risk
+    rr2 = abs(tp2 - entry) / risk
+    split = min(max(split, 0.0), 1.0)
+    return {"risk": risk, "rr1": rr1, "rr2": rr2,
+            "weighted": split * rr1 + (1.0 - split) * rr2}
+
+
 def score_setup(s, ind_row, zone, cfg) -> float:
-    """0-100 ranking score. Higher = cleaner confluence. Ranking beats binary."""
     pts = 0.0
     pts += min(s.rr / 3.0, 1.0) * 25
     pts += 25 if cfg.risk.min_stop_atr <= s.stop_atr <= 1.5 else 10
@@ -44,8 +59,6 @@ def gate(s, ind_row, cfg) -> tuple[bool, list[str]]:
 
 
 def filter_setups(setups, ind, zones_up, zones_dn, cfg):
-    """One shared filter used by BOTH scanner and backtest. Indicators are
-    looked up at the setup's OWN timestamp. Builder meta is preserved."""
     out = []
     for s in setups:
         try:

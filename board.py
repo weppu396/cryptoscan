@@ -5,6 +5,7 @@ import pandas as pd
 import chart
 import paper
 import ui
+from core.tfs import CHART_TFS, chart_minutes, data_tf
 
 
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
@@ -20,9 +21,20 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
             if df is None:
                 st.caption("chart: not enough candles")
             else:
+                idx = CHART_TFS.index(ltf) if ltf in CHART_TFS else 3
+                ctf = st.selectbox("Chart timeframe", CHART_TFS, index=idx,
+                                   key=f"ctf{s.symbol}",
+                                   help="Display only. Structure and the plan "
+                                        "stay on the analysis timeframe.")
+                disp = df
+                if chart_minutes(ctf) < chart_minutes(ltf):
+                    d2, _v = load_fn(ex, s.symbol, data_tf(ctf), 400)
+                    if d2 is not None:
+                        disp = d2
                 plan = {"entry": s.entry, "sl": s.stop, "tp1": s.tp1,
                         "tp2": s.tp2}
-                st.plotly_chart(chart.build(df, cfg, s.direction, plan),
+                st.plotly_chart(chart.build(disp, cfg, s.direction, plan,
+                                            chart_tf=ctf, analysis_df=df),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 with st.expander("How to read this chart"):

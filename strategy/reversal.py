@@ -1,11 +1,12 @@
-"""strategy/reversal.py - auto-selected timeframe pair.
+"""strategy/reversal.py - auto-selected pair, HTF capped at 1h.
 
-No fixed 30m/3m. Three candidate pairs are scored on how cleanly the market is
-structured (swing separation in ATR, swing density, volatility band) and the
-clearest is used. 30m and 1h are resampled from 15m, so no lower timeframe is
-ever invented.
+The higher timeframe is chosen from 15m / 30m / 1h by structure quality, never
+above 1h. The lower timeframe is then chosen from the legal triggers for that
+HTF by running the full assessment on each and keeping the best setup.
 
-Confirmation reuses core.candles.quality — the existing ATR grader.
+30m and 1h are resampled from the loaded 15m frame, so a lower timeframe is
+never invented. Confirmation reuses core.candles.quality, the existing ATR
+grader.
 """
 import numpy as np
 
@@ -13,7 +14,7 @@ from core.candles import quality as candle_quality
 from core.indicators import compute_all
 from core.levels import build_zones
 from core.structure import build_structure, find_swings
-from core.tfs import resample
+from core.tfs import MINUTES, cap_htf, resample
 
 APPROACH_ATR = 1.5
 WATCH_ATR = 6.0
@@ -23,11 +24,18 @@ EXT_LOOKBACK = 12
 CONFIRM_WINDOW = 15
 MIN_CANDLE_Q = 60
 
-# (htf, ltf, htf_source) - source tells us which loaded frame to use
-PAIRS = (("15m", "3m", "15m"), ("30m", "15m", "15m"), ("1h", "30m", "15m"))
+# loaded frames the caller must supply
+BASE = "15m"
+SCALP = "3m"
+
+# HTF is capped at 1h by cap_htf(). LTFs are the legal triggers per HTF.
+HTF_CHOICES = ("15m", "30m", "1h")
+LTF_FOR = {"15m": ("3m",), "30m": ("3m", "15m"), "1h": ("15m", "30m")}
+COARSE = ("30m", "1h")
 
 STATUSES = ("APPROACHING", "DEVELOPING", "CONFIRMED", "ACTIVE_ENTRY",
             "MISSED", "INVALIDATED")
+FUTURE_STATUSES = ("APPROACHING", "DEVELOPING", "ACTIVE_ENTRY")
 RANK = {"ACTIVE_ENTRY": 100, "CONFIRMED": 78, "DEVELOPING": 52,
         "APPROACHING": 34, "MISSED": 12, "INVALIDATED": 0}
 
@@ -40,17 +48,19 @@ def _atr(df, cfg) -> float:
         return 0.0
 
 
-def _frame(src: dict, name: str, source: str):
-    """The loaded frame, or a resample of its parent when `name` is coarser."""
-    if name == source:
-        return src.get(name)
-    parent = src.get(source)
-    if parent is None or not len(parent):
-        return None
-    try:
-        return resample(parent, name)
-    except Exception:
-        return None
+def _frame(src: dict, name: str):
+    """Loaded frame, or a resample of 15m when `name` is coarser."""
+    if name in src and src[name] is not None:
+        return src[name]
+    if name in COARSE:
+        base = src.get(BASE)
+        if base is None or not len(base):
+            return None
+        try:
+            return resample(base, name)
+        except Exception:
+            return None
+    return None
 
 
 def quality(hdf, ldf, cfg) -> float:
@@ -75,16 +85,16 @@ def quality(hdf, ldf, cfg) -> float:
     return q
 
 
-def choose_pair(src: dict, cfg) -> tuple:
-    """(htf, ltf, quality) for the clearest available pair."""
-    best = (PAIRS[0][0], PAIRS[0][1], -1.0)
-    for htf, ltf, source in PAIRS:
-        h = _frame(src, htf, source)
-        l = src.get(ltf)
-        q = quality(h, l, cfg)
-        if q > best[2]:
-            best = (htf, ltf, q)
-    return best
+def choose_htf(src: dict, cfg) -> str | None:
+    """Highest-scoring HTF, never above the 1h ceiling."""
+    best, best_q = None, -1.0
+    for htf in HTF_CHOICES:
+        htf = cap_htf(htf)
+        ltf = LTF_FOR[htf][0]
+        q = quality(_frame(src, htf), _frame(src, ltf), cfg)
+        if q > best_q:
+            best, best_q = htf, q
+    return best if best_q >= 0 else None
 
 
 def _candidate(zones, price, atr, long):
@@ -115,14 +125,10 @@ def _targets(zones, entry, risk, long, cap_r):
     return tp1, max(tp2, entry - cap_r * risk)
 
 
-def evaluate(symbol, src: dict, cfg, already: bool = False):
-    """One coin. `src` holds at least '3m' and '15m'."""
-    htf, ltf, q = choose_pair(src, cfg)
-    hdf = _frame(src, htf, dict((p[0], p[2]) for p in PAIRS)[htf])
-    ldf = src.get(ltf)
+def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
+    """One HTF/LTF combination. Dict, or None when not worth a row."""
     if hdf is None or ldf is None or len(hdf) < 60 or len(ldf) < 120:
         return None
-
     ah, al = _atr(hdf, cfg), _atr(ldf, cfg)
     if ah <= 0 or al <= 0:
         return None
@@ -190,10 +196,17 @@ def evaluate(symbol, src: dict, cfg, already: bool = False):
     else:
         status = "APPROACHING"
 
+    # executable from here forward: not already played, not extended,
+    # reward still worth taking, and not already in the book
+    future = (status in FUTURE_STATUSES and rr >= cfg.risk.min_rr
+              and not extended and not already)
+
     score = RANK[status] + 6.0 * min(int(zone.get("touches", 1)), 4)
     score += min(rr, cfg.risk.max_tp_r) * 4.0 + (10.0 if sweep else 0.0)
     score += max(q, 0.0) * 0.5
     score -= min(dist, 8.0) * 2.5 + (15.0 if extended else 0.0)
+    if not future:
+        score -= 12.0
 
     reasons = [f"pair {htf}/{ltf}"]
     if sweep:
@@ -206,25 +219,54 @@ def evaluate(symbol, src: dict, cfg, already: bool = False):
         reasons.append(f"R:R {rr:.2f}")
     if already:
         reasons.append("in book")
+    reasons.append("executable" if future else "past / played")
 
     return {"symbol": symbol, "direction": "long" if long else "short",
             "status": status, "zone": (zone["low"], zone["high"]),
             "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2, "rr": rr,
-            "score": round(score, 1), "is_new": not already,
+            "score": round(score, 1), "is_new": not already, "future": future,
             "htf": htf, "ltf": ltf, "pair_q": round(max(q, 0.0), 1),
-            "eta_min": round(dist * 30.0, 1) if status == "APPROACHING" else None,
+            "eta_min": (round(dist * MINUTES.get(htf, 60), 1)
+                        if status == "APPROACHING" else None),
             "bias": bias, "dist_atr": round(dist, 2),
             "reasons": reasons, "ts": ldf.index[-1]}
 
 
+def evaluate(symbol, src: dict, cfg, already: bool = False):
+    """One coin. HTF by structure, then the LTF whose setup scores highest."""
+    htf = choose_htf(src, cfg)
+    if htf is None:
+        return None
+    hdf = _frame(src, htf)
+    if hdf is None or len(hdf) < 60:
+        return None
+    q = quality(hdf, _frame(src, LTF_FOR[htf][0]), cfg)
+    best = None
+    for ltf in LTF_FOR[htf]:
+        r = _assess(symbol, hdf, _frame(src, ltf), htf, ltf, cfg, already, q)
+        if r is None:
+            continue
+        if best is None or r["score"] > best["score"]:
+            best = r
+    return best
+
+
 def rank(rows):
+    """(live, dead). Executable first, never a played setup above a live one."""
     live = [r for r in rows if r["status"] in
             ("ACTIVE_ENTRY", "CONFIRMED", "DEVELOPING", "APPROACHING")]
     dead = [r for r in rows if r["status"] in ("MISSED", "INVALIDATED")]
-    live.sort(key=lambda r: (-r["score"], r["eta_min"] or 9e9))
+    live.sort(key=lambda r: (not r.get("future", False),
+                             -r["score"], r["eta_min"] or 9e9))
     dead.sort(key=lambda r: -r["score"])
     return live, dead
 
 
+def future_only(rows):
+    """Only setups a limit order could still fill."""
+    return [r for r in rows if r.get("future")]
+
+
 def active_entries(rows):
-    return [r for r in rows if r["status"] == "ACTIVE_ENTRY" and r["is_new"]]
+    return [r for r in rows if r["status"] == "ACTIVE_ENTRY" and r["is_new"]
+            and r.get("future")]

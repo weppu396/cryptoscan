@@ -3,6 +3,10 @@
 Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves,
 bounded history with a short initial window, all marks to the right edge, both
 axes free for independent zoom, HTF capped at 1h and LTF at 5m.
+
+Swings, events and sweeps reach this module in three different shapes: Swing
+objects, StructureEvent objects, and plain dicts from smc. Every read goes
+through _sv() so a dict can never raise AttributeError again.
 """
 import numpy as np
 import pandas as pd
@@ -40,6 +44,51 @@ MAX_MARKS = {Layer.EXTERNAL: 2, Layer.INTERNAL: 2}
 DEFAULT_BARS = 110
 MAX_TRACE = 1200
 OHLC = ("open", "high", "low", "close")
+
+
+# --------------------------------------------------------------------------- #
+# shape-agnostic reads. dict, Swing or StructureEvent all work.
+# --------------------------------------------------------------------------- #
+def _sv(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        v = obj.get(key, default)
+    else:
+        v = getattr(obj, key, default)
+    return default if v is None else v
+
+
+def _lay(obj):
+    v = _sv(obj, "layer", "")
+    return getattr(v, "value", v)
+
+
+def _lab(obj):
+    v = _sv(obj, "label", "")
+    return getattr(v, "value", v)
+
+
+def _swings(frame):
+    return list(getattr(frame, "swings", None) or [])
+
+
+def _live(frame, t):
+    fn = getattr(frame, "live", None)
+    if callable(fn):
+        try:
+            return list(fn(t))
+        except Exception:
+            pass
+    out = []
+    for e in getattr(frame, "events", None) or []:
+        if _sv(e, "confirm_idx", 10 ** 9) > t:
+            continue
+        inv = _sv(e, "invalidated_at")
+        if inv is not None and t >= inv:
+            continue
+        out.append(e)
+    return out
 
 
 def _clean(df):
@@ -198,32 +247,42 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         decreasing_line_color=DN, decreasing_line_width=1.2, decreasing_fillcolor=DN,
         whiskerwidth=0.6, showlegend=False), row=1, col=1)
 
+    swings = _swings(frame)
+
     for layer in (Layer.EXTERNAL, Layer.INTERNAL):
         key = "ext_swing" if layer == Layer.EXTERNAL else "int_swing"
-        if key in on:
-            pts = [s for s in frame.swings if s.layer == layer
-                   and adf.index[s.idx] >= start]
-            for s in pts:
-                fig.add_trace(go.Scatter(
-                    x=[adf.index[s.idx]], y=[s.price], mode="markers",
-                    marker=dict(symbol="triangle-down" if s.kind == "H"
-                                else "triangle-up", size=5, color=MUT,
-                                opacity=.4), showlegend=False), row=1, col=1)
+        if key not in on:
+            continue
+        for s in swings:
+            if _lay(s) != layer.value:
+                continue
+            idx = _sv(s, "idx")
+            if idx is None or int(idx) >= len(adf) or adf.index[int(idx)] < start:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[adf.index[int(idx)]], y=[float(_sv(s, "price"))],
+                mode="markers",
+                marker=dict(symbol="triangle-down" if _sv(s, "kind") == "H"
+                            else "triangle-up", size=5, color=MUT,
+                            opacity=.4), showlegend=False), row=1, col=1)
 
     if "breaks" in on:
         for layer in (Layer.EXTERNAL, Layer.INTERNAL):
-            live = [e for e in frame.live(t) if e.layer == layer
-                    and adf.index[e.break_idx] >= start
-                    and e.confirm_idx <= len(adf) - 2]
-            live = thin([{"ts": adf.index[e.break_idx], "level": e.level, "e": e}
-                         for e in live], 0.0)
+            live = [e for e in _live(frame, t) if _lay(e) == layer.value
+                    and int(_sv(e, "break_idx", 0)) < len(adf)
+                    and adf.index[int(_sv(e, "break_idx", 0))] >= start
+                    and int(_sv(e, "confirm_idx", 0)) <= len(adf) - 2]
+            live = thin([{"ts": adf.index[int(_sv(e, "break_idx", 0))],
+                          "level": float(_sv(e, "level")), "e": e} for e in live],
+                        0.0)
             w, col = STYLE[layer]
             for row in live[-MAX_MARKS[layer]:]:
                 e = row["e"]
-                c = WARN if (e.label.value == "CHoCH"
+                c = WARN if (_lab(e) == "CHoCH"
                              and layer == Layer.EXTERNAL) else col
-                _struct(fig, adf.index[e.break_idx], e.level, right, c, w,
-                        f"{e.direction.upper()}", e.label.value)
+                _struct(fig, adf.index[int(_sv(e, "break_idx", 0))],
+                        float(_sv(e, "level")), right, c, w,
+                        f"{_sv(e, 'direction', '').upper()}", _lab(e))
 
     if "zones" in on:
         try:
@@ -237,30 +296,35 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     if "fvg" in on:
         for g in [g for g in smc.fair_value_gaps(adf)
-                  if g["dir"] == ("bull" if long else "bear")][:2]:
-            if adf.index[g["idx"]] < start:
+                  if _sv(g, "dir") == ("bull" if long else "bear")][:2]:
+            idx = int(_sv(g, "idx", 0))
+            if adf.index[idx] < start:
                 continue
-            fig.add_shape(type="rect", row=1, col=1, x0=adf.index[g["idx"]], x1=right,
-                          y0=g["bot"], y1=g["top"], line=dict(width=0),
+            fig.add_shape(type="rect", row=1, col=1, x0=adf.index[idx], x1=right,
+                          y0=float(_sv(g, "bot")), y1=float(_sv(g, "top")),
+                          line=dict(width=0),
                           fillcolor="rgba(22,199,132,0.05)" if long
                           else "rgba(234,57,67,0.05)")
 
     if "sweeps" in on:
         for s in [s for s in smc.liquidity_sweeps(adf)
-                  if s["dir"] == ("bull" if long else "bear")][:3]:
-            if adf.index[s["idx"]] < start:
+                  if _sv(s, "dir") == ("bull" if long else "bear")][:3]:
+            idx = int(_sv(s, "idx", 0))
+            if adf.index[idx] < start:
                 continue
-            fig.add_trace(go.Scatter(x=[adf.index[s["idx"]]], y=[s.level],
+            fig.add_trace(go.Scatter(x=[adf.index[idx]],
+                                     y=[float(_sv(s, "level"))],
                                      mode="markers",
                                      marker=dict(symbol="x", size=9, color=WARN),
                                      showlegend=False), row=1, col=1)
 
     if "avwap" in on:
         try:
-            pool = [s for s in frame.swings if s.layer == Layer.EXTERNAL
-                    and s.kind == ("L" if long else "H") and s.confirmed_at <= t]
+            pool = [s for s in swings if _lay(s) == Layer.EXTERNAL.value
+                    and _sv(s, "kind") == ("L" if long else "H")
+                    and int(_sv(s, "confirmed_at", 0)) <= t]
             if pool:
-                line = anchored_vwap(adf, pool[-1].idx).tail(len(hist))
+                line = anchored_vwap(adf, int(_sv(pool[-1], "idx"))).tail(len(hist))
                 fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",
                                          line=dict(color=TEAL, width=1.2, dash="dash"),
                                          opacity=.75), row=1, col=1)

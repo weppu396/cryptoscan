@@ -8,8 +8,19 @@ cfg.struct so they are tunable. A pivot at i is knowable at i+right and never
 earlier. Swings are anchored to the WICK (high for H, low for L), which is the
 only honest anchor for a structure line.
 
-Non-repainting: swings confirm at i+right, events confirm at the break bar's
-close, invalidation is stamped at the bar it happens. Nothing reads forward.
+Break rules, non-repainting:
+
+* A level is armed only by a pivot whose bar formed AFTER the previous break, so
+  a stale pivot can never be re-used.
+* A level can only break on a bar strictly AFTER the bar that confirmed it, so
+  nothing fires on the confirmation bar itself.
+* The armed level ratchets: highs only replace when higher, lows only when
+  lower. A bullish BOS therefore originates from the confirmed HH and a bearish
+  BOS from the confirmed LL, not from whatever pivot happened to print last.
+* A break requires a CLOSE beyond the level (cfg.struct.close_based).
+
+Events confirm at the break bar's close, invalidation is stamped at the bar it
+happens. Nothing reads forward.
 """
 import numpy as np
 import pandas as pd
@@ -75,7 +86,9 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
     state_arr[:] = "unclear"
     ranging = np.zeros(n, bool)
 
-    armed_h = armed_l = None
+    bull = None          # (level, armed_at, swing) — highest confirmed high
+    bear = None          # (level, armed_at, swing) — lowest confirmed low
+    last_break = -1
     last_h, last_l = [], []
     events = []
 
@@ -88,38 +101,44 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
             tol = tol_at(t)
             if s.kind == "H":
                 last_h = (last_h + [s])[-2:]
-                if armed_h is None:
-                    armed_h = s
-                elif abs(s.price - armed_h.price) <= tol:
-                    if s.price > armed_h.price:
-                        armed_h = s
-                else:
-                    armed_h = s
+                if s.idx > last_break:
+                    if bull is None:
+                        bull = (s.price, t, s)
+                    elif abs(s.price - bull[0]) <= tol:
+                        if s.price > bull[0]:
+                            bull = (s.price, t, s)
+                    elif s.price > bull[0]:
+                        bull = (s.price, t, s)
             else:
                 last_l = (last_l + [s])[-2:]
-                if armed_l is None:
-                    armed_l = s
-                elif abs(s.price - armed_l.price) <= tol:
-                    if s.price < armed_l.price:
-                        armed_l = s
-                else:
-                    armed_l = s
+                if s.idx > last_break:
+                    if bear is None:
+                        bear = (s.price, t, s)
+                    elif abs(s.price - bear[0]) <= tol:
+                        if s.price < bear[0]:
+                            bear = (s.price, t, s)
+                    elif s.price < bear[0]:
+                        bear = (s.price, t, s)
 
         if len(last_h) == 2 and len(last_l) == 2:
             et = tol_at(t)
             ranging[t] = (abs(last_h[0].price - last_h[1].price) <= et
                           and abs(last_l[0].price - last_l[1].price) <= et)
 
-        if armed_h is not None and up_probe[t] > armed_h.price:
-            s, armed_h = armed_h, None
+        if bull is not None and t > bull[1] and up_probe[t] > bull[0]:
+            level, _at, s = bull
+            bull = None
+            last_break = t
             label, state = TRANSITION[(state, "bull")]
             events.append(StructureEvent(new_id(), sym, tf, layer, label, "bull",
-                                         s.price, s.idx, t, t, None, state))
-        elif armed_l is not None and dn_probe[t] < armed_l.price:
-            s, armed_l = armed_l, None
+                                         level, s.idx, s.idx, t, None, state))
+        elif bear is not None and t > bear[1] and dn_probe[t] < bear[0]:
+            level, _at, s = bear
+            bear = None
+            last_break = t
             label, state = TRANSITION[(state, "bear")]
             events.append(StructureEvent(new_id(), sym, tf, layer, label, "bear",
-                                         s.price, s.idx, t, t, None, state))
+                                         level, s.idx, s.idx, t, None, state))
 
         state_arr[t] = state
 

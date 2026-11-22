@@ -1,14 +1,14 @@
-"""chart.py - renderer shim. Builds the frame from cfg, then defers to chart2.
+"""chart.py - renderer shim. One frame per layer, then defers to chart2.
 
-Kept so every existing call site (SMC tab, setups board) renders the same chart
-with the same pan/zoom behaviour, structure lines and zones. `cfg` is the second
-positional argument, `plan` may use "sl" or "stop".
+The HTF frame feeds EXTERNAL only and the LTF frame feeds INTERNAL only, so an
+opposing higher and lower timeframe can coexist on one chart. `cfg` is the
+second positional argument; `plan` may use "sl" or "stop".
 """
 import streamlit as st
 
 import chart2
 import core.structure2 as s2
-from core.models import StructureFrame
+from core.models import Layer, StructureFrame
 from core.tfs import CHART_TFS
 
 DEFAULT = "30m"
@@ -25,9 +25,10 @@ def legend_md() -> str:
 **Reading the map**
 
 - Yellow lines: higher-timeframe structure, from the pivot wick to the right edge.
-- Cyan lines: lower-timeframe structure, same anchoring.
-- `BOS` continues the trend. `CHoCH` is the first break against it.
-- Rose zones are supply, mint zones are demand, both labelled with timeframe,
+- Cyan lines: lower-timeframe structure, same anchoring. The two run independently.
+- `BOS` continues that layer's trend. `CHoCH` is the first break against it.
+- `HH` / `HL` / `LH` / `LL` label each confirmed pivot; `EQH` / `EQL` mark equals.
+- Rose zones are supply, mint zones are demand, labelled with timeframe,
   multiple, price band and traded volume.
 - Blue profile is HTF context, orange is LTF trigger. Both live in the right
   gutter and never overlap the candles.
@@ -36,14 +37,43 @@ def legend_md() -> str:
 """
 
 
+def _layer_frame(df, cfg, tf):
+    if df is None or not len(df):
+        return None
+    try:
+        return s2.run(df, "", tf, cfg)
+    except Exception:
+        return None
+
+
+def merge_frames(ext_df, int_df, cfg, htf_tf: str, ltf_tf: str) -> StructureFrame:
+    """One frame, two independent sources. External never leaks into internal."""
+    frame = StructureFrame()
+    ext = _layer_frame(ext_df, cfg, htf_tf)
+    inn = _layer_frame(int_df, cfg, ltf_tf)
+    for f, layer in ((ext, Layer.EXTERNAL), (inn, Layer.INTERNAL)):
+        if f is None:
+            continue
+        frame.events.extend(e for e in f.events if e.layer == layer)
+        frame.swings.extend(s for s in f.swings if s.layer == layer)
+        frame.state[layer.value] = f.state.get(layer.value, [])
+    base = inn or ext
+    if base is not None:
+        frame.ranging = list(base.ranging)
+    frame.events.sort(key=lambda e: (e.confirm_idx, e.layer.value))
+    return frame
+
+
 def build(df, cfg, direction, plan=None, chart_tf=None, analysis_df=None,
           htf_df=None, ltf_df=None, pair=None, bars=chart2.DEFAULT_BARS):
     adf = analysis_df if analysis_df is not None else df
-    frame = StructureFrame()
-    try:
-        frame = s2.run(adf, "", str(chart_tf or ""), cfg)
-    except Exception:
-        pass
+    htf_tf, ltf_tf = pair if pair else ("30m", "3m")
+    frame = merge_frames(htf_df, ltf_df, cfg, htf_tf, ltf_tf)
+    frames = {}
+    if htf_df is not None and len(htf_df):
+        frames[Layer.EXTERNAL] = htf_df
+    if ltf_df is not None and len(ltf_df):
+        frames[Layer.INTERNAL] = ltf_df
     p = None
     if plan:
         p = {"entry": plan.get("entry"),
@@ -51,4 +81,4 @@ def build(df, cfg, direction, plan=None, chart_tf=None, analysis_df=None,
              "tp1": plan.get("tp1"), "tp2": plan.get("tp2")}
     return chart2.build(df, frame, direction, p, mode="analysis", bars=bars,
                         chart_tf=chart_tf, analysis_df=adf, htf_df=htf_df,
-                        ltf_df=ltf_df, pair=pair, cfg=cfg)
+                        ltf_df=ltf_df, pair=pair, cfg=cfg, frames=frames)

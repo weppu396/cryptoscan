@@ -1,15 +1,14 @@
-"""core/tfs.py - display timeframes. Display only; the strategy is fixed.
+"""core/tfs.py - display timeframes. Display only; the strategy owns its pair.
 
-Strategy is always 30m context / 3m trigger. Changing the chart timeframe
-never changes what the engine reads.
+The higher timeframe is never allowed above the 1h ceiling. Changing the chart
+timeframe never changes what the engine reads.
 """
 
 CHART_TFS = ["1m", "3m", "5m", "15m", "30m", "1H", "4H"]
 DATA_TF = {"1H": "1h", "4H": "4h"}
 MINUTES = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "4H": 240}
 
-STRAT_HTF = "30m"
-STRAT_LTF = "3m"
+HTF_CEILING_MIN = 60
 
 _RULE = {"1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min",
          "30m": "30min", "1H": "1h", "4H": "4h"}
@@ -30,6 +29,11 @@ def data_tf(tf: str) -> str:
 
 def chart_minutes(tf: str) -> int:
     return MINUTES.get(tf, 60)
+
+
+def cap_htf(tf: str) -> str:
+    """Never return a higher timeframe above the 1h ceiling."""
+    return tf if chart_minutes(tf) <= HTF_CEILING_MIN else "1h"
 
 
 def can_resample_to(src: str, dst: str) -> bool:

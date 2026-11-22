@@ -1,10 +1,8 @@
 """chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
 
-Same layout contract as chart.py: candles 0-82% on a datetime axis, profile
-gutter 84.5-100% on its own numeric axis. Traces use 'x2', layout uses 'xaxis2'.
-
-Spacing comes from the median gap, and the x range is pinned, so no tail gap
-can collapse the candles into a stripe.
+Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves
+(30m HTF blue right, 3m LTF orange left). All structure and zone marks run to
+the right edge. Both axes are free for independent zoom.
 """
 import numpy as np
 import pandas as pd
@@ -26,15 +24,15 @@ LAYERS = {
                  "vp", "avwap"},
     "execution": {"candles", "zone", "plan"},
 }
-STYLE = {Layer.EXTERNAL: (1.6, "rgba(96,152,255,0.60)"),
-         Layer.INTERNAL: (1.0, "rgba(140,148,160,0.32)")}
-VP_HTF = "rgba(96,152,255,0.20)"
-VP_LTF = "rgba(20,184,166,0.14)"
-PRICE_DOMAIN = [0.0, 0.82]
-PROFILE_DOMAIN = [0.845, 1.0]
+STYLE = {Layer.EXTERNAL: (1.6, "rgba(96,152,255,0.55)"),
+         Layer.INTERNAL: (1.0, "rgba(140,148,160,0.28)")}
+VP_HTF = "rgba(96,152,255,0.22)"
+VP_LTF = "rgba(240,140,11,0.20)"
+PRICE_DOMAIN = [0.0, 0.76]
+PROFILE_DOMAIN = [0.785, 1.0]
+HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
 MAX_MARKS = {Layer.EXTERNAL: 2, Layer.INTERNAL: 3}
 DEFAULT_BARS = 110
-MARK_BARS = 6
 OHLC = ("open", "high", "low", "close")
 
 
@@ -59,7 +57,6 @@ def _clean(df):
 
 
 def _step(df):
-    """Median positive bar gap."""
     if len(df) < 3:
         return pd.Timedelta(0)
     d = pd.Series(df.index).diff().dropna()
@@ -91,12 +88,15 @@ def _gutter(fig):
     return prop.replace("axis", ""), prop
 
 
-def _profile(fig, df, bars, color, axis):
+def _profile(fig, df, bars, color, axis, side):
+    b0, b1 = HALF[side]
+    span = b1 - b0
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
     if not vp or not len(vp["centers"]):
         return
     step = float(vp["centers"][1] - vp["centers"][0]) if len(vp["centers"]) > 1 else 0.0
-    fig.add_trace(go.Bar(y=vp["centers"], x=vp["hist"], orientation="h",
+    fig.add_trace(go.Bar(y=vp["centers"], x=vp["hist"] * span, base=b0,
+                         orientation="h",
                          marker=dict(color=color, line=dict(width=0)),
                          width=step * 0.9 if step else None,
                          hoverinfo="skip", showlegend=False), row=1, col=1)
@@ -104,26 +104,27 @@ def _profile(fig, df, bars, color, axis):
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
                                  (vp["vah"], MUT, "VAH", "dot"),
                                  (vp["val"], MUT, "VAL", "dot")):
-        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=1,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b1,
                       y0=lvl, y1=lvl, line=dict(color=tone, width=1, dash=dash))
-        fig.add_annotation(xref="paper", yref="y", x=PRICE_DOMAIN[1], y=lvl,
-                           text=tag, showarrow=False, xanchor="right",
-                           font=dict(size=7, color=tone), opacity=0.8)
+        if side == "htf":
+            fig.add_annotation(xref="paper", yref="y", x=PROFILE_DOMAIN[1], y=lvl,
+                               text=tag, showarrow=False, xanchor="right",
+                               font=dict(size=7, color=tone), opacity=0.85)
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.45,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.45,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.32)", width=1))
+                      line=dict(color="rgba(150,150,160,0.34)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.22,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.22,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.18)", width=1))
+                      line=dict(color="rgba(150,150,160,0.20)", width=1))
 
 
-def _mark(fig, ts, level, step, color, width, label=None, yshift=0):
-    fig.add_shape(type="line", row=1, col=1, x0=ts, x1=ts + step * MARK_BARS,
+def _mark(fig, x0, x1, level, color, width, label=None, yshift=0):
+    fig.add_shape(type="line", row=1, col=1, x0=x0, x1=x1,
                   y0=level, y1=level, line=dict(color=color, width=width))
     if label:
-        fig.add_annotation(x=ts, y=level, row=1, col=1, text=label,
+        fig.add_annotation(x=x0, y=level, row=1, col=1, text=label,
                            showarrow=False, xanchor="left", yshift=yshift,
                            font=dict(size=8, color=color))
 
@@ -174,6 +175,10 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         if key in on:
             pts = [s for s in frame.swings if s.layer == layer
                    and adf.index[s.idx] >= view.index[0]]
+            for s in pts:
+                fig.add_shape(type="line", row=1, col=1, x0=adf.index[s.idx],
+                              x1=right, y0=s.price, y1=s.price,
+                              line=dict(color="rgba(140,148,160,0.18)", width=1))
             for kind, sym in (("H", "triangle-down"), ("L", "triangle-up")):
                 sub = [s for s in pts if s.kind == kind]
                 if sub:
@@ -200,7 +205,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 if layer == Layer.EXTERNAL:
                     side = "Bullish" if e.direction == "bull" else "Bearish"
                     label = f"{side} {e.label.value}"
-                _mark(fig, adf.index[e.break_idx], e.level, step, col, w, label,
+                _mark(fig, adf.index[e.break_idx], right, e.level, col, w, label,
                       9 if e.direction == "bull" else -9)
 
     if "zones" in on:
@@ -249,11 +254,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if "vp" in on:
         try:
             if htf_df is not None and len(htf_df) >= 30:
-                _profile(fig, htf_df, bars * 2, VP_HTF, gutter_ref)
+                _profile(fig, htf_df, bars * 2, VP_HTF, gutter_ref, "htf")
         except Exception:
             pass
         try:
-            _profile(fig, adf, bars, VP_LTF, gutter_ref)
+            _profile(fig, adf, bars, VP_LTF, gutter_ref, "ltf")
         except Exception:
             pass
 
@@ -278,23 +283,24 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if x_lo >= right:
         right = x_lo + (step or pd.Timedelta(minutes=1)) * 6
 
-    fig.update_layout(height=620, template="plotly_dark", paper_bgcolor=BG,
-                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=34, b=22),
+    fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
+                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=40, b=22),
                       showlegend=False, hovermode="x unified", dragmode="pan",
-                      title=dict(text=f"chart {chart_tf or ''} · profile = "
-                                      f"OHLCV estimate", x=0, xanchor="left",
-                                 font=dict(size=10, color=MUT)),
+                      title=dict(text=f"chart {chart_tf or ''} · gutter: blue = "
+                                      f"30m HTF, orange = 3m LTF (estimate)",
+                                 x=0, xanchor="left", font=dict(size=10, color=MUT)),
                       xaxis=dict(domain=PRICE_DOMAIN, type="date",
                                  showgrid=False, range=[x_lo, right], nticks=8,
                                  tickformat=_tick(chart_tf),
-                                 rangeslider=dict(visible=False)))
+                                 rangeslider=dict(visible=False),
+                                 fixedrange=False, constrain="range"))
     fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
                                           range=[0, 1], type="linear",
                                           showgrid=False, showticklabels=False,
                                           zeroline=False, fixedrange=True)})
     if y_range:
-        fig.update_layout(yaxis=dict(range=y_range))
+        fig.update_layout(yaxis=dict(range=y_range, fixedrange=False))
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
-                     tickformat=",.6g")
+                     tickformat=",.6g", fixedrange=False)
     return fig

@@ -3,9 +3,9 @@
 Candles 0-76% on a datetime axis. Profile gutter 78.5-100% in two halves,
 HTF left-in-gutter blue, LTF right-in-gutter orange, own numeric axis.
 
-History: the trace carries the WHOLE loaded frame (capped at MAX_TRACE) and only
-the initial view is DEFAULT_BARS. Zooming out therefore reveals real earlier
-candles instead of empty space.
+History: the trace carries ZOOM_TRACE bars and only the initial view is
+DEFAULT_BARS, so zooming out reveals real earlier candles. The trace is bounded
+so overlays like the anchored VWAP cannot stretch the axis back to old data.
 
 Structure: exactly two pivots per timeframe, four total. Up = HH + HL, down =
 LH + LL, range = H + L. Each line starts on the pivot wick, runs to the right
@@ -205,8 +205,8 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     if ltf_df is None:
         ltf_df = adf
 
-    # full history in the trace, short initial window
-    hist = df.tail(MAX_TRACE)
+    # bounded history in the trace, short initial window
+    hist = df.tail(min(MAX_TRACE, max(bars * 8, bars)))
     view = hist.tail(bars)
     step = _step(hist)
     ind = compute_all(adf, cfg)
@@ -361,26 +361,28 @@ def build(df, cfg, direction: str, plan: dict | None = None,
                         f"profile, orange = LTF profile (estimate)",
                    x=0, xanchor="left", font=dict(size=10, color=MUT)),
         xaxis=dict(domain=PRICE_DOMAIN, type="date", showgrid=False,
-                   range=[x_lo, right], nticks=8, tickformat=_tick(chart_tf),
-                   rangeslider=dict(visible=False), fixedrange=False,
-                   constrain="range"))
+                   range=[x_lo, right], autorange=False, nticks=8,
+                   tickformat=_tick(chart_tf), rangeslider=dict(visible=False),
+                   fixedrange=False, constrain="range"))
     fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
                                           range=[0, 1], type="linear",
                                           showgrid=False, showticklabels=False,
                                           zeroline=False, fixedrange=True)})
     if y_range:
-        fig.update_layout(yaxis=dict(range=y_range, fixedrange=False))
+        fig.update_layout(yaxis=dict(range=y_range, autorange=False,
+                                     fixedrange=False))
     fig.update_xaxes(showgrid=False, gridcolor="#1b1f28")
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
                      tickformat=",.6g", fixedrange=False)
     return fig
 
 
-def st_selectbox(key: str, idx: int) -> str:
+def st_selectbox(key: str, idx: int, default: str = "30m") -> str:
     import streamlit as st
     return st.selectbox("Chart timeframe", CHART_TFS, index=idx, key=key,
-                        help="Display only. Structure and the plan use the "
-                             "auto-selected pair, HTF never above 1h.")
+                        help=f"Display only, default {default}. Structure and "
+                             "the plan use the auto-selected pair, HTF never "
+                             "above 1h.")
 
 
 def legend_md() -> str:
@@ -404,17 +406,17 @@ def legend_md() -> str:
 
 The HTF is picked from 15m, 30m or 1h — never above 1h — by how cleanly the
 market is structured. The LTF is then picked from the legal triggers for that
-HTF by running the full assessment on each and keeping the best setup. Both are
-printed in the chart title.
+HTF (3m, 5m or 15m depending on the HTF) by running the full assessment on each
+and keeping the best setup. Both are printed in the chart title.
 
 Exactly two pivots per timeframe, four total. The `x` in a zone label is the
 touch-bar volume against its 20-bar average; anything under 1.3x is dropped, so
 only zones with real participation appear.
 
 **Zoom:** drag horizontally to compress or expand time, drag vertically to
-compress or expand price, right-drag to pan, double-click to reset. The whole
-loaded history is in the chart, so zooming out reveals earlier candles rather
-than empty space.
+compress or expand price, right-drag to pan, double-click to reset. Roughly
+eight windows of history are loaded behind the visible 110 bars, so zooming out
+reveals earlier candles rather than empty space.
 
 Only closed bars produce a pivot. The gutter is an OHLCV estimate.
 """

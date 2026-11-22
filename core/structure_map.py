@@ -1,12 +1,13 @@
-"""core/structure_map.py - pick the few structure marks worth drawing.
+"""core/structure_map.py - the few marks worth drawing.
 
-Detection is core.structure.build_structure. This only ranks, caps and
-de-duplicates. The final bar is dropped so a forming break never shows as
-confirmed.
+Detection stays core.structure. This ranks, caps and labels:
+  * two trend-conforming pivots per timeframe (HH+HL up, LH+LL down)
+  * zones with real volume behind them
+The final bar is dropped so a forming break never shows as confirmed.
 """
 import numpy as np
 
-from core.structure import build_structure
+from core.structure import build_structure, find_swings
 
 KEYS = (("bos_up", "BOS", "bull"), ("choch_up", "CHoCH", "bull"),
         ("bos_dn", "BOS", "bear"), ("choch_dn", "CHoCH", "bear"))
@@ -39,10 +40,79 @@ def thin(rows: list[dict], gap: float) -> list[dict]:
     return sorted(kept, key=lambda r: r["ts"])
 
 
+def _trend(highs, lows) -> str:
+    if len(highs) < 2 or len(lows) < 2:
+        return "range"
+    if highs[-1]["price"] > highs[-2]["price"] and lows[-1]["price"] > lows[-2]["price"]:
+        return "up"
+    if highs[-1]["price"] < highs[-2]["price"] and lows[-1]["price"] < lows[-2]["price"]:
+        return "down"
+    return "range"
+
+
+def _tag(df, pivot, trend: str) -> str:
+    """BOS if the pivot was broken with the trend, CHoCH if against it."""
+    after = df["close"].iloc[pivot["idx"] + 1:]
+    if after.empty:
+        return ""
+    broken = bool((after > pivot["price"]).any()) if pivot["type"] == "H" \
+        else bool((after < pivot["price"]).any())
+    if not broken:
+        return ""
+    if trend == "up":
+        return "BOS" if pivot["type"] == "H" else "CHoCH"
+    if trend == "down":
+        return "BOS" if pivot["type"] == "L" else "CHoCH"
+    return ""
+
+
+def structure_lines(df, cfg, tf_label: str, grade: str,
+                    max_lines: int = 2) -> list[dict]:
+    """Newest trend-conforming pivots. At most two, so four across both frames.
+
+    Up: last HH and last HL. Down: last LH and last LL. Range: last H and L.
+    """
+    d = _closed(df)
+    if len(d) < 40:
+        return []
+    sw = find_swings(d, cfg.structure.swing_left, cfg.structure.swing_right)
+    highs = [s for s in sw if s["type"] == "H"]
+    lows = [s for s in sw if s["type"] == "L"]
+    if not highs or not lows:
+        return []
+    trend = _trend(highs, lows)
+
+    out: list[dict] = []
+
+    def add(pivot, label):
+        out.append({"ts": d.index[pivot["idx"]], "price": float(pivot["price"]),
+                    "label": label, "tag": _tag(d, pivot, trend),
+                    "tf": tf_label, "grade": grade})
+
+    if len(highs) >= 2:
+        cur, prev = highs[-1], highs[-2]
+        if trend == "up" and cur["price"] > prev["price"]:
+            add(cur, "HH")
+        elif trend == "down" and cur["price"] < prev["price"]:
+            add(cur, "LH")
+        else:
+            add(cur, "H")
+    if len(lows) >= 2:
+        cur, prev = lows[-1], lows[-2]
+        if trend == "up" and cur["price"] > prev["price"]:
+            add(cur, "HL")
+        elif trend == "down" and cur["price"] < prev["price"]:
+            add(cur, "LL")
+        else:
+            add(cur, "L")
+
+    out.sort(key=lambda r: r["ts"])
+    return out[-max_lines:]
+
+
 def marks(adf, cfg, htf_df, gap: float,
           max_major: int = 2, max_minor: int = 3):
-    """(majors, minors). Majors from 30m, minors from the trigger frame.
-    Minors colliding with a major are dropped."""
+    """(majors, minors) event marks. Kept for callers that want events."""
     majors, minors = [], []
     if htf_df is not None and len(htf_df) > 30:
         h = _closed(htf_df)
@@ -61,8 +131,55 @@ def marks(adf, cfg, htf_df, gap: float,
     return majors, minors
 
 
+def volume_zones(df, cfg, tf_label: str, grade: str, direction: str,
+                 min_ratio: float = 1.3, keep: int = 1) -> list[dict]:
+    """Unmitigated zones with above-average volume behind the touch.
+
+    Supply for longs' exits and shorts' entries, demand for the reverse; only
+    the side that matters for `direction` is returned.
+    """
+    from core.levels import build_zones
+    from core.indicators import atr as atr_fn
+
+    d = _closed(df)
+    if len(d) < 60:
+        return []
+    sw = find_swings(d, cfg.structure.swing_left, cfg.structure.swing_right)
+    if not sw:
+        return []
+    atr_s = atr_fn(d, 14)
+    kind = "sup" if direction == "long" else "res"
+    zones = build_zones(d, sw, atr_s, cfg.structure, kind)
+    vol = d["volume"].to_numpy(float)
+    out = []
+    for z in sorted(zones, key=lambda z: -z["last_touch_idx"]):
+        i = int(z["last_touch_idx"])
+        base = vol[max(0, i - 20):i]
+        if not len(base):
+            continue
+        mean = float(np.nanmean(base))
+        if mean <= 0:
+            continue
+        ratio = float(vol[i]) / mean
+        if ratio < min_ratio:
+            continue
+        after = d.iloc[i + 1:]
+        if not after.empty:
+            hit = (after["low"] <= z["high"]).any() if kind == "sup" \
+                else (after["high"] >= z["low"]).any()
+            if hit:
+                continue
+        out.append({"low": z["low"], "high": z["high"], "ratio": round(ratio, 2),
+                    "tf": tf_label, "grade": grade,
+                    "side": "demand" if kind == "sup" else "supply",
+                    "ts": d.index[i]})
+        if len(out) >= keep:
+            break
+    return out
+
+
 def live_zones(zones: list[dict], df, direction: str, keep: int = 2) -> list[dict]:
-    """Nearest unmitigated zones in the trade direction, newest first."""
+    """Nearest unmitigated zones from a raw build_zones list."""
     want = "sup" if direction == "long" else "res"
     out = []
     for z in sorted([z for z in zones if z["kind"] == want],

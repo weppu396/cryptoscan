@@ -69,7 +69,10 @@ def trend_state(df, lookback: int = 400) -> tuple[str, list[str]]:
 
 
 def structure_events(df, lookback: int = 400) -> list[dict]:
-    """BOS and CHoCH. CHoCH is a break against the prevailing trend."""
+    """BOS and CHoCH. CHoCH is a break against the prevailing trend.
+
+    `closed` is False when the break is on the final bar, i.e. still forming.
+    """
     hi, lo = swings(df)
     h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float)
@@ -90,12 +93,14 @@ def structure_events(df, lookback: int = 400) -> list[dict]:
         if last_h is not None and i > 0 and c[i] > h[last_h]:
             kind = "CHoCH" if trend == "down" else "BOS"
             events.append({"kind": kind, "dir": "bull", "idx": i,
-                           "level": float(h[last_h]), "age": n - 1 - i})
+                           "level": float(h[last_h]), "age": n - 1 - i,
+                           "closed": i < n - 1})
             trend = "up"
         if last_l is not None and i > 0 and c[i] < l[last_l]:
             kind = "CHoCH" if trend == "up" else "BOS"
             events.append({"kind": kind, "dir": "bear", "idx": i,
-                           "level": float(l[last_l]), "age": n - 1 - i})
+                           "level": float(l[last_l]), "age": n - 1 - i,
+                           "closed": i < n - 1})
             trend = "down"
     return [e for e in events if e["age"] <= 40]
 
@@ -178,7 +183,6 @@ def fair_value_gaps(df, lookback: int = 300, min_atr: float = 0.35,
 
 
 def mitigated(zone: dict, df) -> bool:
-    """Zone already traded back into."""
     if not zone:
         return False
     after = df.iloc[zone["idx"] + 1:]
@@ -190,7 +194,7 @@ def mitigated(zone: dict, df) -> bool:
 
 
 def equal_levels(df, tol_atr: float = 0.25, lookback: int = 300) -> dict:
-    """Clusters of near-identical highs and lows: stop-loss pools."""
+    """Pairs of near-identical highs and lows: stop-loss pools."""
     hi, lo = swings(df)
     atr = atr_series(df)
     a = float(atr.iloc[-1] or 0)
@@ -232,7 +236,6 @@ def liquidity_sweeps(df, lookback: int = 300, width: int = 20,
 
 
 def inducement(df, lookback: int = 200) -> list[dict]:
-    """Minor swing sitting just before a bigger one: the trap level."""
     hi, lo = swings(df)
     atr = atr_series(df)
     a = float(atr.iloc[-1] or 0)
@@ -278,9 +281,6 @@ def fib_levels(df, lookback: int = 120) -> dict:
 
 
 def patterns(df, look: int = 3, end: int | None = None) -> list[str]:
-    """Simple pattern names, scored elsewhere. `end` pins the window to a bar
-    index instead of the dataframe tail, so old setups are graded on their own
-    candles rather than today's."""
     if len(df) < 3:
         return []
     o = df["open"].to_numpy(float)
@@ -348,7 +348,9 @@ def confluence(df, direction: str, entry: float, atr: float,
     if ev:
         e = ev[-1]
         score += 2 if e["kind"] == "CHoCH" else 1
-        flags.append(f"{e['kind']} {e['dir']} {e['age']} bars ago")
+        when = ("forming bar" if not e.get("closed", True)
+                else f"{e['age']} bars ago")
+        flags.append(f"{e['kind']} {e['dir']} {when}")
 
     zones = [z for z in supply_demand(df)
              if z["dir"] == ("demand" if want == "bull" else "supply")]
@@ -379,7 +381,7 @@ def confluence(df, direction: str, entry: float, atr: float,
     eq = equal_levels(df)
     pool = eq["lows"] if want == "bull" else eq["highs"]
     if pool:
-        flags.append(f"{len(pool)} equal level cluster(s) nearby")
+        flags.append(f"{len(pool)} equal-level pair(s) nearby")
 
     ind = [i for i in inducement(df) if i["dir"] == want]
     if ind:
@@ -451,6 +453,7 @@ def playbook(df, direction: str, equity: float, risk_pct: float) -> dict:
 
     rr1 = abs(tp1 - entry) / risk
     rr2 = abs(tp2 - entry) / risk
+    weighted = 0.5 * rr1 + 0.5 * rr2
     size_usd = equity * risk_pct / 100
     qty = size_usd / risk if risk else 0
 
@@ -470,13 +473,13 @@ def playbook(df, direction: str, equity: float, risk_pct: float) -> dict:
                "C — watch only" if passed >= 4 else "D — skip")
 
     return {"direction": direction, "entry": entry, "sl": sl, "tp1": tp1,
-            "tp2": tp2, "risk": risk, "rr1": rr1, "rr2": rr2, "qty": qty,
+            "tp2": tp2, "risk": risk, "rr1": rr1, "rr2": rr2,
+            "weighted_rr": weighted, "qty": qty,
             "size_usd": size_usd, "checks": checks, "passed": passed,
             "verdict": verdict, "confluence": conf, "atr": atr, "fib": fib}
 
 
 def ladder(plan: dict, tranches: int = 3) -> list[dict]:
-    """Split a spot entry into staged buys into the zone."""
     zone_top = plan["entry"]
     zone_bot = plan["sl"] + (plan["atr"] * 0.3 if plan["atr"] else 0)
     if zone_top <= zone_bot:

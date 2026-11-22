@@ -6,6 +6,7 @@ import chart
 import paper
 import ui
 from core.tfs import CHART_TFS, chart_minutes, data_tf
+from strategy.risk import plan_rr
 
 
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
@@ -31,10 +32,11 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                     d2, _v = load_fn(ex, s.symbol, data_tf(ctf), 400)
                     if d2 is not None:
                         disp = d2
+                cdf = df.iloc[:-1] if len(df) > 2 else df
                 plan = {"entry": s.entry, "sl": s.stop, "tp1": s.tp1,
                         "tp2": s.tp2}
                 st.plotly_chart(chart.build(disp, cfg, s.direction, plan,
-                                            chart_tf=ctf, analysis_df=df),
+                                            chart_tf=ctf, analysis_df=cdf),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 with st.expander("How to read this chart"):
@@ -42,27 +44,34 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
         except Exception as e:
             st.caption(f"chart error: {type(e).__name__}: {e}")
 
+        rr = plan_rr(s.entry, s.stop, s.tp1, s.tp2, 0.5)
+
         st.write(f"**Logic** {' · '.join(s.reasons) or '—'}")
         if sm.get("flags"):
             st.write("**Supporting** " + " · ".join(sm["flags"]))
         if sm.get("warnings"):
             st.write("**Against** " + " · ".join(sm["warnings"]))
         st.write(f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
-                 f"**TP1** {s.tp1:,.6g} · **TP2** {s.tp2:,.6g} · R:R {s.rr:.2f}")
+                 f"**TP1** {s.tp1:,.6g} ({rr['rr1']:.2f}R) · "
+                 f"**TP2** {s.tp2:,.6g} ({rr['rr2']:.2f}R) · "
+                 f"weighted {rr['weighted']:.2f}R")
         for p in r["positives"]:
             st.write(f"- {p}")
         for n in r["negatives"]:
             st.write(f"- {n}")
         av = s.meta.get("avwap", {})
-        st.write(f"**AVWAP** {av.get('dist', 0):+.2f} ATR · **in value area** "
+        av_txt = (f"{av.get('dist', 0):+.2f} ATR" if av.get("usable", True)
+                  else "n/a")
+        st.write(f"**AVWAP** {av_txt} · **in value area** "
                  f"{'yes' if s.meta.get('in_value') else 'no'} · **candle** "
                  f"{s.meta.get('candle') or '—'} ({s.meta.get('candle_q', 0)})")
 
-        rr2 = abs(s.tp2 - s.entry) / abs(s.entry - s.stop) if s.stop != s.entry else s.rr
         order_card({"qty": s.meta.get("qty", 0), "entry": s.entry, "sl": s.stop,
                     "tp1": s.tp1, "tp2": s.tp2,
                     "size_usd": s.meta.get("risk_cash", 0),
-                    "rr1": s.rr, "rr2": rr2}, s.symbol, s.direction)
+                    "rr1": rr["rr1"], "rr2": rr["rr2"],
+                    "weighted_rr": rr["weighted"]},
+                   s.symbol, s.direction, ltf)
 
         c1, c2 = st.columns(2)
         if c1.button("Alert me", key=f"ba{s.symbol}"):
@@ -134,7 +143,9 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
         "smc": s.meta.get("smc", {}).get("score", 0),
         "status": s.meta.get("status"),
         "entry": f"{s.entry:,.6g}", "stop": f"{s.stop:,.6g}",
-        "tp1": f"{s.tp1:,.6g}", "rr": round(s.rr, 2),
+        "tp1": f"{s.tp1:,.6g} ({s.rr1:.2f}R)",
+        "tp2": f"{s.tp2:,.6g} ({s.rr2:.2f}R)",
+        "weighted": round(s.weighted_rr, 2),
     } for s in board]), hide_index=True, use_container_width=True)
 
     st.divider()

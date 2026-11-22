@@ -1,12 +1,11 @@
 """chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
 
-Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves,
-bounded history with a short initial window, all marks to the right edge, both
-axes free for independent zoom, HTF capped at 1h and LTF at 5m.
+Candles 0-76%, gutter 78.5-100% in two halves, bounded history with a short
+initial window, all marks to the right edge, both axes free for independent
+zoom with pan as the default drag. HTF capped at 1h, LTF at 5m.
 
 Swings, events and sweeps arrive in three shapes: Swing objects, StructureEvent
-objects, and plain dicts from smc. Every read goes through _sv() so a dict can
-never raise AttributeError again.
+objects, and plain dicts from smc. Every read goes through _sv().
 """
 import numpy as np
 import pandas as pd
@@ -22,10 +21,10 @@ from core.volume import anchored_vwap, profile_histogram
 UP, DN, MUT, WARN, TEAL, BLUE = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6", "#3b82f6"
 HTF_LINE = "#f5d90a"
 LTF_LINE = "#22d3ee"
-SUPPLY_FILL = "rgba(190,110,120,0.14)"
-SUPPLY_EDGE = "rgba(190,110,120,0.42)"
-DEMAND_FILL = "rgba(120,200,160,0.13)"
-DEMAND_EDGE = "rgba(120,200,160,0.42)"
+SUPPLY_FILL = "rgba(190,110,120,0.16)"
+SUPPLY_EDGE = "rgba(214,116,128,0.85)"
+DEMAND_FILL = "rgba(120,200,160,0.15)"
+DEMAND_EDGE = "rgba(88,206,150,0.85)"
 BG = "#0f1116"
 MODES = ("structure", "analysis", "execution")
 LAYERS = {
@@ -34,21 +33,18 @@ LAYERS = {
                  "vp", "avwap"},
     "execution": {"candles", "zone", "plan"},
 }
-STYLE = {Layer.EXTERNAL: (1.8, HTF_LINE), Layer.INTERNAL: (1.4, LTF_LINE)}
-VP_HTF = "rgba(96,152,255,0.30)"
-VP_LTF = "rgba(240,140,11,0.28)"
+STYLE = {Layer.EXTERNAL: (2.2, HTF_LINE), Layer.INTERNAL: (1.8, LTF_LINE)}
+VP_HTF = "rgba(96,152,255,0.34)"
+VP_LTF = "rgba(240,140,11,0.30)"
 PRICE_DOMAIN = [0.0, 0.76]
 PROFILE_DOMAIN = [0.785, 1.0]
 HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
-MAX_MARKS = {Layer.EXTERNAL: 2, Layer.INTERNAL: 2}
+MAX_MARKS = 2
 DEFAULT_BARS = 110
 MAX_TRACE = 1200
 OHLC = ("open", "high", "low", "close")
 
 
-# --------------------------------------------------------------------------- #
-# shape-agnostic reads: dict, Swing and StructureEvent all work
-# --------------------------------------------------------------------------- #
 def _sv(obj, key, default=None):
     if obj is None:
         return default
@@ -146,6 +142,8 @@ def _gutter(fig):
 
 
 def _profile(fig, df, bars, color, axis, side):
+    """Proportional bars in the dedicated gutter half. Thicker than the bar step
+    so they read as one band, never touching the candles."""
     b0, b1 = HALF[side]
     span = b1 - b0
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
@@ -155,7 +153,7 @@ def _profile(fig, df, bars, color, axis, side):
     fig.add_trace(go.Bar(y=vp["centers"], x=vp["hist"] * span, base=b0,
                          orientation="h",
                          marker=dict(color=color, line=dict(width=0)),
-                         width=step * 3.0 if step else None,
+                         width=step * 6.0 if step else None,
                          hoverinfo="skip", showlegend=False), row=1, col=1)
     fig.data[-1].xaxis = axis
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
@@ -166,42 +164,49 @@ def _profile(fig, df, bars, color, axis, side):
         if side == "htf":
             fig.add_annotation(xref="paper", yref="y", x=PROFILE_DOMAIN[1], y=lvl,
                                text=tag, showarrow=False, xanchor="right",
-                               font=dict(size=7, color=tone), opacity=0.85)
+                               yanchor="middle", font=dict(size=8, color=tone),
+                               opacity=0.9)
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.5,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.6,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(170,170,180,0.40)", width=1))
+                      line=dict(color="rgba(180,180,190,0.45)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.25,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.3,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(170,170,180,0.24)", width=1))
+                      line=dict(color="rgba(180,180,190,0.26)", width=1))
 
 
 def _struct(fig, ts, price, x1, color, width, label, tag):
-    fig.add_shape(type="line", row=1, col=1, x0=ts, x1=x1,
+    """Wick-anchored line, run to the right edge, exact price in the label."""
+    fig.add_shape(type="line", xref="x", yref="y", x0=ts, x1=x1,
                   y0=price, y1=price, line=dict(color=color, width=width))
     txt = f"{label} {price:,.6g}" + (f" {tag}" if tag else "")
-    fig.add_annotation(x=ts, y=price, row=1, col=1, text=txt, showarrow=False,
-                       xanchor="left", yshift=9, font=dict(size=8, color=color))
+    fig.add_annotation(x=ts, xref="x", y=price, yref="y", text=txt,
+                       showarrow=False, xanchor="left", yanchor="bottom",
+                       xshift=5, yshift=3, font=dict(size=9, color=color))
 
 
-def _zone(fig, z, x0, x1, label):
-    fill = SUPPLY_FILL if z["side"] == "supply" else DEMAND_FILL
-    edge = SUPPLY_EDGE if z["side"] == "supply" else DEMAND_EDGE
-    fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=x1,
-                  y0=z["low"], y1=z["high"],
-                  fillcolor=fill, line=dict(width=1, color=edge))
-    fig.add_annotation(x=x1, y=(z["low"] + z["high"]) / 2, row=1, col=1,
-                       text=f" {label} {z['side']} {z['ratio']:.1f}x "
-                            f"{z['low']:,.6g}–{z['high']:,.6g} ",
-                       showarrow=False, xanchor="right",
-                       font=dict(size=7, color=edge),
-                       bgcolor="rgba(15,17,22,0.65)")
+def _zone(fig, z, x0, x1, label, tf):
+    supply = z["side"] == "supply"
+    fill = SUPPLY_FILL if supply else DEMAND_FILL
+    edge = SUPPLY_EDGE if supply else DEMAND_EDGE
+    fig.add_shape(type="rect", xref="x", yref="y", x0=x0, x1=x1,
+                  y0=z["low"], y1=z["high"], fillcolor=fill,
+                  line=dict(width=1.8, color=edge))
+    vol = z.get("vol")
+    vol_txt = f" · vol {vol:,.0f}" if isinstance(vol, (int, float)) else ""
+    fig.add_annotation(x=x1, xref="x", y=(z["low"] + z["high"]) / 2, yref="y",
+                       text=f"{label} {z['side']} {z.get('ratio', 0):.1f}x "
+                            f"{z['low']:,.6g}–{z['high']:,.6g}{vol_txt} ",
+                       showarrow=False, xanchor="right", yanchor="middle",
+                       font=dict(size=8, color=edge),
+                       bgcolor="rgba(15,17,22,0.72)",
+                       bordercolor=edge, borderwidth=1, borderpad=2)
 
 
 def build(df, frame, direction, plan=None, mode="analysis", layers=None,
           bars=DEFAULT_BARS, chart_tf=None, analysis_df=None,
-          htf_df=None, ltf_df=None, pair=None) -> go.Figure:
+          htf_df=None, ltf_df=None, pair=None, cfg=None) -> go.Figure:
     if mode not in MODES:
         raise ValueError(mode)
     df = _clean(df)
@@ -216,6 +221,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                             xref="paper", yref="paper",
                                             x=0.5, y=0.5)])
         return fig
+
+    keep = MAX_MARKS
+    zone_keep = 1
+    if cfg is not None:
+        keep = max(1, int(getattr(cfg.structure, "line_keep", MAX_MARKS)))
+        zone_keep = max(1, int(getattr(cfg.structure, "zone_keep", 1)))
 
     htf_label, ltf_label = (pair if pair else ("30m", "3m"))
     htf_label, ltf_label = cap_htf(htf_label), cap_ltf(ltf_label)
@@ -264,7 +275,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 mode="markers",
                 marker=dict(symbol="triangle-down" if _sv(s, "kind") == "H"
                             else "triangle-up", size=5, color=MUT,
-                            opacity=.4), showlegend=False), row=1, col=1)
+                            opacity=.45), showlegend=False), row=1, col=1)
 
     if "breaks" in on:
         for layer in (Layer.EXTERNAL, Layer.INTERNAL):
@@ -276,7 +287,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                           "level": float(_sv(e, "level")), "e": e} for e in live],
                         0.0)
             w, col = STYLE[layer]
-            for row in live[-MAX_MARKS[layer]:]:
+            for row in live[-keep:]:
                 e = row["e"]
                 c = WARN if (_lab(e) == "CHoCH"
                              and layer == Layer.EXTERNAL) else col
@@ -287,10 +298,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if "zones" in on:
         try:
             from config import CFG as _CFG
-            for z in volume_zones(htf_df, _CFG, htf_label, "HTF", direction, keep=1):
-                _zone(fig, z, max(z["ts"], start), right, "HTF " + htf_label)
-            for z in volume_zones(ltf_df, _CFG, ltf_label, "LTF", direction, keep=1):
-                _zone(fig, z, max(z["ts"], start), right, "LTF " + ltf_label)
+            for z in volume_zones(htf_df, _CFG, htf_label, "HTF", direction,
+                                  keep=zone_keep):
+                _zone(fig, z, max(z["ts"], start), right, "HTF", htf_label)
+            for z in volume_zones(ltf_df, _CFG, ltf_label, "LTF", direction,
+                                  keep=zone_keep):
+                _zone(fig, z, max(z["ts"], start), right, "LTF", ltf_label)
         except Exception:
             pass
 
@@ -300,8 +313,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             idx = int(_sv(g, "idx", 0))
             if adf.index[idx] < start:
                 continue
-            fig.add_shape(type="rect", row=1, col=1, x0=adf.index[idx], x1=right,
-                          y0=float(_sv(g, "bot")), y1=float(_sv(g, "top")),
+            fig.add_shape(type="rect", xref="x", yref="y", x0=adf.index[idx],
+                          x1=right, y0=float(_sv(g, "bot")), y1=float(_sv(g, "top")),
                           line=dict(width=0),
                           fillcolor="rgba(22,199,132,0.05)" if long
                           else "rgba(234,57,67,0.05)")
@@ -345,11 +358,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if plan and "plan" in on:
         for y, col, txt in ((plan["entry"], BLUE, "ENTRY"), (plan["stop"], DN, "SL"),
                             (plan["tp1"], UP, "TP1"), (plan["tp2"], UP, "TP2")):
-            fig.add_shape(type="line", row=1, col=1, x0=last_x, x1=right,
+            fig.add_shape(type="line", xref="x", yref="y", x0=last_x, x1=right,
                           y0=y, y1=y, line=dict(color=col, width=1.4))
-            fig.add_annotation(x=right, y=y, row=1, col=1, xanchor="left",
-                               text=f" {txt} {y:,.6g}", showarrow=False,
-                               font=dict(size=8, color=col))
+            fig.add_annotation(x=right, xref="x", y=y, yref="y", xanchor="left",
+                               yanchor="middle", text=f" {txt} {y:,.6g}",
+                               showarrow=False, font=dict(size=8, color=col))
 
     try:
         y_ref = hist.tail(min(len(hist), max(bars * 4, bars)))
@@ -366,7 +379,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=62, r=10, t=42, b=22),
-                      showlegend=False, hovermode="x unified", dragmode="zoom",
+                      showlegend=False, hovermode="x unified", dragmode="pan",
                       uirevision="cryptoscan",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
@@ -377,7 +390,10 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                  autorange=False, nticks=8,
                                  tickformat=_tick(chart_tf),
                                  rangeslider=dict(visible=False),
-                                 fixedrange=False, constrain="range"))
+                                 fixedrange=False, constrain="range",
+                                 showspikes=True, spikemode="across",
+                                 spikethickness=1, spikedash="dot",
+                                 spikecolor=MUT))
     fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
                                           range=[0, 1], type="linear",
                                           showgrid=False, showticklabels=False,
@@ -387,5 +403,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                      fixedrange=False))
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
-                     tickformat=",.6g", fixedrange=False)
+                     tickformat=",.6g", fixedrange=False, showspikes=True,
+                     spikemode="across", spikethickness=1, spikedash="dot",
+                     spikecolor=MUT)
     return fig

@@ -3,14 +3,18 @@
 Candles 0-76% on a datetime axis. Profile gutter 78.5-100% in two halves,
 HTF left-in-gutter blue, LTF right-in-gutter orange, own numeric axis.
 
+History: the trace carries the WHOLE loaded frame (capped at MAX_TRACE) and only
+the initial view is DEFAULT_BARS. Zooming out therefore reveals real earlier
+candles instead of empty space.
+
 Structure: exactly two pivots per timeframe, four total. Up = HH + HL, down =
 LH + LL, range = H + L. Each line starts on the pivot wick, runs to the right
 edge, carries the exact price and a BOS/CHoCH chip. HTF vibrant yellow, LTF
 bright cyan.
 
 Zones: only unmitigated zones with above-average volume behind the touch.
-Dusty rose supply, mint demand, both low opacity and labelled with timeframe
-and multiple.
+Dusty rose supply, mint demand, both low opacity, labelled with timeframe and
+multiple.
 
 Drag to zoom: horizontal compresses/expands time, vertical compresses/expands
 price. Right-drag pans, double-click resets. Every mark is in data space so it
@@ -19,7 +23,6 @@ stays locked while zooming.
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from subprocess import SubprocessError
 from plotly.subplots import make_subplots
 
 import smc
@@ -27,7 +30,7 @@ from core.candles import latest as latest_candle
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.structure_map import structure_lines, volume_zones
-from core.tfs import CHART_TFS, chart_minutes, data_tf, resample
+from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf, resample
 from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6"
@@ -40,6 +43,7 @@ DEMAND_EDGE = "rgba(120,200,160,0.42)"
 BG = "#0f1116"
 ANCHOR_BARS = 60
 DEFAULT_BARS = 110
+MAX_TRACE = 1200
 
 ZONE_FILL = {"long": "rgba(20,184,166,0.075)", "short": "rgba(240,185,11,0.075)"}
 FVG_FILL = {"long": "rgba(22,199,132,0.05)", "short": "rgba(234,57,67,0.05)"}
@@ -114,6 +118,7 @@ def _gutter(fig) -> tuple[str, str]:
 
 
 def _draw_profile(fig, df, bars: int, color: str, axis: str, side: str) -> None:
+    """Thick horizontal bars so the profile reads as one block against zones."""
     b0, b1 = HALF[side]
     span = b1 - b0
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
@@ -123,7 +128,7 @@ def _draw_profile(fig, df, bars: int, color: str, axis: str, side: str) -> None:
     fig.add_trace(go.Bar(
         y=vp["centers"], x=vp["hist"] * span, base=b0, orientation="h",
         marker=dict(color=color, line=dict(width=0)),
-        width=step * 1.6 if step else None,
+        width=step * 3.0 if step else None,
         hoverinfo="skip", showlegend=False), row=1, col=1)
     fig.data[-1].xaxis = axis
 
@@ -191,6 +196,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
         return fig
 
     htf_label, ltf_label = (pair if pair else ("30m", "3m"))
+    htf_label = cap_htf(htf_label)
     if htf_df is None:
         try:
             htf_df = resample(adf, htf_label) if len(adf) > 60 else None
@@ -199,24 +205,26 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     if ltf_df is None:
         ltf_df = adf
 
-    view = df.tail(bars)
-    step = _step(view)
+    # full history in the trace, short initial window
+    hist = df.tail(MAX_TRACE)
+    view = hist.tail(bars)
+    step = _step(hist)
     ind = compute_all(adf, cfg)
     stt = build_structure(adf, cfg.structure)
     a = ind["atr"].iloc[-1]
     atr = float(a) if a == a else 0.0
     long = direction == "long"
     want = "bull" if long else "bear"
-    last_x = view.index[-1]
+    last_x = hist.index[-1]
     right = _future(last_x, step, 6)
-    start = view.index[0]
+    start = hist.index[0]
 
     fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
 
     fig.add_trace(go.Candlestick(
-        x=view.index, open=view["open"], high=view["high"], low=view["low"],
-        close=view["close"], name="price",
+        x=hist.index, open=hist["open"], high=hist["high"], low=hist["low"],
+        close=hist["close"], name="price",
         increasing_line_color=UP, increasing_line_width=1.2,
         increasing_fillcolor=UP,
         decreasing_line_color=DN, decreasing_line_width=1.2,
@@ -285,7 +293,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     try:
         anchor = _anchor(stt, long)
         if anchor is not None:
-            line = anchored_vwap(adf, anchor).tail(bars)
+            line = anchored_vwap(adf, anchor).tail(len(hist))
             fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",
                                      line=dict(color=TEAL, width=1.2, dash="dash"),
                                      opacity=.75), row=1, col=1)
@@ -332,8 +340,9 @@ def build(df, cfg, direction: str, plan: dict | None = None,
         pass
 
     try:
-        lo = float(view["low"].min())
-        hi = float(view["high"].max())
+        y_ref = hist.tail(min(len(hist), max(bars * 4, bars)))
+        lo = float(y_ref["low"].min())
+        hi = float(y_ref["high"].max())
         pad = (hi - lo) * 0.03 or max(abs(hi), 1.0) * 0.001
         y_range = [lo - pad, hi + pad]
     except Exception:
@@ -346,7 +355,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     fig.update_layout(
         height=640, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
         margin=dict(l=62, r=10, t=42, b=22), showlegend=False,
-        hovermode="x unified", dragmode="zoom",
+        hovermode="x unified", dragmode="zoom", uirevision="cryptoscan",
         title=dict(text=f"chart {chart_tf or ''} · structure {htf_label} (HTF, "
                         f"yellow) / {ltf_label} (LTF, cyan) · gutter blue = HTF "
                         f"profile, orange = LTF profile (estimate)",
@@ -371,7 +380,7 @@ def st_selectbox(key: str, idx: int) -> str:
     import streamlit as st
     return st.selectbox("Chart timeframe", CHART_TFS, index=idx, key=key,
                         help="Display only. Structure and the plan use the "
-                             "auto-selected HTF/LTF pair.")
+                             "auto-selected pair, HTF never above 1h.")
 
 
 def legend_md() -> str:
@@ -393,13 +402,19 @@ def legend_md() -> str:
 | grey dotted in gutter | VAH / VAL |
 | green / red boxes | reward to TP1/TP2 and risk to stop |
 
+The HTF is picked from 15m, 30m or 1h — never above 1h — by how cleanly the
+market is structured. The LTF is then picked from the legal triggers for that
+HTF by running the full assessment on each and keeping the best setup. Both are
+printed in the chart title.
+
 Exactly two pivots per timeframe, four total. The `x` in a zone label is the
-touch-bar volume against its 20-bar average — anything under 1.3x is dropped,
-so only zones with real participation appear.
+touch-bar volume against its 20-bar average; anything under 1.3x is dropped, so
+only zones with real participation appear.
 
 **Zoom:** drag horizontally to compress or expand time, drag vertically to
-compress or expand price, right-drag to pan, double-click to reset. Every mark
-is in price/time space and stays locked while you move.
+compress or expand price, right-drag to pan, double-click to reset. The whole
+loaded history is in the chart, so zooming out reveals earlier candles rather
+than empty space.
 
 Only closed bars produce a pivot. The gutter is an OHLCV estimate.
 """

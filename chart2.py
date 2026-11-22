@@ -4,6 +4,10 @@ Each layer is placed on its own source frame: external events are indexed in the
 HTF frame, internal events in the LTF frame. Feeding both layers from one frame
 is what made an opposing LTF impossible to draw.
 
+Structure lines are BOS only. A BOS line sits on the pivot that broke — HH/HL in
+an uptrend, LH/LL in a downtrend — and the pivot tag is printed in the label.
+CHoCH is not given a horizontal line; the pivot labels carry that information.
+
 History: the trace carries the whole loaded frame (up to MAX_TRACE bars), so
 panning left always finds candles. The initial window is only an initial range,
 and uirevision is keyed to the view so zoom survives reruns but not a timeframe
@@ -26,6 +30,9 @@ from core.volume import anchored_vwap, profile_histogram
 UP, DN, MUT, WARN, TEAL, BLUE = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6", "#3b82f6"
 HTF_LINE = "#f5d90a"
 LTF_LINE = "#22d3ee"
+SL_DARK = "#a61b1b"
+TP_DARK = "#1a7f37"
+ENTRY_DARK = "#1d4ed8"
 SUPPLY_FILL = "rgba(190,110,120,0.16)"
 SUPPLY_EDGE = "rgba(214,116,128,0.85)"
 DEMAND_FILL = "rgba(120,200,160,0.15)"
@@ -46,10 +53,11 @@ PROFILE_DOMAIN = [0.785, 1.0]
 HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
 MAX_MARKS = 2
 LABEL_KEEP = 4
-DEFAULT_BARS = 110
+DEFAULT_BARS = 70
 MAX_TRACE = 6000
 OHLC = ("open", "high", "low", "close")
 EQ_TOL_ATR = 0.25
+BOS_LABELS = ("BOS", "BOS_INIT")
 
 
 def _sv(obj, key, default=None):
@@ -211,7 +219,7 @@ def _profile(fig, df, bars, color, axis, side):
 
 
 def _struct(fig, ts, price, x1, color, width, label, tag):
-    """Wick-anchored line, run to the right edge, exact price in the label."""
+    """Wick-anchored BOS line, run to the right edge, exact price in the label."""
     fig.add_shape(type="line", xref="x", yref="y", x0=ts, x1=x1,
                   y0=price, y1=price, line=dict(color=color, width=width))
     txt = f"{label} {price:,.6g}" + (f" {tag}" if tag else "")
@@ -318,13 +326,21 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     atr_ref = float((hist["high"] - hist["low"]).tail(50).median() or 0.0)
     eq_tol = EQ_TOL_ATR * atr_ref
 
+    pts_by_layer = {}
+    tags_by_layer = {}
+    idx_by_layer = {}
+    for layer in (Layer.EXTERNAL, Layer.INTERNAL):
+        pts = [s for s in swings if _lay(s) == layer.value]
+        pts_by_layer[layer] = pts
+        tags_by_layer[layer] = _classify(pts, atr_ref, eq_tol)
+        idx_by_layer[layer] = {int(_sv(s, "idx", -1)): s for s in pts}
+
     for layer in (Layer.EXTERNAL, Layer.INTERNAL):
         key = "ext_swing" if layer == Layer.EXTERNAL else "int_swing"
         f = layer_frame(layer)
-        pts = [s for s in swings if _lay(s) == layer.value]
-        tags = _classify(pts, atr_ref, eq_tol)
+        tags = tags_by_layer[layer]
         visible = []
-        for s in pts:
+        for s in pts_by_layer[layer]:
             idx = int(_sv(s, "idx", -1))
             if idx < 0 or idx >= len(f):
                 continue
@@ -350,21 +366,28 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         for layer in (Layer.EXTERNAL, Layer.INTERNAL):
             f = layer_frame(layer)
             t_l = len(f) - 1
-            live = [e for e in _live(frame, t_l) if _lay(e) == layer.value
-                    and int(_sv(e, "break_idx", 0)) < len(f)
-                    and f.index[int(_sv(e, "break_idx", 0))] >= start
-                    and int(_sv(e, "confirm_idx", 0)) <= t_l]
-            live = thin([{"ts": f.index[int(_sv(e, "break_idx", 0))],
-                          "level": float(_sv(e, "level")), "e": e} for e in live],
-                        0.0)
+            bos = [e for e in _live(frame, t_l) if _lay(e) == layer.value
+                   and _lab(e) in BOS_LABELS
+                   and int(_sv(e, "break_idx", 0)) < len(f)
+                   and f.index[int(_sv(e, "break_idx", 0))] >= start
+                   and int(_sv(e, "confirm_idx", 0)) <= t_l]
+            bos = thin([{"ts": f.index[int(_sv(e, "break_idx", 0))],
+                         "level": float(_sv(e, "level")), "e": e} for e in bos],
+                       0.0)
             w, col = STYLE[layer]
-            for row in live[-keep:]:
+            tags = tags_by_layer[layer]
+            by_idx = idx_by_layer[layer]
+            for row in bos[-keep:]:
                 e = row["e"]
-                c = WARN if (_lab(e) == "CHoCH"
-                             and layer == Layer.EXTERNAL) else col
-                _struct(fig, f.index[int(_sv(e, "break_idx", 0))],
-                        float(_sv(e, "level")), right, c, w,
-                        f"{_sv(e, 'direction', '').upper()}", _lab(e))
+                s_idx = int(_sv(e, "swing_idx", -1))
+                pivot = by_idx.get(s_idx)
+                tag = tags.get(id(pivot), "") if pivot is not None else ""
+                if _sv(e, "direction") == "bull":
+                    col_line = HTF_LINE if layer == Layer.EXTERNAL else LTF_LINE
+                else:
+                    col_line = HTF_LINE if layer == Layer.EXTERNAL else LTF_LINE
+                _struct(fig, row["ts"], row["level"], right, col_line, w,
+                        f"{_sv(e, 'direction', '').upper()} BOS", tag)
 
     if "zones" in on:
         try:
@@ -431,23 +454,25 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             pass
 
     if plan and "plan" in on:
-        for y, col, txt in ((plan.get("entry"), BLUE, "ENTRY"),
-                            (plan.get("stop"), DN, "SL"),
-                            (plan.get("tp1"), UP, "TP1"),
-                            (plan.get("tp2"), UP, "TP2")):
+        for y, col, txt in ((plan.get("entry"), ENTRY_DARK, "ENTRY"),
+                            (plan.get("stop"), SL_DARK, "SL"),
+                            (plan.get("tp1"), TP_DARK, "TP1"),
+                            (plan.get("tp2"), TP_DARK, "TP2")):
             if y is None:
                 continue
             fig.add_shape(type="line", xref="x", yref="y", x0=last_x, x1=right,
-                          y0=y, y1=y, line=dict(color=col, width=1.4))
+                          y0=y, y1=y, line=dict(color=col, width=1.6))
             fig.add_annotation(x=right, xref="x", y=y, yref="y", xanchor="left",
                                yanchor="middle", text=f" {txt} {y:,.6g}",
-                               showarrow=False, font=dict(size=8, color=col))
+                               showarrow=False,
+                               font=dict(size=9, color=col),
+                               bgcolor="rgba(15,17,22,0.72)")
 
     try:
         y_ref = hist.tail(min(len(hist), max(bars * 4, bars)))
         lo = float(y_ref["low"].min())
         hi = float(y_ref["high"].max())
-        pad = (hi - lo) * 0.03 or max(abs(hi), 1.0) * 0.001
+        pad = (hi - lo) * 0.02 or max(abs(hi), 1.0) * 0.001
         y_range = [lo - pad, hi + pad]
     except Exception:
         y_range = None

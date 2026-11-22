@@ -3,8 +3,13 @@
 Trend is a STATE VARIABLE. Only the transition table writes it. Swing
 comparisons label swings and detect ranging; they never write state.
 
-Non-repainting: swings confirm at i+right; events confirm at the break bar's
-close; invalidation is stamped at the bar it happens.
+Pivots: internal 3 left + 3 right, external 5 left + 5 right, both from
+cfg.struct so they are tunable. A pivot at i is knowable at i+right and never
+earlier. Swings are anchored to the WICK (high for H, low for L), which is the
+only honest anchor for a structure line.
+
+Non-repainting: swings confirm at i+right, events confirm at the break bar's
+close, invalidation is stamped at the bar it happens. Nothing reads forward.
 """
 import numpy as np
 import pandas as pd
@@ -12,7 +17,7 @@ import pandas as pd
 from core.models import (Layer, Label, StructureEvent, StructureFrame, Swing,
                          new_id)
 
-DEFAULT = {Layer.EXTERNAL: (5, 5), Layer.INTERNAL: (2, 2)}
+DEFAULT = {Layer.EXTERNAL: (5, 5), Layer.INTERNAL: (3, 3)}
 TRANSITION = {
     ("unclear", "bull"): (Label.BOS_INIT, "up"),
     ("unclear", "bear"): (Label.BOS_INIT, "down"),
@@ -34,15 +39,20 @@ def _atr(df, n=14):
 
 
 def _swings(df, left, right, layer):
+    """Strict fractal pivots on the wick. Confirmed at i + right, never before."""
     h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float)
     n = len(df)
+    left = max(1, int(left))
+    right = max(1, int(right))
     out = []
+    if n < left + right + 1:
+        return out
     for i in range(left, n - right):
         if (h[i] > h[i - left:i]).all() and (h[i] > h[i + 1:i + right + 1]).all():
-            out.append(Swing(i, float(h[i]), "H", layer, i + right))
+            out.append(Swing(i, float(h[i]), "H", layer, i + right, "H"))
         if (l[i] < l[i - left:i]).all() and (l[i] < l[i + 1:i + right + 1]).all():
-            out.append(Swing(i, float(l[i]), "L", layer, i + right))
+            out.append(Swing(i, float(l[i]), "L", layer, i + right, "L"))
     return sorted(out, key=lambda s: s.idx)
 
 
@@ -95,8 +105,6 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
                 else:
                     armed_l = s
 
-            if len(last_h) == 2:
-                last_h[0].__class__  # noop, keeps tag assignment below explicit
         if len(last_h) == 2 and len(last_l) == 2:
             et = tol_at(t)
             ranging[t] = (abs(last_h[0].price - last_h[1].price) <= et
@@ -133,9 +141,10 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
 def run(df: pd.DataFrame, symbol: str, tf: str, cfg) -> StructureFrame:
     """cfg is a Config; uses cfg.struct."""
     s = cfg.struct
+    ext = (getattr(s, "ext_left", 5), getattr(s, "ext_right", 5))
+    inn = (getattr(s, "int_left", 3), getattr(s, "int_right", 3))
     frame = StructureFrame(symbol=symbol, timeframe=tf)
-    for layer, (lf, rt) in ((Layer.EXTERNAL, (s.ext_left, s.ext_right)),
-                            (Layer.INTERNAL, (s.int_left, s.int_right))):
+    for layer, (lf, rt) in ((Layer.EXTERNAL, ext), (Layer.INTERNAL, inn)):
         ev, sw, st, rg = _layer(df, symbol, tf, layer, lf, rt, s.eq_tol_atr,
                                 s.invalidate_bars, s.close_based)
         frame.events.extend(ev)

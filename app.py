@@ -30,7 +30,7 @@ import sop
 import ui
 from config import AUTH_ENABLED, CFG
 from core import reversal_alerts
-from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf
+from core.tfs import CHART_TFS, cap_htf, cap_ltf, chart_minutes, data_tf
 from strategy import reversal
 
 try:
@@ -81,23 +81,25 @@ DEFAULT_TF = "30m"
 
 RATIO = {"3m": 5, "5m": 6, "15m": 4, "1h": 4, "4h": 6, "1d": 1, "1w": 1}
 HTF_BARS = 260
-TF_MIN = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+TF_MIN = {"1s": 1 / 60, "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
           "1h": 60, "4h": 240, "1d": 1440}
 OHLC = ("open", "high", "low", "close")
 
 LOGIC_MD = """
-### The pair is chosen, and the higher side is capped at 1h
+### The pair is chosen, and both sides are capped
 
-The higher timeframe is picked from **15m / 30m / 1h** — never above 1h — by how
-cleanly the market is structured: swing separation measured in ATR, swing
-density, and whether volatility sits in a workable band. 30m and 1h are
-resampled from the loaded 15m frame, so a lower timeframe is never invented.
+The higher timeframe is picked from **30m or 1h** — never slower than 1h — by
+how cleanly the market is structured: swing separation measured in ATR, swing
+density, and whether volatility sits in a workable band.
 
-Once the HTF is fixed, **every legal lower timeframe for it is fully assessed**
-and the one whose setup scores highest is kept. 3m for a 15m HTF, 3m or 5m for a
-30m HTF, 5m or 15m for a 1h HTF. The HTF decides location; the LTF decides
-whether the trigger actually fired. Both are printed on every card, alert and
-chart title.
+The lower timeframe is picked from **3m or 5m** — never slower than 5m — by
+running the full assessment on each and keeping the better setup. The HTF
+decides location; the LTF decides whether the trigger actually fired. Both are
+printed on every card, alert and chart title, and both pass through a clamp so
+a stale label cannot leak through.
+
+30m and 1h are resampled from the loaded 15m frame, so a lower timeframe is
+never invented.
 
 | role | higher timeframe | lower timeframe |
 |---|---|---|
@@ -245,8 +247,9 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
 
     lo, hi = float(view["low"].min()), float(view["high"].max())
     pad = (hi - lo) * 0.03 or max(abs(hi), 1.0) * 0.001
-    tick = "%H:%M" if TF_MIN.get(tf, 60) < 60 else (
-        "%d %b %H:%M" if TF_MIN.get(tf, 60) < 1440 else "%d %b")
+    m = TF_MIN.get(tf, 60)
+    tick = "%H:%M:%S" if m < 1 else "%H:%M" if m < 60 else (
+        "%d %b %H:%M" if m < 1440 else "%d %b")
 
     fig = go.Figure(go.Candlestick(
         x=hist.index, open=hist["open"], high=hist["high"], low=hist["low"],
@@ -407,7 +410,7 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     return replace(
         CFG,
         scan=replace(CFG.scan, exchange=exchange, top_n_symbols=top,
-                     min_quote_vol_24h=min_vol, ltf=ltf,
+                     min_quote_vol_24h=min_vol, ltf=cap_ltf(ltf),
                      htf=cap_htf(htf_for(ltf))),
         risk=replace(CFG.risk, min_rr=min_rr, max_stop_atr=max_stop_atr,
                      risk_per_trade_pct=risk_pct, account_equity=equity),
@@ -700,7 +703,7 @@ def cached_radar(exchange, preferred, proxy):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_reversal(exchange, preferred, proxy, symbols):
-    """3m, 5m and 15m per symbol. HTF capped at 1h, LTF by best setup."""
+    """3m, 5m and 15m per symbol. HTF 30m/1h, LTF 3m/5m, both by setup."""
     cfg = build_cfg(exchange, 40, 30e6, reversal.SCALP, 2.0, 3.5, 0.5, 10000)
     ex, name = _resolve(cfg, preferred, proxy)
     try:
@@ -765,8 +768,8 @@ with st.sidebar:
     st.divider()
     ltf = st.selectbox("Timeframe", ["4h", "1d"] if MODE == "Spot" else ["1h", "4h", "1d"],
                        index=1)
-    st.caption(f"bias from {cap_htf(htf_for(ltf))} · {_scan_bars(ltf)} bars · "
-               f"HTF capped at 1h")
+    st.caption(f"bias from {cap_htf(htf_for(ltf))} · trigger from 3m/5m · "
+               f"{_scan_bars(ltf)} bars")
     top = st.slider("Symbols to scan", 10, 150, 25, step=5)
     min_vol = st.select_slider("Min 24h volume",
                                [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
@@ -867,7 +870,7 @@ def order_card(plan: dict, symbol: str, side: str, tf: str = "") -> None:
     w_rr = plan.get("weighted_rr", (rr1 + rr2) / 2 if (rr1 or rr2) else 0.0)
     bars = CFG.risk.time_stop_bars
     mins = TF_MIN.get(tf or "", 0)
-    stop_txt = (f"{bars} bars @ {tf} ≈ {bars * mins} min"
+    stop_txt = (f"{bars} bars @ {tf} ≈ {bars * mins:.0f} min"
                 if mins else f"{bars} bars @ {tf or 'setup tf'}")
     st.code(
         f"symbol      {symbol}\n"
@@ -897,13 +900,15 @@ with T["Overview"]:
     ui.section("Coin detail", "Candles, structure state and venue depth.")
     d1, d2 = st.columns([2, 1])
     detail_sym = d1.text_input("Symbol", "BTC/USDT:USDT", key="detail_sym")
-    detail_tf = d2.selectbox("Timeframe", ["1h", "4h", "1d", "1w"], index=2)
+    detail_tf = d2.selectbox("Timeframe",
+                             ["1s", "1m", "5m", "15m", "1h", "4h", "1d", "1w"],
+                             index=5)
     if st.button("Load detail", type="primary"):
         try:
             cfg = build_cfg(exch, top, min_vol, detail_tf, min_rr, max_stop_atr,
                             risk_pct, equity)
             ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
-            df, used = _load(ex, detail_sym, detail_tf, CHART_BARS, 200)
+            df, used = _load(ex, detail_sym, detail_tf, CHART_BARS, 100)
             if df is None:
                 st.warning(f"Not enough candles for {detail_sym} on {ex_name}.")
             else:
@@ -1015,9 +1020,8 @@ with T["SMC"]:
     ui.section("Smart money map",
                "Structure, zones, volume, the trade and its invalidation.")
     st.caption("Two pivots per timeframe — yellow HTF, cyan LTF — each from the "
-               "wick to the right edge. HTF is capped at 1h and the LTF follows "
-               "the HTF. Drag horizontally to compress/expand time, vertically "
-               "for price; right-drag pans.")
+               "wick to the right edge. HTF is 30m or 1h, LTF is 3m or 5m. Drag "
+               "horizontally to compress/expand time, vertically for price.")
     s1, s2, s3 = st.columns([2, 1, 1])
     smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym")
     smc_tf = s2.selectbox("Entry timeframe",
@@ -1036,9 +1040,16 @@ with T["SMC"]:
                 st.warning(f"No data for {smc_sym} on {ex_name}.")
             else:
                 cdf = _closed(df)
-                htf_tf = cap_htf(cfg.scan.htf)
-                hdf, _ = _load(ex, used, htf_tf, max(HTF_BARS, 250), 60)
-                hdf_c = _closed(hdf) if hdf is not None else None
+                frames = {smc_tf: cdf}
+                for tf in (reversal.SCALP, reversal.FAST, reversal.BASE):
+                    if tf == smc_tf:
+                        continue
+                    d, _u = _load(ex, used, tf, 1200, 200)
+                    if d is not None:
+                        frames[tf] = _closed(d)
+                htf_tf, ltf_tf, _q = reversal.choose_pair(frames, cfg)
+                hdf_c = reversal._frame(frames, htf_tf)
+                ldf_c = frames.get(ltf_tf, cdf)
                 hb = structure_bias(hdf_c, cfg) if hdf_c is not None else "range"
                 stt_tab = build_structure(df, cfg.structure)
                 lb = str(stt_tab["trend"].iloc[-1])
@@ -1064,8 +1075,8 @@ with T["SMC"]:
                         "up" if av["score"] >= 40 else "dn")
                 ui.stat(k[4], "In value area", "yes" if in_va else "no",
                         "up" if in_va else "warn")
-                st.caption(f"HTF {htf_tf} (capped at 1h) · LTF {smc_tf} · {why} "
-                           f"· closed candles only")
+                st.caption(f"HTF {htf_tf} · LTF {ltf_tf} · {why} · closed "
+                           f"candles only · both auto-picked and capped")
 
                 disp = df
                 if chart_minutes(chart_tf) < chart_minutes(smc_tf):
@@ -1074,8 +1085,8 @@ with T["SMC"]:
                         disp = d2
                 st.plotly_chart(chart.build(disp, cfg, side, plan,
                                             chart_tf=chart_tf, analysis_df=cdf,
-                                            htf_df=hdf_c, ltf_df=cdf,
-                                            pair=(htf_tf, smc_tf)),
+                                            htf_df=hdf_c, ltf_df=ldf_c,
+                                            pair=(htf_tf, ltf_tf)),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 st.caption("Gutter: blue = HTF profile (left half), orange = "
@@ -1087,7 +1098,7 @@ with T["SMC"]:
                 st.divider()
                 render_plan(plan, used, ladder=(side == "long"))
                 st.divider()
-                order_card(plan, used, side, smc_tf)
+                order_card(plan, used, side, ltf_tf)
                 if st.button("Log to paper book", key="paper_log"):
                     paper.open_trade(used, side, plan["entry"], plan["sl"],
                                      plan["tp1"], plan["tp2"], plan["qty"], equity,
@@ -1130,8 +1141,8 @@ with T["Radar"]:
 
     st.divider()
     ui.section("Reversal radar",
-               "Pair auto-selected per coin, HTF capped at 1h. Approaching "
-               "first. Only setups still executable are listed.")
+               "HTF 30m/1h, LTF 3m/5m, both auto-picked. Approaching first. "
+               "Only setups still executable are listed.")
     st.caption("Zones from the HTF engine. Confirmation from the LTF CHoCH/BOS "
                "plus the ATR candle grader. Played, extended and already-held "
                "coins are kept out of the live table. Closed candles only.")
@@ -1420,10 +1431,9 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 `Reset venue` clears the pin.
 
 ### Chart timeframes
-The chart selector (1m to 4H) is display-only and defaults to 30m. It re-reads
-candles, never the strategy. The higher timeframe the engine uses is capped at
-1h, and the lower timeframe follows it: 3m under a 15m HTF, 3m or 5m under a
-30m HTF, 5m or 15m under a 1h HTF.
+The chart selector is display-only and defaults to 30m. It re-reads candles,
+never the strategy. The structure pair is capped on both sides: HTF 30m or 1h,
+LTF 3m or 5m.
 
 ### Zoom and history
 Roughly eight windows of history sit behind the visible bars, so zooming out

@@ -115,7 +115,7 @@ never invented.
 ### Sequence
 
 1. **HTF trend.** `build_structure` returns up, down or range. A long needs the
-   HTF not-up, a short not-down. Continuation is skipped.
+   HTF not-down, a short not-up. Continuation is skipped.
 2. **HTF location.** `core.levels.build_zones` clusters swing prices. The
    nearest unmitigated zone within 6 ATR becomes the candidate.
 3. **Proximity.** Measured in HTF ATR. Past 6 ATR the coin drops off. Inside
@@ -274,7 +274,7 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
     fig.update_layout(height=460, template="plotly_dark",
                       paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
                       margin=dict(l=58, r=10, t=26, b=22), showlegend=False,
-                      dragmode="zoom", uirevision="detail",
+                      dragmode="pan", uirevision="detail",
                       title=dict(text=f"{tf} · {len(view)} shown of "
                                       f"{len(hist)} loaded · "
                                       f"{len(breaks)} real gap(s) collapsed",
@@ -651,7 +651,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
 
                 if need_mtf:
                     htf_df, _ = _load(ex, used_sym, cfg.scan.htf,
-                                      max(HTF_BARS, 250), 60)
+                                      cfg.scan.htf_bars, 60)
                     hb_s = structure_bias(_closed(htf_df), cfg) \
                         if htf_df is not None else "range"
                     ok_mtf, why = aligned(hb_s, str(stt["trend"].iloc[-1]), s.direction)
@@ -743,13 +743,16 @@ def cached_reversal(exchange, preferred, proxy, symbols):
     rows = []
     for c in symbols:
         try:
-            ldf, used = _load(ex, f"{c}/USDT:USDT", reversal.SCALP, 1500, 200)
+            ldf, used = _load(ex, f"{c}/USDT:USDT", reversal.SCALP,
+                              reversal.LTF_BARS, reversal.MIN_LTF_BARS)
             if ldf is None:
                 continue
-            fdf, _ = _load(ex, used, reversal.FAST, 1500, 200)
+            fdf, _ = _load(ex, used, reversal.FAST, reversal.LTF_BARS,
+                           reversal.MIN_LTF_BARS)
             if fdf is None:
                 continue
-            mdf, _ = _load(ex, used, reversal.BASE, 1500, 200)
+            mdf, _ = _load(ex, used, reversal.BASE, reversal.LTF_BARS,
+                           reversal.MIN_LTF_BARS)
             if mdf is None:
                 continue
             src = {reversal.SCALP: _closed(ldf), reversal.FAST: _closed(fdf),
@@ -965,14 +968,14 @@ with T["Overview"]:
                 st.caption(
                     f"{used} · {detail_tf} · real venue holes collapsed: {gaps}. "
                     "No candle is invented. The whole loaded history is in the "
-                    "chart, so zooming out reveals earlier candles. Drag to "
-                    "zoom, right-drag to pan, double-click to reset.")
+                    "chart, so zooming out reveals earlier candles. Drag to pan, "
+                    "scroll to zoom, double-click to reset.")
                 st.session_state["detail_ctx"] = {"ex": ex, "sym": used}
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
 
     dctx = st.session_state.get("detail_ctx")
-    if dctx and LIVE_OK and st.toggle("Live 1s tape", key="detail_live"):
+    if dctx and LIVE_OK and st.toggle("Live ticks", key="detail_live"):
         live.render(dctx["ex"], dctx["sym"], "long", "detail_live_seed")
 
     st.divider()
@@ -1066,8 +1069,9 @@ with T["SMC"]:
     ui.section("Smart money map",
                "Structure, zones, volume, the trade and its invalidation.")
     st.caption("Two pivots per timeframe — yellow HTF, cyan LTF — each from the "
-               "wick to the right edge. HTF is 30m or 1h, LTF is 3m or 5m. Drag "
-               "horizontally to compress/expand time, vertically for price.")
+               "wick to the right edge, exact price and BOS/CHoCH tag. HTF is "
+               "30m or 1h, LTF is 3m or 5m. Internal pivots 3+3, external 5+5, "
+               "confirmed only. Drag to pan, scroll to zoom.")
     s1, s2, s3 = st.columns([2, 1, 1])
     smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym")
     smc_tf = s2.selectbox("Entry timeframe",
@@ -1090,7 +1094,8 @@ with T["SMC"]:
                 for tf in (reversal.SCALP, reversal.FAST, reversal.BASE):
                     if tf == smc_tf:
                         continue
-                    d, _u = _load(ex, used, tf, 1200, 200)
+                    d, _u = _load(ex, used, tf, reversal.LTF_BARS,
+                                  reversal.MIN_LTF_BARS)
                     if d is not None:
                         frames[tf] = _closed(d)
                 htf_tf, ltf_tf, _q = reversal.choose_pair(frames, cfg)
@@ -1156,7 +1161,7 @@ with T["SMC"]:
             st.exception(e)
 
     lctx = st.session_state.get("live_ctx")
-    if lctx and LIVE_OK and st.toggle("Live 1s tape", key="smc_live"):
+    if lctx and LIVE_OK and st.toggle("Live ticks", key="smc_live"):
         live.render(lctx["ex"], lctx["sym"], lctx["side"], "smc_live_seed")
 
     st.divider()
@@ -1430,7 +1435,7 @@ if MODE == "Bot":
             j_dir = j2.selectbox("Side", ["long", "short"])
             j_r = j3.number_input("Result (R)", -10.0, 10.0, 0.0, step=0.1)
             j_ok = j4.checkbox("Followed rules", value=True)
-            j_note = st.text_input("Note")
+            j_note = j4.text_input("Note")
             if st.form_submit_button("Log"):
                 p = pathlib.Path("./state/journal.csv")
                 p.parent.mkdir(exist_ok=True)
@@ -1491,21 +1496,26 @@ The chart selector is display-only and defaults to 30m. It re-reads candles,
 never the strategy. The structure pair is capped on both sides: HTF 30m or 1h,
 LTF 3m or 5m.
 
+### Pivots
+Internal 3 left + 3 right, external 5 left + 5 right, from `config.StructCfg`.
+A pivot is only knowable right bars later; that lag is the anti-repainting
+guarantee. Two structure lines per timeframe, anchored at the wick, run to the
+right edge with the exact price and the BOS/CHoCH tag.
+
 ### Freshness
 The freshness slider is hours, not bars. It is converted to bars of the
 timeframe actually scanned, so the same setting means the same wall-clock age
 whether the trigger side resolves to 3m or 5m.
 
-### Live 1s tape
-Available on Coin detail, SMC and Analysis. It polls a ticker once a second and
-draws the ticks it has seen, seeded from real 1s candles where the venue serves
-them. It is display only — the strategy still reads closed 3m/5m bars.
+### Live ticks
+Available on Coin detail, SMC and Analysis. A ticker is polled once a second
+and each tick is folded into a one-second OHLC bucket, so you get real candles,
+not a line. Display only — the strategy still reads closed 3m/5m bars.
 
 ### Zoom and history
+Pan is the default drag. Scroll or drag a box to zoom; X and Y are independent.
 Roughly eight windows of history sit behind the visible bars, so zooming out
-keeps revealing earlier candles instead of empty space. Drag horizontally to
-compress or expand time, vertically to compress or expand price, right-drag to
-pan, double-click to reset.
+keeps revealing earlier candles. Double-click resets.
 
 ### Coin detail gaps
 Sparse history on 1H, 4H and 1D is a venue fact. The detail chart collapses
@@ -1514,10 +1524,6 @@ only real holes and prints how many it hid.
 ### Setups vs Analysis
 Setups is the scanner board, filtered to what can still be executed. Analysis
 is the point-in-time workflow.
-
-### Reading a card
-Chart top to bottom: structure, location, liquidity, volume, acceptance, break,
-candle, range position. Verdict A or B only. C is watch. D is skip.
 
 ### R:R
 TP1, TP2 and the weighted plan are quoted separately. A 50/50 exit between TP1
@@ -1533,7 +1539,7 @@ enough that liquidation sits past the stop.
 
 ### Volume profile
 The right-hand gutter is an OHLCV estimate. Blue is HTF context, orange is LTF
-trigger.
+trigger, both proportional and clear of the candles.
 """)
 
 st.divider()

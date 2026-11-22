@@ -12,8 +12,11 @@ from strategy.risk import plan_rr
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
           exch, proxy, cfg_fn, resolve_fn, load_fn, order_card, notify):
     conf = r["confidence"]
+    pair = (s.meta.get("htf") or "30m", s.meta.get("ltf") or ltf)
     with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
                      f"{s.meta.get('status')} · conf {conf:.0f}/100"):
+        st.caption(f"structure pair **{pair[0]} HTF / {pair[1]} LTF** · auto-"
+                   f"selected on swing separation and density")
         try:
             cfg = cfg_fn(exch, top, min_vol, ltf, min_rr, max_stop_atr,
                          risk_pct, equity)
@@ -26,7 +29,7 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                 ctf = st.selectbox("Chart timeframe", CHART_TFS, index=idx,
                                    key=f"ctf{s.symbol}",
                                    help="Display only. Structure and the plan "
-                                        "stay on the analysis timeframe.")
+                                        "use the auto-selected pair.")
                 disp = df
                 if chart_minutes(ctf) < chart_minutes(ltf):
                     d2, _v = load_fn(ex, s.symbol, data_tf(ctf), 400)
@@ -36,7 +39,8 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                 plan = {"entry": s.entry, "sl": s.stop, "tp1": s.tp1,
                         "tp2": s.tp2}
                 st.plotly_chart(chart.build(disp, cfg, s.direction, plan,
-                                            chart_tf=ctf, analysis_df=cdf),
+                                            chart_tf=ctf, analysis_df=cdf,
+                                            pair=pair),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 with st.expander("How to read this chart"):
@@ -71,7 +75,7 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                     "size_usd": s.meta.get("risk_cash", 0),
                     "rr1": rr["rr1"], "rr2": rr["rr2"],
                     "weighted_rr": rr["weighted"]},
-                   s.symbol, s.direction, ltf)
+                   s.symbol, s.direction, pair[1])
 
         c1, c2 = st.columns(2)
         if c1.button("Alert me", key=f"ba{s.symbol}"):

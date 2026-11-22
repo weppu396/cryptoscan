@@ -4,9 +4,9 @@ Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves,
 bounded history with a short initial window, all marks to the right edge, both
 axes free for independent zoom, HTF capped at 1h and LTF at 5m.
 
-Swings, events and sweeps reach this module in three different shapes: Swing
-objects, StructureEvent objects, and plain dicts from smc. Every read goes
-through _sv() so a dict can never raise AttributeError again.
+Swings, events and sweeps arrive in three shapes: Swing objects, StructureEvent
+objects, and plain dicts from smc. Every read goes through _sv() so a dict can
+never raise AttributeError again.
 """
 import numpy as np
 import pandas as pd
@@ -47,7 +47,7 @@ OHLC = ("open", "high", "low", "close")
 
 
 # --------------------------------------------------------------------------- #
-# shape-agnostic reads. dict, Swing or StructureEvent all work.
+# shape-agnostic reads: dict, Swing and StructureEvent all work
 # --------------------------------------------------------------------------- #
 def _sv(obj, key, default=None):
     if obj is None:

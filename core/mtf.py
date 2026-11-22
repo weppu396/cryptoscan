@@ -1,7 +1,8 @@
 """core/mtf.py - explicit HTF/LTF pairing with a structure-based bias."""
 from .structure import build_structure
 
-PAIRS = {"3m": "15m", "5m": "30m", "15m": "1h", "1h": "4h", "4h": "1d"}
+PAIRS = {"1m": "5m", "3m": "15m", "5m": "30m", "15m": "1h", "30m": "4h",
+         "1h": "4h", "4h": "1d"}
 
 
 def htf_for(ltf: str) -> str:

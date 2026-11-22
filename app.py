@@ -29,6 +29,9 @@ import smc
 import sop
 import ui
 from config import AUTH_ENABLED, CFG
+from core import reversal_alerts
+from core.tfs import CHART_TFS, chart_minutes, data_tf
+from strategy import reversal
 
 try:
     import analysis_page
@@ -556,6 +559,33 @@ def cached_radar(exchange, preferred, proxy):
     return out
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_reversal(exchange, preferred, proxy, symbols):
+    """30m context, 3m trigger. Reuses build_zones, build_structure and the
+    existing candle grader. Nothing is auto-traded."""
+    cfg = build_cfg(exchange, 40, 30e6, reversal.LTF, 2.0, 3.5, 0.5, 10000)
+    ex, name = _resolve(cfg, preferred, proxy)
+    try:
+        held = {r["symbol"] for r in paper.open_rows()}
+    except Exception:
+        held = set()
+    rows = []
+    for c in symbols:
+        try:
+            hdf, used = _load(ex, f"{c}/USDT:USDT", reversal.HTF, 500, 120)
+            if hdf is None:
+                continue
+            ldf, _ = _load(ex, used, reversal.LTF, 500, 200)
+            if ldf is None:
+                continue
+            r = reversal.evaluate(used, hdf, ldf, cfg, already=used in held)
+            if r:
+                rows.append(r)
+        except Exception:
+            continue
+    return rows, name
+
+
 with st.sidebar:
     st.markdown('<div class="auth-logo">◈</div>', unsafe_allow_html=True)
     st.markdown("**CryptoScan**")
@@ -831,6 +861,8 @@ with T["SMC"]:
     smc_tf = s2.selectbox("Entry timeframe", ["3m", "5m", "15m", "1h", "4h", "1d"],
                           index=2, key="smc_tf")
     side = s3.radio("Side", ["long", "short"], horizontal=True)
+    chart_tf = chart.st_selectbox("smc_chart_tf",
+                                  CHART_TFS.index(smc_tf) if smc_tf in CHART_TFS else 3)
     if st.button("Build map", type="primary"):
         try:
             cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
@@ -840,7 +872,7 @@ with T["SMC"]:
             if df is None:
                 st.warning(f"No data for {smc_sym} on {ex_name}.")
             else:
-                hdf, _ = _load(ex, smc_sym, cfg.scan.htf, max(HTF_BARS, 250), 60)
+                hdf, _ = _load(ex, used, cfg.scan.htf, max(HTF_BARS, 250), 60)
                 hb = structure_bias(hdf, cfg)
                 stt_tab = build_structure(df, cfg.structure)
                 lb = str(stt_tab["trend"].iloc[-1])
@@ -864,9 +896,19 @@ with T["SMC"]:
                 ui.stat(k[4], "In value area", "yes" if in_va else "no",
                         "up" if in_va else "warn")
                 st.caption(f"pair {smc_tf}/{cfg.scan.htf} · {why}")
-                st.plotly_chart(chart.build(df, cfg, side, plan),
+
+                disp = df
+                if chart_minutes(chart_tf) < chart_minutes(smc_tf):
+                    d2, _v = _load(ex, used, data_tf(chart_tf), 400)
+                    if d2 is not None:
+                        disp = d2
+                st.plotly_chart(chart.build(disp, cfg, side, plan,
+                                            chart_tf=chart_tf, analysis_df=df,
+                                            htf_df=hdf),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
+                st.caption("Chart timeframe is display only — structure, zones "
+                           "and the plan stay on 30m context / 3m trigger.")
                 with st.expander("How to read this chart"):
                     st.markdown(chart.legend_md())
                 st.divider()
@@ -910,6 +952,61 @@ with T["Radar"]:
                      hide_index=True, use_container_width=True)
     else:
         st.info("Press Refresh radar.")
+
+    st.divider()
+    ui.section("Reversal radar",
+               "30m context, 3m trigger. Approaching coins first. Active "
+               "entries are new, confirmed and still in range.")
+    st.caption("Zones from the 30m engine. Confirmation from the existing 3m "
+               "CHoCH/BOS plus the ATR candle grader. Extended moves and coins "
+               "already in the paper book are kept out of the new-entry list.")
+    if st.button("Scan reversals", key="rev_scan", type="primary"):
+        try:
+            with st.spinner("reading 30m context and 3m triggers..."):
+                rows, venue = cached_reversal(exch, exch, proxy.strip() or None,
+                                              MAJORS[:12])
+            st.session_state["rev_rows"] = rows
+            st.session_state["rev_venue"] = venue
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
+
+    rev_rows = st.session_state.get("rev_rows", [])
+    if rev_rows:
+        live, dead = reversal.rank(rev_rows)
+        st.caption(f"venue {st.session_state.get('rev_venue', '—')} · "
+                   f"{len(live)} live · {len(dead)} stale")
+        if live:
+            st.dataframe(pd.DataFrame([{
+                "status": r["status"], "symbol": r["symbol"],
+                "side": r["direction"], "zone": f"{r['zone'][0]:,.6g}–"
+                                               f"{r['zone'][1]:,.6g}",
+                "dist ATR": r["dist_atr"], "entry": f"{r['entry']:,.6g}",
+                "stop": f"{r['stop']:,.6g}", "tp1": f"{r['tp1']:,.6g}",
+                "rr": round(r["rr"], 2),
+                "eta": f"~{r['eta_min']:.0f}m" if r["eta_min"] else "—",
+                "why": " · ".join(r["reasons"]) or "—"} for r in live]),
+                hide_index=True, use_container_width=True)
+
+        entries = reversal.active_entries(rev_rows)
+        st.markdown("##### Active entries")
+        if not entries:
+            st.info("No new confirmed reversal is still in its entry range.")
+        else:
+            for r in entries:
+                st.write(f"**{r['symbol']} {r['direction'].upper()}** · entry "
+                         f"{r['entry']:,.6g} · stop {r['stop']:,.6g} · tp1 "
+                         f"{r['tp1']:,.6g} · tp2 {r['tp2']:,.6g} · R:R "
+                         f"{r['rr']:.2f}")
+
+        with st.expander(f"Missed / invalidated ({len(dead)})"):
+            st.dataframe(pd.DataFrame([{
+                "status": r["status"], "symbol": r["symbol"],
+                "side": r["direction"], "zone": f"{r['zone'][0]:,.6g}–"
+                                               f"{r['zone'][1]:,.6g}",
+                "rr": round(r["rr"], 2)} for r in dead]),
+                hide_index=True, use_container_width=True)
+    else:
+        st.info("Press Scan reversals.")
 
 
 with T["Portfolio"]:
@@ -1038,6 +1135,42 @@ if MODE == "Bot":
                 ok, msg = notify("CryptoScan test — alerts working.")
             st.success(msg) if ok else st.error(msg)
 
+        st.divider()
+        ui.section("Reversal alerts",
+                   "Early warning 5-10 minutes out, then a separate confirmed "
+                   "entry. Reuses the same Telegram credentials.")
+        st.caption("ETA comes from distance divided by the 30m ATR per bar. It "
+                   "is an estimate and drifts when volatility changes. Duplicate "
+                   "and stale alerts are suppressed. Nothing is auto-traded.")
+        a1, a2 = st.columns(2)
+        auto = a1.checkbox("Poll automatically", value=False,
+                           help="Re-scans every 90s while this tab is open.")
+        a2.caption("Manual poll uses the same dedupe as the automatic one.")
+        state = st.session_state.setdefault("rev_alerts", reversal_alerts.State())
+
+        def _poll() -> None:
+            try:
+                rows, _v = cached_reversal(exch, exch, proxy.strip() or None,
+                                           MAJORS[:12])
+                cfg = build_cfg(exch, top, min_vol, reversal.LTF, min_rr,
+                                max_stop_atr, risk_pct, equity)
+                batch = state.due(rows, cfg.risk.min_rr)
+                state.prune()
+                for r, kind, text in batch:
+                    notify(text)
+                st.session_state["rev_sent"] = (
+                    f"{len(batch)} alert(s) at {pd.Timestamp.utcnow():%H:%M:%S} UTC")
+            except Exception as e:
+                st.session_state["rev_sent"] = f"{type(e).__name__}: {e}"
+
+        if auto and HAS_FRAGMENT:
+            st.fragment(run_every="90s")(_poll)()
+        elif st.button("Poll now", key="rev_poll"):
+            with st.spinner("checking zones..."):
+                _poll()
+        if st.session_state.get("rev_sent"):
+            st.caption(st.session_state["rev_sent"])
+
 
 if MODE == "Bot":
     with T["Journal"]:
@@ -1107,9 +1240,18 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 The bias timeframe is always paired to the entry timeframe, roughly 1:4. The
 sidebar shows the pair and the bar count.
 
+The **chart** timeframe is separate and display-only: 1m through 4H. Switching
+it re-reads candles, never the strategy. Structure marks stay 30m major / 3m
+minor, and the plan you see was built on the analysis timeframe.
+
 ### Setups vs Analysis
 Setups is the scanner board. Analysis is the point-in-time workflow: dual-layer
 structure, readiness, next action, three chart modes.
+
+### Reversal radar
+30m gives context, 3m gives the trigger. Statuses run Approaching, Developing,
+Confirmed, Active Entry, Missed, Invalidated. Only Active Entry means a new
+confirmed setup that is still inside its range with an acceptable R:R.
 
 ### Gates
 `Require MTF` and `Require AVWAP` are strict — turn them on once the board gives
@@ -1126,6 +1268,11 @@ qty = (equity × risk percent) ÷ (entry − stop)
 Post-only limit entry, stop-market reduce-only on mark price, TP1 and TP2 limits
 reduce-only at 50% each. Round down to step size. Isolated margin, leverage low
 enough that liquidation sits past the stop.
+
+### Volume profile
+The gutter is an OHLCV estimate, not tick data. Bars carry no trade direction,
+so volume is spread evenly across each bar's range. Use it for where value
+sits, not for exact resting size.
 """)
 
 st.divider()

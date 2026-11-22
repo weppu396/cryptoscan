@@ -29,9 +29,16 @@ import smc
 import sop
 import ui
 from config import AUTH_ENABLED, CFG
-from core import reversal_alerts
 from core.tfs import CHART_TFS, chart_minutes, data_tf
-from strategy import reversal
+
+# Optional layers. A missing or broken module must cost one panel, never the app.
+try:
+    from core import reversal_alerts
+    from strategy import reversal
+    REVERSAL_OK, REVERSAL_ERR = True, ""
+except Exception as _e:
+    reversal_alerts = reversal = None
+    REVERSAL_OK, REVERSAL_ERR = False, f"{type(_e).__name__}: {_e}"
 
 try:
     import analysis_page
@@ -861,8 +868,8 @@ with T["SMC"]:
     smc_tf = s2.selectbox("Entry timeframe", ["3m", "5m", "15m", "1h", "4h", "1d"],
                           index=2, key="smc_tf")
     side = s3.radio("Side", ["long", "short"], horizontal=True)
-    chart_tf = chart.st_selectbox("smc_chart_tf",
-                                  CHART_TFS.index(smc_tf) if smc_tf in CHART_TFS else 3)
+    chart_tf = chart.st_selectbox(
+        "smc_chart_tf", CHART_TFS.index(smc_tf) if smc_tf in CHART_TFS else 3)
     if st.button("Build map", type="primary"):
         try:
             cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
@@ -957,56 +964,59 @@ with T["Radar"]:
     ui.section("Reversal radar",
                "30m context, 3m trigger. Approaching coins first. Active "
                "entries are new, confirmed and still in range.")
-    st.caption("Zones from the 30m engine. Confirmation from the existing 3m "
-               "CHoCH/BOS plus the ATR candle grader. Extended moves and coins "
-               "already in the paper book are kept out of the new-entry list.")
-    if st.button("Scan reversals", key="rev_scan", type="primary"):
-        try:
-            with st.spinner("reading 30m context and 3m triggers..."):
-                rows, venue = cached_reversal(exch, exch, proxy.strip() or None,
-                                              MAJORS[:12])
-            st.session_state["rev_rows"] = rows
-            st.session_state["rev_venue"] = venue
-        except Exception as e:
-            st.error(f"{type(e).__name__}: {e}")
-
-    rev_rows = st.session_state.get("rev_rows", [])
-    if rev_rows:
-        live, dead = reversal.rank(rev_rows)
-        st.caption(f"venue {st.session_state.get('rev_venue', '—')} · "
-                   f"{len(live)} live · {len(dead)} stale")
-        if live:
-            st.dataframe(pd.DataFrame([{
-                "status": r["status"], "symbol": r["symbol"],
-                "side": r["direction"], "zone": f"{r['zone'][0]:,.6g}–"
-                                               f"{r['zone'][1]:,.6g}",
-                "dist ATR": r["dist_atr"], "entry": f"{r['entry']:,.6g}",
-                "stop": f"{r['stop']:,.6g}", "tp1": f"{r['tp1']:,.6g}",
-                "rr": round(r["rr"], 2),
-                "eta": f"~{r['eta_min']:.0f}m" if r["eta_min"] else "—",
-                "why": " · ".join(r["reasons"]) or "—"} for r in live]),
-                hide_index=True, use_container_width=True)
-
-        entries = reversal.active_entries(rev_rows)
-        st.markdown("##### Active entries")
-        if not entries:
-            st.info("No new confirmed reversal is still in its entry range.")
-        else:
-            for r in entries:
-                st.write(f"**{r['symbol']} {r['direction'].upper()}** · entry "
-                         f"{r['entry']:,.6g} · stop {r['stop']:,.6g} · tp1 "
-                         f"{r['tp1']:,.6g} · tp2 {r['tp2']:,.6g} · R:R "
-                         f"{r['rr']:.2f}")
-
-        with st.expander(f"Missed / invalidated ({len(dead)})"):
-            st.dataframe(pd.DataFrame([{
-                "status": r["status"], "symbol": r["symbol"],
-                "side": r["direction"], "zone": f"{r['zone'][0]:,.6g}–"
-                                               f"{r['zone'][1]:,.6g}",
-                "rr": round(r["rr"], 2)} for r in dead]),
-                hide_index=True, use_container_width=True)
+    if not REVERSAL_OK:
+        st.warning(f"Reversal layer unavailable: {REVERSAL_ERR}")
     else:
-        st.info("Press Scan reversals.")
+        st.caption("Zones from the 30m engine. Confirmation from the existing 3m "
+                   "CHoCH/BOS plus the ATR candle grader. Extended moves and coins "
+                   "already in the paper book are kept out of the new-entry list.")
+        if st.button("Scan reversals", key="rev_scan", type="primary"):
+            try:
+                with st.spinner("reading 30m context and 3m triggers..."):
+                    rows, venue = cached_reversal(exch, exch, proxy.strip() or None,
+                                                  MAJORS[:12])
+                st.session_state["rev_rows"] = rows
+                st.session_state["rev_venue"] = venue
+            except Exception as e:
+                st.error(f"{type(e).__name__}: {e}")
+
+        rev_rows = st.session_state.get("rev_rows", [])
+        if rev_rows:
+            live, dead = reversal.rank(rev_rows)
+            st.caption(f"venue {st.session_state.get('rev_venue', '—')} · "
+                       f"{len(live)} live · {len(dead)} stale")
+            if live:
+                st.dataframe(pd.DataFrame([{
+                    "status": r["status"], "symbol": r["symbol"],
+                    "side": r["direction"],
+                    "zone": f"{r['zone'][0]:,.6g}–{r['zone'][1]:,.6g}",
+                    "dist ATR": r["dist_atr"], "entry": f"{r['entry']:,.6g}",
+                    "stop": f"{r['stop']:,.6g}", "tp1": f"{r['tp1']:,.6g}",
+                    "rr": round(r["rr"], 2),
+                    "eta": f"~{r['eta_min']:.0f}m" if r["eta_min"] else "—",
+                    "why": " · ".join(r["reasons"]) or "—"} for r in live]),
+                    hide_index=True, use_container_width=True)
+
+            entries = reversal.active_entries(rev_rows)
+            st.markdown("##### Active entries")
+            if not entries:
+                st.info("No new confirmed reversal is still in its entry range.")
+            else:
+                for r in entries:
+                    st.write(f"**{r['symbol']} {r['direction'].upper()}** · entry "
+                             f"{r['entry']:,.6g} · stop {r['stop']:,.6g} · tp1 "
+                             f"{r['tp1']:,.6g} · tp2 {r['tp2']:,.6g} · R:R "
+                             f"{r['rr']:.2f}")
+
+            with st.expander(f"Missed / invalidated ({len(dead)})"):
+                st.dataframe(pd.DataFrame([{
+                    "status": r["status"], "symbol": r["symbol"],
+                    "side": r["direction"],
+                    "zone": f"{r['zone'][0]:,.6g}–{r['zone'][1]:,.6g}",
+                    "rr": round(r["rr"], 2)} for r in dead]),
+                    hide_index=True, use_container_width=True)
+        else:
+            st.info("Press Scan reversals.")
 
 
 with T["Portfolio"]:
@@ -1139,37 +1149,43 @@ if MODE == "Bot":
         ui.section("Reversal alerts",
                    "Early warning 5-10 minutes out, then a separate confirmed "
                    "entry. Reuses the same Telegram credentials.")
-        st.caption("ETA comes from distance divided by the 30m ATR per bar. It "
-                   "is an estimate and drifts when volatility changes. Duplicate "
-                   "and stale alerts are suppressed. Nothing is auto-traded.")
-        a1, a2 = st.columns(2)
-        auto = a1.checkbox("Poll automatically", value=False,
-                           help="Re-scans every 90s while this tab is open.")
-        a2.caption("Manual poll uses the same dedupe as the automatic one.")
-        state = st.session_state.setdefault("rev_alerts", reversal_alerts.State())
+        if not REVERSAL_OK:
+            st.warning(f"Reversal layer unavailable: {REVERSAL_ERR}")
+        else:
+            st.caption("ETA comes from distance divided by the 30m ATR per bar. It "
+                       "is an estimate and drifts when volatility changes. "
+                       "Duplicate and stale alerts are suppressed. Nothing is "
+                       "auto-traded.")
+            a1, a2 = st.columns(2)
+            auto = a1.checkbox("Poll automatically", value=False,
+                               help="Re-scans every 90s while this tab is open.")
+            a2.caption("Manual poll uses the same dedupe as the automatic one.")
+            state = st.session_state.setdefault("rev_alerts",
+                                                reversal_alerts.State())
 
-        def _poll() -> None:
-            try:
-                rows, _v = cached_reversal(exch, exch, proxy.strip() or None,
-                                           MAJORS[:12])
-                cfg = build_cfg(exch, top, min_vol, reversal.LTF, min_rr,
-                                max_stop_atr, risk_pct, equity)
-                batch = state.due(rows, cfg.risk.min_rr)
-                state.prune()
-                for r, kind, text in batch:
-                    notify(text)
-                st.session_state["rev_sent"] = (
-                    f"{len(batch)} alert(s) at {pd.Timestamp.utcnow():%H:%M:%S} UTC")
-            except Exception as e:
-                st.session_state["rev_sent"] = f"{type(e).__name__}: {e}"
+            def _poll() -> None:
+                try:
+                    rows, _v = cached_reversal(exch, exch, proxy.strip() or None,
+                                               MAJORS[:12])
+                    cfg = build_cfg(exch, top, min_vol, reversal.LTF, min_rr,
+                                    max_stop_atr, risk_pct, equity)
+                    batch = state.due(rows, cfg.risk.min_rr)
+                    state.prune()
+                    for r, kind, text in batch:
+                        notify(text)
+                    st.session_state["rev_sent"] = (
+                        f"{len(batch)} alert(s) at "
+                        f"{pd.Timestamp.utcnow():%H:%M:%S} UTC")
+                except Exception as e:
+                    st.session_state["rev_sent"] = f"{type(e).__name__}: {e}"
 
-        if auto and HAS_FRAGMENT:
-            st.fragment(run_every="90s")(_poll)()
-        elif st.button("Poll now", key="rev_poll"):
-            with st.spinner("checking zones..."):
-                _poll()
-        if st.session_state.get("rev_sent"):
-            st.caption(st.session_state["rev_sent"])
+            if auto and HAS_FRAGMENT:
+                st.fragment(run_every="90s")(_poll)()
+            elif st.button("Poll now", key="rev_poll"):
+                with st.spinner("checking zones..."):
+                    _poll()
+            if st.session_state.get("rev_sent"):
+                st.caption(st.session_state["rev_sent"])
 
 
 if MODE == "Bot":

@@ -1,8 +1,13 @@
 """chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
 
-Candles 0-76%, gutter 78.5-100% in two halves, bounded history with a short
-initial window, all marks to the right edge, both axes free for independent
-zoom with pan as the default drag. HTF capped at 1h, LTF at 5m.
+Each layer is placed on its own source frame: external events are indexed in the
+HTF frame, internal events in the LTF frame. Feeding both layers from one frame
+is what made an opposing LTF impossible to draw.
+
+History: the trace carries the whole loaded frame (up to MAX_TRACE bars), so
+panning left always finds candles. The initial window is only an initial range,
+and uirevision is keyed to the view so zoom survives reruns but not a timeframe
+switch.
 
 Swings, events and sweeps arrive in three shapes: Swing objects, StructureEvent
 objects, and plain dicts from smc. Every read goes through _sv().
@@ -28,9 +33,9 @@ DEMAND_EDGE = "rgba(88,206,150,0.85)"
 BG = "#0f1116"
 MODES = ("structure", "analysis", "execution")
 LAYERS = {
-    "structure": {"candles", "ext_swing", "int_swing", "breaks", "tags"},
+    "structure": {"candles", "ext_swing", "int_swing", "breaks", "tags", "plan"},
     "analysis": {"candles", "ext_swing", "breaks", "zones", "fvg", "sweeps",
-                 "vp", "avwap"},
+                 "vp", "avwap", "plan"},
     "execution": {"candles", "zone", "plan"},
 }
 STYLE = {Layer.EXTERNAL: (2.2, HTF_LINE), Layer.INTERNAL: (1.8, LTF_LINE)}
@@ -40,9 +45,11 @@ PRICE_DOMAIN = [0.0, 0.76]
 PROFILE_DOMAIN = [0.785, 1.0]
 HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
 MAX_MARKS = 2
+LABEL_KEEP = 4
 DEFAULT_BARS = 110
-MAX_TRACE = 1200
+MAX_TRACE = 6000
 OHLC = ("open", "high", "low", "close")
+EQ_TOL_ATR = 0.25
 
 
 def _sv(obj, key, default=None):
@@ -141,6 +148,33 @@ def _gutter(fig):
     return prop.replace("axis", ""), prop
 
 
+def _classify(swings, atr, eq_tol):
+    """HH / HL / LH / LL against the previous pivot of the same kind, plus EQ."""
+    out = {}
+    last_h = last_l = None
+    tol = max(eq_tol, 0.0)
+    for s in sorted(swings, key=lambda x: int(_sv(x, "idx", 0))):
+        price = float(_sv(s, "price"))
+        if _sv(s, "kind") == "H":
+            if last_h is None:
+                tag = ""
+            elif abs(price - last_h) <= tol:
+                tag = "EQH"
+            else:
+                tag = "HH" if price > last_h else "LH"
+            last_h = price
+        else:
+            if last_l is None:
+                tag = ""
+            elif abs(price - last_l) <= tol:
+                tag = "EQL"
+            else:
+                tag = "HL" if price > last_l else "LL"
+            last_l = price
+        out[id(s)] = tag
+    return out
+
+
 def _profile(fig, df, bars, color, axis, side):
     """Proportional bars in the dedicated gutter half. Thicker than the bar step
     so they read as one band, never touching the candles."""
@@ -186,6 +220,14 @@ def _struct(fig, ts, price, x1, color, width, label, tag):
                        xshift=5, yshift=3, font=dict(size=9, color=color))
 
 
+def _pivot_label(fig, ts, price, tag, kind, color):
+    fig.add_annotation(x=ts, xref="x", y=price, yref="y", text=tag,
+                       showarrow=False, xanchor="center",
+                       yanchor="bottom" if kind == "H" else "top",
+                       yshift=6 if kind == "H" else -6,
+                       font=dict(size=8, color=color))
+
+
 def _zone(fig, z, x0, x1, label, tf):
     supply = z["side"] == "supply"
     fill = SUPPLY_FILL if supply else DEMAND_FILL
@@ -206,7 +248,9 @@ def _zone(fig, z, x0, x1, label, tf):
 
 def build(df, frame, direction, plan=None, mode="analysis", layers=None,
           bars=DEFAULT_BARS, chart_tf=None, analysis_df=None,
-          htf_df=None, ltf_df=None, pair=None, cfg=None) -> go.Figure:
+          htf_df=None, ltf_df=None, pair=None, cfg=None,
+          frames=None) -> go.Figure:
+    """frames maps Layer -> the frame that layer's indices belong to."""
     if mode not in MODES:
         raise ValueError(mode)
     df = _clean(df)
@@ -224,6 +268,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     keep = MAX_MARKS
     zone_keep = 1
+    eq_tol = 0.0
     if cfg is not None:
         keep = max(1, int(getattr(cfg.structure, "line_keep", MAX_MARKS)))
         zone_keep = max(1, int(getattr(cfg.structure, "zone_keep", 1)))
@@ -238,11 +283,22 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if ltf_df is None:
         ltf_df = adf
 
+    src = dict(frames or {})
+    if htf_df is not None and Layer.EXTERNAL not in src:
+        src[Layer.EXTERNAL] = htf_df
+    if Layer.INTERNAL not in src:
+        src[Layer.INTERNAL] = ltf_df if ltf_df is not None else adf
+
+    def layer_frame(layer):
+        f = src.get(layer)
+        if f is None or not len(f):
+            return adf
+        return f
+
     on = set(layers) if layers else LAYERS[mode]
-    hist = df.tail(min(MAX_TRACE, max(bars * 8, bars)))
+    hist = df.tail(MAX_TRACE)
     view = hist.tail(bars)
     step = _step(hist)
-    t = len(adf) - 1
     long = direction == "long"
     last_x = hist.index[-1]
     right = _future(last_x, step, 6)
@@ -259,31 +315,46 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         whiskerwidth=0.6, showlegend=False), row=1, col=1)
 
     swings = _swings(frame)
+    atr_ref = float((hist["high"] - hist["low"]).tail(50).median() or 0.0)
+    eq_tol = EQ_TOL_ATR * atr_ref
 
     for layer in (Layer.EXTERNAL, Layer.INTERNAL):
         key = "ext_swing" if layer == Layer.EXTERNAL else "int_swing"
-        if key not in on:
-            continue
-        for s in swings:
-            if _lay(s) != layer.value:
+        f = layer_frame(layer)
+        pts = [s for s in swings if _lay(s) == layer.value]
+        tags = _classify(pts, atr_ref, eq_tol)
+        visible = []
+        for s in pts:
+            idx = int(_sv(s, "idx", -1))
+            if idx < 0 or idx >= len(f):
                 continue
-            idx = _sv(s, "idx")
-            if idx is None or int(idx) >= len(adf) or adf.index[int(idx)] < start:
+            ts = f.index[idx]
+            if ts < start:
+                continue
+            visible.append((ts, s))
+            if key not in on:
                 continue
             fig.add_trace(go.Scatter(
-                x=[adf.index[int(idx)]], y=[float(_sv(s, "price"))],
-                mode="markers",
+                x=[ts], y=[float(_sv(s, "price"))], mode="markers",
                 marker=dict(symbol="triangle-down" if _sv(s, "kind") == "H"
                             else "triangle-up", size=5, color=MUT,
                             opacity=.45), showlegend=False), row=1, col=1)
+        if key in on:
+            for ts, s in visible[-LABEL_KEEP:]:
+                tag = tags.get(id(s), "")
+                if tag:
+                    _pivot_label(fig, ts, float(_sv(s, "price")), tag,
+                                 _sv(s, "kind"), MUT)
 
     if "breaks" in on:
         for layer in (Layer.EXTERNAL, Layer.INTERNAL):
-            live = [e for e in _live(frame, t) if _lay(e) == layer.value
-                    and int(_sv(e, "break_idx", 0)) < len(adf)
-                    and adf.index[int(_sv(e, "break_idx", 0))] >= start
-                    and int(_sv(e, "confirm_idx", 0)) <= len(adf) - 2]
-            live = thin([{"ts": adf.index[int(_sv(e, "break_idx", 0))],
+            f = layer_frame(layer)
+            t_l = len(f) - 1
+            live = [e for e in _live(frame, t_l) if _lay(e) == layer.value
+                    and int(_sv(e, "break_idx", 0)) < len(f)
+                    and f.index[int(_sv(e, "break_idx", 0))] >= start
+                    and int(_sv(e, "confirm_idx", 0)) <= t_l]
+            live = thin([{"ts": f.index[int(_sv(e, "break_idx", 0))],
                           "level": float(_sv(e, "level")), "e": e} for e in live],
                         0.0)
             w, col = STYLE[layer]
@@ -291,7 +362,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 e = row["e"]
                 c = WARN if (_lab(e) == "CHoCH"
                              and layer == Layer.EXTERNAL) else col
-                _struct(fig, adf.index[int(_sv(e, "break_idx", 0))],
+                _struct(fig, f.index[int(_sv(e, "break_idx", 0))],
                         float(_sv(e, "level")), right, c, w,
                         f"{_sv(e, 'direction', '').upper()}", _lab(e))
 
@@ -301,7 +372,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             for z in volume_zones(htf_df, _CFG, htf_label, "HTF", direction,
                                   keep=zone_keep):
                 _zone(fig, z, max(z["ts"], start), right, "HTF", htf_label)
-            for z in volume_zones(ltf_df, _CFG, ltf_label, "LTF", direction,
+        except Exception:
+            pass
+        try:
+            from config import CFG as _CFG2
+            for z in volume_zones(ltf_df, _CFG2, ltf_label, "LTF", direction,
                                   keep=zone_keep):
                 _zone(fig, z, max(z["ts"], start), right, "LTF", ltf_label)
         except Exception:
@@ -335,7 +410,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         try:
             pool = [s for s in swings if _lay(s) == Layer.EXTERNAL.value
                     and _sv(s, "kind") == ("L" if long else "H")
-                    and int(_sv(s, "confirmed_at", 0)) <= t]
+                    and int(_sv(s, "confirmed_at", 0)) <= len(adf) - 1]
             if pool:
                 line = anchored_vwap(adf, int(_sv(pool[-1], "idx"))).tail(len(hist))
                 fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",
@@ -356,8 +431,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             pass
 
     if plan and "plan" in on:
-        for y, col, txt in ((plan["entry"], BLUE, "ENTRY"), (plan["stop"], DN, "SL"),
-                            (plan["tp1"], UP, "TP1"), (plan["tp2"], UP, "TP2")):
+        for y, col, txt in ((plan.get("entry"), BLUE, "ENTRY"),
+                            (plan.get("stop"), DN, "SL"),
+                            (plan.get("tp1"), UP, "TP1"),
+                            (plan.get("tp2"), UP, "TP2")):
+            if y is None:
+                continue
             fig.add_shape(type="line", xref="x", yref="y", x0=last_x, x1=right,
                           y0=y, y1=y, line=dict(color=col, width=1.4))
             fig.add_annotation(x=right, xref="x", y=y, yref="y", xanchor="left",
@@ -380,7 +459,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=62, r=10, t=42, b=22),
                       showlegend=False, hovermode="x unified", dragmode="pan",
-                      uirevision="cryptoscan",
+                      uirevision=f"cs|{chart_tf or ''}|{htf_label}|{ltf_label}",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
                                       f"gutter blue = HTF, orange = LTF",

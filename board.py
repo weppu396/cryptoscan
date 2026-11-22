@@ -150,21 +150,31 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
     if bd:
         st.caption(f"venue {bd['venue']} · universe {bd['universe']} · loaded "
                    f"{bd['loaded']} · failed {bd['err']} · raw {bd['raw']} · "
-                   f"kept {bd['kept']} · stale {bd['stale']} · played "
-                   f"{bd.get('past_skip', 0)} · below grade {bd['below_grade']} "
-                   f"· mtf {bd['mtf_skip']} · volume {bd['vol_skip']} · no "
-                   f"anchor {bd['no_anchor']} · HTF {bd.get('htf', '1h')}")
+                   f"kept {bd['kept']} · stale {bd['stale']} · live "
+                   f"{bd.get('actionable', 0) + bd.get('better', 0)} "
+                   f"(actionable {bd.get('actionable', 0)} / better "
+                   f"{bd.get('better', 0)}) · played {bd.get('extended', 0)} · "
+                   f"invalid {bd.get('invalid', 0)} · below grade "
+                   f"{bd['below_grade']} · mtf {bd['mtf_skip']} · volume "
+                   f"{bd['vol_skip']} · no anchor {bd['no_anchor']} · scan "
+                   f"{bd.get('ltf', '5m')} · HTF {bd.get('htf', '1h')} · "
+                   f"freshness {bd.get('recent', 12)}h")
         if bd["universe"] < 8:
             st.warning(f"Only {bd['universe']} symbols on this venue. If it is "
                        f"binanceus, pick okx or bybit — it has almost no perps.")
         if bd["loaded"] and not bd["raw"]:
-            st.warning("Candles loaded but no breaks in the window. Raise "
-                       "freshness to 24, keep Relax on, or widen the universe.")
+            st.warning("Candles loaded but no break-of-structure in the window. "
+                       "Raise freshness to 48h, keep Relax on, or widen the "
+                       "universe.")
         if bd["loaded"] and bd["err"] >= bd["loaded"]:
             st.warning("Most symbols failed — rate limiting. Lower universe size "
                        "or choose a venue manually.")
+        if bd["kept"] and not (bd.get("actionable", 0) + bd.get("better", 0)):
+            st.warning("Setups were found but every one has already run away "
+                       "from its entry. Raise freshness hours, or wait for a "
+                       "pullback into the zone.")
         if bd["stale"] > bd["kept"]:
-            st.caption(f"{bd['stale']} setups fell outside the {bd['recent']}-bar "
+            st.caption(f"{bd['stale']} setups fell outside the {bd['recent']}h "
                        f"freshness window. Raise it to see more.")
 
     board = [s for s in st.session_state.get("board", [])

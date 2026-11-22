@@ -25,6 +25,25 @@ class Setup:
     def stop_atr(self) -> float:
         return abs(self.entry - self.stop) / self.atr
 
+    @property
+    def risk(self) -> float:
+        return abs(self.entry - self.stop)
+
+    @property
+    def rr1(self) -> float:
+        r = self.risk
+        return abs(self.tp1 - self.entry) / r if r else 0.0
+
+    @property
+    def rr2(self) -> float:
+        r = self.risk
+        return abs(self.tp2 - self.entry) / r if r else 0.0
+
+    @property
+    def weighted_rr(self) -> float:
+        """Expected R on a 50/50 partial exit. rr2 alone is never banked."""
+        return 0.5 * self.rr1 + 0.5 * self.rr2
+
 
 def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
     htf_b = np.asarray(htf_b)

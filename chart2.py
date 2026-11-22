@@ -5,6 +5,8 @@ Axis map:
   x2   volume row time axis from make_subplots(shared_xaxes=True), matches="x",
        so it must keep x's domain
   x3   the profile gutter, resolved at runtime. Never reuse x2.
+
+Traces take a reference ("x3"); update_layout takes a property ("xaxis3").
 """
 import numpy as np
 import plotly.graph_objects as go
@@ -40,13 +42,14 @@ def _future(df, bars=14):
     return df.index[-1] + (df.index[-1] - df.index[-2]) * bars
 
 
-def _gutter_axis(fig) -> str:
-    """First x-axis name not already owned by the subplot grid."""
+def _gutter(fig) -> tuple[str, str]:
+    """(trace reference, layout property) for a free x axis."""
     used = {k for k in fig.layout.to_plotly_json() if k.startswith("xaxis")}
     i = 2
     while f"xaxis{i}" in used:
         i += 1
-    return f"x{i}"
+    prop = f"xaxis{i}"
+    return prop.replace("axis", ""), prop
 
 
 def _profile(fig, df, bars, color, axis):
@@ -99,7 +102,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
                         row_heights=[0.78, 0.22] if rows == 2 else [1.0],
                         vertical_spacing=0.03)
-    gutter = _gutter_axis(fig)
+    gutter_ref, gutter_prop = _gutter(fig)
 
     fig.add_trace(go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"],
@@ -195,11 +198,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if "vp" in on:
         try:
             if htf_df is not None and len(htf_df) >= 30:
-                _profile(fig, htf_df, bars * 2, VP_HTF, gutter)
+                _profile(fig, htf_df, bars * 2, VP_HTF, gutter_ref)
         except Exception:
             pass
         try:
-            _profile(fig, adf, bars, VP_LTF, gutter)
+            _profile(fig, adf, bars, VP_LTF, gutter_ref)
         except Exception:
             pass
 
@@ -231,10 +234,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_layout(xaxis=dict(domain=PRICE_DOMAIN))
     if rows == 2:
         fig.update_layout(xaxis2=dict(domain=PRICE_DOMAIN))
-    fig.update_layout(**{gutter: dict(domain=PROFILE_DOMAIN, anchor="y",
-                                      range=[0, 1], showgrid=False,
-                                      showticklabels=False, zeroline=False,
-                                      fixedrange=True)})
+    # gutter: layout property name, not the trace reference
+    fig.update_layout(**{gutter_prop: dict(domain=PROFILE_DOMAIN, anchor="y",
+                                           range=[0, 1], showgrid=False,
+                                           showticklabels=False, zeroline=False,
+                                           fixedrange=True)})
     if y_range:
         fig.update_layout(yaxis=dict(range=y_range))
     fig.update_xaxes(showgrid=False)

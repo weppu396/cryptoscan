@@ -34,6 +34,12 @@ from core.tfs import CHART_TFS, cap_htf, cap_ltf, chart_minutes, data_tf
 from strategy import reversal
 
 try:
+    import live
+    LIVE_OK = True
+except Exception:
+    LIVE_OK = False
+
+try:
     import analysis_page
     ANALYSIS_OK, ANALYSIS_ERR = True, ""
 except Exception as _e:
@@ -148,6 +154,15 @@ Closed candles only. The forming bar never produces a claim.
 
 def _scan_bars(ltf: str) -> int:
     return max(1200, HTF_BARS * RATIO.get(ltf, 6))
+
+
+def fresh_bars(hours: float, tf: str) -> int:
+    """Hours of freshness expressed in bars of the timeframe actually scanned.
+
+    12 bars of 5m is one hour, not twelve. This is what the slider means now.
+    """
+    mins = max(chart_minutes(tf), 1e-6)
+    return max(1, min(4000, int(round(float(hours) * 60.0 / mins))))
 
 
 VENUE_ORDER = ["okx", "bybit", "kucoinfutures", "mexc", "gateio", "bitget",
@@ -417,9 +432,11 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     )
 
 
-def setup_status(s, df) -> str:
+def setup_status(s, df, atr=0.0) -> str:
+    """A flat 0.25% band is noise on a 5m bar and marks everything EXTENDED.
+    The band scales with ATR, floored at 0.12% of price."""
     cur = float(df["close"].iloc[-1])
-    tol = cur * 0.0025
+    tol = max(cur * 0.0012, 0.35 * float(atr or 0.0))
     if s.direction == "long":
         if cur <= s.stop:
             return "INVALID"
@@ -533,7 +550,7 @@ def notify(text: str):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                equity, recent_bars, min_grade, preferred, proxy, relax,
+                equity, recent_h, min_grade, preferred, proxy, relax,
                 need_smc, long_only, need_mtf=False, need_vol=False):
     if relax:
         min_rr = max(1.2, min_rr * 0.7)
@@ -544,14 +561,16 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     ex, ex_name = _resolve(cfg, preferred, proxy)
     universe, floor, perps = _universe(ex, int(min_vol), top)
     bars = _scan_bars(cfg.scan.ltf)
+    fresh = fresh_bars(recent_h, cfg.scan.ltf)
     stats = load_stats()
     found = []
     diag = {"venue": ex_name, "perps": perps, "universe": len(universe),
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
             "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0, "bias_blank": 0,
-            "past_skip": 0, "htf": cfg.scan.htf, "bars": bars,
-            "recent": recent_bars}
+            "past_skip": 0, "actionable": 0, "better": 0, "extended": 0,
+            "invalid": 0, "htf": cfg.scan.htf, "ltf": cfg.scan.ltf,
+            "bars": bars, "recent": recent_h, "fresh": fresh}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, bars)
@@ -574,17 +593,28 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             if long_only:
                 kept = [s for s in kept if s.direction == "long"]
             diag["kept"] += len(kept)
-            if recent_bars and kept:
-                cut = df.index[max(0, len(df) - 1 - recent_bars)]
-                fresh = [s for s in kept if s.ts >= cut]
-                diag["stale"] += len(kept) - len(fresh)
-                kept = fresh
+            if kept:
+                cut = df.index[max(0, len(df) - 1 - fresh)]
+                fresh_kept = [s for s in kept if s.ts >= cut]
+                diag["stale"] += len(kept) - len(fresh_kept)
+                kept = fresh_kept
+            atr_now = _last(ind, "atr", default=0.0)
             for s in kept:
-                s.meta["status"] = setup_status(s, df)
+                s.meta["status"] = setup_status(s, df, atr_now)
                 s.meta["htf"] = cfg.scan.htf
                 s.meta["ltf"] = cfg.scan.ltf
-                if s.meta["status"] not in OK_STATUS:
+                stt_s = s.meta["status"]
+                if stt_s == "ACTIONABLE":
+                    diag["actionable"] += 1
+                elif stt_s == "BETTER_PRICE":
+                    diag["better"] += 1
+                elif stt_s == "EXTENDED":
+                    diag["extended"] += 1
+                elif stt_s == "INVALID":
+                    diag["invalid"] += 1
+                else:
                     diag["past_skip"] += 1
+                if stt_s not in OK_STATUS:
                     continue
                 zone = (zu[0] if zu else None) if s.direction == "long" \
                     else (zd[0] if zd else None)
@@ -650,9 +680,9 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
                     risk_pct, equity, preferred, proxy):
     cfg = build_cfg(exchange, 40, 30e6, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, _ = _resolve(cfg, preferred, proxy)
-    df, used = _load(ex, symbol, cfg.scan.ltf, int(limit))
+    df, used = _load(ex, symbol, cfg.scan.ltf, int(limit), 200)
     if df is None:
-        return None, None, 0, 0
+        return None, None, 0, 0, 0
     ind = compute_all(df, cfg)
     stt = build_structure(df, cfg.structure)
     hb = htf_bias(df, cfg)
@@ -667,7 +697,7 @@ def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
                            {"dir": s.direction, "stop": s.stop, "tp1": s.tp1,
                             "tp2": s.tp2, "score": s.score})
     curve, trades = engine_run(df, signals, cfg, used)
-    return curve, trades, len(raw), len(setups)
+    return curve, trades, len(raw), len(setups), len(df)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -768,13 +798,16 @@ with st.sidebar:
     st.divider()
     ltf = st.selectbox("Timeframe", ["4h", "1d"] if MODE == "Spot" else ["1h", "4h", "1d"],
                        index=1)
-    st.caption(f"bias from {cap_htf(htf_for(ltf))} · trigger from 3m/5m · "
-               f"{_scan_bars(ltf)} bars")
+    st.caption(f"scan {cap_ltf(ltf)} · bias {cap_htf(htf_for(ltf))} · "
+               f"{_scan_bars(cap_ltf(ltf))} bars · trigger never slower than 5m")
     top = st.slider("Symbols to scan", 10, 150, 25, step=5)
     min_vol = st.select_slider("Min 24h volume",
                                [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
                                format_func=lambda v: f"${v/1e6:.0f}M")
-    recent = st.slider("Signal freshness (bars)", 1, 48, 12)
+    recent = st.slider("Signal freshness (hours)", 1, 72, 12,
+                       help="Wall-clock age a setup may have and still be "
+                            "listed. Converted to bars of the scanned timeframe, "
+                            "so 12h is 144 bars of 5m.")
     min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="C")
     only_ok = st.checkbox("Actionable only", value=False)
     relax = st.checkbox("Relax filters", value=True)
@@ -934,8 +967,13 @@ with T["Overview"]:
                     "No candle is invented. The whole loaded history is in the "
                     "chart, so zooming out reveals earlier candles. Drag to "
                     "zoom, right-drag to pan, double-click to reset.")
+                st.session_state["detail_ctx"] = {"ex": ex, "sym": used}
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
+
+    dctx = st.session_state.get("detail_ctx")
+    if dctx and LIVE_OK and st.toggle("Live 1s tape", key="detail_live"):
+        live.render(dctx["ex"], dctx["sym"], "long", "detail_live_seed")
 
     st.divider()
     ui.section("Movers", "Largest 24h moves in the top 100.")
@@ -982,7 +1020,8 @@ if MODE == "Spot":
 
 if MODE == "Bot":
     with T["Scan"]:
-        ui.section("Live scan", f"Grade {min_grade}+ · last {recent} bars · {ltf}")
+        ui.section("Live scan", f"Grade {min_grade}+ · last {recent}h · "
+                                f"scanning {cap_ltf(ltf)}")
         if st.button("Run scan", type="primary"):
             try:
                 with st.spinner("Scanning..."):
@@ -999,13 +1038,20 @@ if MODE == "Bot":
         if diag:
             st.caption(f"venue {diag['venue']} · universe {diag['universe']} · "
                        f"loaded {diag['loaded']} · failed {diag['err']} · raw "
-                       f"{diag['raw']} · kept {diag['kept']} · played "
-                       f"{diag.get('past_skip', 0)} · graded {diag['graded']} · "
-                       f"below grade {diag['below_grade']} · blank bias "
-                       f"{diag['bias_blank']} · HTF {diag['htf']}")
-        live = [s for s in st.session_state.get("setups", [])
-                if s.meta.get("status") in OK_STATUS]
-        for s in live[:10]:
+                       f"{diag['raw']} · kept {diag['kept']} · live "
+                       f"{diag.get('actionable', 0) + diag.get('better', 0)} · "
+                       f"played {diag.get('extended', 0)} · invalid "
+                       f"{diag.get('invalid', 0)} · below grade "
+                       f"{diag['below_grade']} · blank bias {diag['bias_blank']} "
+                       f"· scan {diag.get('ltf', '5m')} · HTF {diag['htf']} · "
+                       f"freshness {diag.get('recent', 12)}h "
+                       f"({diag.get('fresh', 0)} bars)")
+        live_rows = [s for s in st.session_state.get("setups", [])
+                     if s.meta.get("status") in OK_STATUS]
+        if diag and not live_rows:
+            st.info("Nothing executable in this window. Raise freshness hours, "
+                    "keep Relax on, or lower the minimum grade.")
+        for s in live_rows[:10]:
             r = _norm(s.meta.get("r"))
             with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
                              f"{s.meta.get('status')}"):
@@ -1093,6 +1139,7 @@ with T["SMC"]:
                            "LTF profile (right half), both estimates. Eight "
                            "windows of history sit behind the visible bars, so "
                            "zooming out keeps revealing earlier candles.")
+                st.session_state["live_ctx"] = {"ex": ex, "sym": used, "side": side}
                 with st.expander("How to read this chart"):
                     st.markdown(chart.legend_md())
                 st.divider()
@@ -1107,6 +1154,11 @@ with T["SMC"]:
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
             st.exception(e)
+
+    lctx = st.session_state.get("live_ctx")
+    if lctx and LIVE_OK and st.toggle("Live 1s tape", key="smc_live"):
+        live.render(lctx["ex"], lctx["sym"], lctx["side"], "smc_live_seed")
+
     st.divider()
     with st.expander("Full trading logic — how the pair is chosen and used"):
         st.markdown(LOGIC_MD)
@@ -1278,17 +1330,21 @@ if MODE == "Bot":
         b1, b2 = st.columns(2)
         bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym")
         bt_bars = b2.number_input("Bars", 500, 20000, 6000, step=500)
+        st.caption(f"runs on {cap_ltf(ltf)} — the same timeframe the scan uses.")
         if st.button("Run backtest", type="primary"):
             try:
                 with st.spinner("Running..."):
-                    curve, trades, raw_n, kept_n = cached_backtest(
+                    curve, trades, raw_n, kept_n, bars_n = cached_backtest(
                         exch, bt_sym, ltf, int(bt_bars), min_rr, max_stop_atr,
                         risk_pct, equity, exch, proxy.strip() or None)
                 if curve is None:
-                    st.warning("Not enough history.")
+                    st.warning(f"Not enough history for {bt_sym}: the venue "
+                               f"returned fewer than 200 bars of {cap_ltf(ltf)}. "
+                               f"Pick a venue with deeper short-timeframe "
+                               f"history, or lower the bar count.")
                 else:
-                    st.caption(f"raw {raw_n} · after filters {kept_n} · "
-                               f"trades {len(trades)}")
+                    st.caption(f"bars {bars_n} · raw {raw_n} · after filters "
+                               f"{kept_n} · trades {len(trades)}")
                     fig = go.Figure(go.Scatter(x=curve.index, y=curve.values,
                                                line=dict(color="#14b8a6", width=1.6)))
                     fig.update_layout(height=340, template="plotly_dark",
@@ -1434,6 +1490,16 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 The chart selector is display-only and defaults to 30m. It re-reads candles,
 never the strategy. The structure pair is capped on both sides: HTF 30m or 1h,
 LTF 3m or 5m.
+
+### Freshness
+The freshness slider is hours, not bars. It is converted to bars of the
+timeframe actually scanned, so the same setting means the same wall-clock age
+whether the trigger side resolves to 3m or 5m.
+
+### Live 1s tape
+Available on Coin detail, SMC and Analysis. It polls a ticker once a second and
+draws the ticks it has seen, seeded from real 1s candles where the venue serves
+them. It is display only — the strategy still reads closed 3m/5m bars.
 
 ### Zoom and history
 Roughly eight windows of history sit behind the visible bars, so zooming out

@@ -77,6 +77,7 @@ OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
 HAS_FRAGMENT = hasattr(st, "fragment")
 CHART_BARS = 1500
+DEFAULT_TF = "30m"
 
 RATIO = {"3m": 5, "5m": 6, "15m": 4, "1h": 4, "4h": 6, "1d": 1, "1w": 1}
 HTF_BARS = 260
@@ -93,9 +94,10 @@ density, and whether volatility sits in a workable band. 30m and 1h are
 resampled from the loaded 15m frame, so a lower timeframe is never invented.
 
 Once the HTF is fixed, **every legal lower timeframe for it is fully assessed**
-and the one whose setup scores highest is kept. The HTF decides location; the
-LTF decides whether the trigger actually fired. Both are printed on every card,
-alert and chart title.
+and the one whose setup scores highest is kept. 3m for a 15m HTF, 3m or 5m for a
+30m HTF, 5m or 15m for a 1h HTF. The HTF decides location; the LTF decides
+whether the trigger actually fired. Both are printed on every card, alert and
+chart title.
 
 | role | higher timeframe | lower timeframe |
 |---|---|---|
@@ -263,11 +265,11 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
                       xaxis=dict(type="date", showgrid=False, nticks=8,
                                  tickformat=tick, rangeslider=dict(visible=False),
                                  range=[view.index[0], view.index[-1]],
-                                 rangebreaks=breaks, fixedrange=False,
-                                 constrain="range"),
-                      yaxis=dict(range=[lo - pad, hi + pad], side="left",
-                                 gridcolor="#1b1f28", tickformat=",.6g",
-                                 fixedrange=False))
+                                 autorange=False, rangebreaks=breaks,
+                                 fixedrange=False, constrain="range"),
+                      yaxis=dict(range=[lo - pad, hi + pad], autorange=False,
+                                 side="left", gridcolor="#1b1f28",
+                                 tickformat=",.6g", fixedrange=False))
     return fig, len(breaks)
 
 
@@ -405,7 +407,8 @@ def build_cfg(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equit
     return replace(
         CFG,
         scan=replace(CFG.scan, exchange=exchange, top_n_symbols=top,
-                     min_quote_vol_24h=min_vol, ltf=ltf, htf=htf_for(ltf)),
+                     min_quote_vol_24h=min_vol, ltf=ltf,
+                     htf=cap_htf(htf_for(ltf))),
         risk=replace(CFG.risk, min_rr=min_rr, max_stop_atr=max_stop_atr,
                      risk_per_trade_pct=risk_pct, account_equity=equity),
     )
@@ -544,7 +547,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
             "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0, "bias_blank": 0,
-            "past_skip": 0, "htf": cap_htf(cfg.scan.htf), "bars": bars,
+            "past_skip": 0, "htf": cfg.scan.htf, "bars": bars,
             "recent": recent_bars}
 
     for sym in universe:
@@ -575,7 +578,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 kept = fresh
             for s in kept:
                 s.meta["status"] = setup_status(s, df)
-                s.meta["htf"] = cap_htf(cfg.scan.htf)
+                s.meta["htf"] = cfg.scan.htf
                 s.meta["ltf"] = cfg.scan.ltf
                 if s.meta["status"] not in OK_STATUS:
                     diag["past_skip"] += 1
@@ -614,7 +617,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     continue
 
                 if need_mtf:
-                    htf_df, _ = _load(ex, used_sym, cap_htf(cfg.scan.htf),
+                    htf_df, _ = _load(ex, used_sym, cfg.scan.htf,
                                       max(HTF_BARS, 250), 60)
                     hb_s = structure_bias(_closed(htf_df), cfg) \
                         if htf_df is not None else "range"
@@ -697,7 +700,7 @@ def cached_radar(exchange, preferred, proxy):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_reversal(exchange, preferred, proxy, symbols):
-    """Two requests per symbol: 3m and 15m. HTF capped at 1h, LTF by best setup."""
+    """3m, 5m and 15m per symbol. HTF capped at 1h, LTF by best setup."""
     cfg = build_cfg(exchange, 40, 30e6, reversal.SCALP, 2.0, 3.5, 0.5, 10000)
     ex, name = _resolve(cfg, preferred, proxy)
     try:
@@ -710,12 +713,15 @@ def cached_reversal(exchange, preferred, proxy, symbols):
             ldf, used = _load(ex, f"{c}/USDT:USDT", reversal.SCALP, 1500, 200)
             if ldf is None:
                 continue
+            fdf, _ = _load(ex, used, reversal.FAST, 1500, 200)
+            if fdf is None:
+                continue
             mdf, _ = _load(ex, used, reversal.BASE, 1500, 200)
             if mdf is None:
                 continue
-            r = reversal.evaluate(used, {reversal.SCALP: _closed(ldf),
-                                         reversal.BASE: _closed(mdf)},
-                                  cfg, already=used in held)
+            src = {reversal.SCALP: _closed(ldf), reversal.FAST: _closed(fdf),
+                   reversal.BASE: _closed(mdf)}
+            r = reversal.evaluate(used, src, cfg, already=used in held)
             if r:
                 rows.append(r)
         except Exception:
@@ -759,7 +765,8 @@ with st.sidebar:
     st.divider()
     ltf = st.selectbox("Timeframe", ["4h", "1d"] if MODE == "Spot" else ["1h", "4h", "1d"],
                        index=1)
-    st.caption(f"bias from {cap_htf(htf_for(ltf))} · {_scan_bars(ltf)} bars")
+    st.caption(f"bias from {cap_htf(htf_for(ltf))} · {_scan_bars(ltf)} bars · "
+               f"HTF capped at 1h")
     top = st.slider("Symbols to scan", 10, 150, 25, step=5)
     min_vol = st.select_slider("Min 24h volume",
                                [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
@@ -990,7 +997,7 @@ if MODE == "Bot":
                        f"{diag['raw']} · kept {diag['kept']} · played "
                        f"{diag.get('past_skip', 0)} · graded {diag['graded']} · "
                        f"below grade {diag['below_grade']} · blank bias "
-                       f"{diag['bias_blank']}")
+                       f"{diag['bias_blank']} · HTF {diag['htf']}")
         live = [s for s in st.session_state.get("setups", [])
                 if s.meta.get("status") in OK_STATUS]
         for s in live[:10]:
@@ -1008,15 +1015,17 @@ with T["SMC"]:
     ui.section("Smart money map",
                "Structure, zones, volume, the trade and its invalidation.")
     st.caption("Two pivots per timeframe — yellow HTF, cyan LTF — each from the "
-               "wick to the right edge. HTF is capped at 1h. Drag horizontally "
-               "to compress/expand time, vertically for price; right-drag pans.")
+               "wick to the right edge. HTF is capped at 1h and the LTF follows "
+               "the HTF. Drag horizontally to compress/expand time, vertically "
+               "for price; right-drag pans.")
     s1, s2, s3 = st.columns([2, 1, 1])
     smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym")
-    smc_tf = s2.selectbox("Entry timeframe", ["3m", "5m", "15m", "1h", "4h", "1d"],
-                          index=2, key="smc_tf")
+    smc_tf = s2.selectbox("Entry timeframe",
+                          ["3m", "5m", "15m", "30m", "1h", "4h", "1d"],
+                          index=3, key="smc_tf")
     side = s3.radio("Side", ["long", "short"], horizontal=True)
     chart_tf = chart.st_selectbox(
-        "smc_chart_tf", CHART_TFS.index(smc_tf) if smc_tf in CHART_TFS else 3)
+        "smc_chart_tf", CHART_TFS.index(DEFAULT_TF), default=DEFAULT_TF)
     if st.button("Build map", type="primary"):
         try:
             cfg = build_cfg(exch, top, min_vol, smc_tf, min_rr, max_stop_atr,
@@ -1070,9 +1079,9 @@ with T["SMC"]:
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 st.caption("Gutter: blue = HTF profile (left half), orange = "
-                           "LTF profile (right half), both estimates. The whole "
-                           "loaded history is in the chart, so zooming out keeps "
-                           "revealing earlier candles.")
+                           "LTF profile (right half), both estimates. Eight "
+                           "windows of history sit behind the visible bars, so "
+                           "zooming out keeps revealing earlier candles.")
                 with st.expander("How to read this chart"):
                     st.markdown(chart.legend_md())
                 st.divider()
@@ -1411,14 +1420,16 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 `Reset venue` clears the pin.
 
 ### Chart timeframes
-The chart selector (1m to 4H) is display-only. It re-reads candles, never the
-strategy. The higher timeframe the engine uses is capped at 1h.
+The chart selector (1m to 4H) is display-only and defaults to 30m. It re-reads
+candles, never the strategy. The higher timeframe the engine uses is capped at
+1h, and the lower timeframe follows it: 3m under a 15m HTF, 3m or 5m under a
+30m HTF, 5m or 15m under a 1h HTF.
 
 ### Zoom and history
-The whole loaded history is in every chart, so zooming out keeps revealing
-earlier candles instead of empty space. Drag horizontally to compress or expand
-time, vertically to compress or expand price, right-drag to pan, double-click
-to reset.
+Roughly eight windows of history sit behind the visible bars, so zooming out
+keeps revealing earlier candles instead of empty space. Drag horizontally to
+compress or expand time, vertically to compress or expand price, right-drag to
+pan, double-click to reset.
 
 ### Coin detail gaps
 Sparse history on 1H, 4H and 1D is a venue fact. The detail chart collapses

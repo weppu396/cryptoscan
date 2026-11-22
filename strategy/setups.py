@@ -1,8 +1,17 @@
+"""strategy/setups.py - break-of-structure retest.
+
+A break arms a pending retest of the level that broke. The HTF must not be
+against the trade; a `range` or `unclear` HTF no longer kills the setup, which
+is where most longs and shorts were being lost. Two pendings may be live at
+once so a fresh break is not swallowed by an older one.
+"""
 from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
 from core.candles import quality as candle_quality
+
+MAX_PENDING = 2
 
 
 @dataclass
@@ -45,52 +54,62 @@ class Setup:
         return 0.5 * self.rr1 + 0.5 * self.rr2
 
 
+def _against(bias: str, direction: str) -> bool:
+    return (direction == "long" and bias == "down") or \
+           (direction == "short" and bias == "up")
+
+
 def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
     htf_b = np.asarray(htf_b)
     setups = []
     n = len(ltf)
-    pend = None
+    pends = []
     o, h, l, c = (ltf[x].values for x in ("open", "high", "low", "close"))
     tol_mult = cfg.structure.zone_tol_atr
     cap = cfg.risk.max_tp_r
+    wait = max(1, int(cfg.structure.max_wait_bars))
 
     for t in range(n):
-        if st["bos_up"].iat[t] and htf_b[t] == "up":
+        bias = htf_b[t]
+
+        if st["bos_up"].iat[t] and bias != "down":
             lvl = st["active_high"].iat[t]
             if not np.isnan(lvl):
-                pend = {"dir": "long", "level": float(lvl),
-                        "expiry": t + cfg.structure.max_wait_bars}
-        elif st["bos_dn"].iat[t] and htf_b[t] == "down":
+                pends.append({"dir": "long", "level": float(lvl),
+                              "expiry": t + wait, "used": False})
+        elif st["bos_dn"].iat[t] and bias != "up":
             lvl = st["active_low"].iat[t]
             if not np.isnan(lvl):
-                pend = {"dir": "short", "level": float(lvl),
-                        "expiry": t + cfg.structure.max_wait_bars}
+                pends.append({"dir": "short", "level": float(lvl),
+                              "expiry": t + wait, "used": False})
 
-        if pend is None:
-            continue
-        if t > pend["expiry"]:
-            pend = None
+        pends = [p for p in pends if t <= p["expiry"] and not p["used"]][-MAX_PENDING:]
+        if not pends:
             continue
 
         a = float(ind["atr"].iat[t])
         if not np.isfinite(a) or a <= 0:
             continue
         tol = tol_mult * a
-        lvl = pend["level"]
         rng = float(h[t] - l[t])
         if rng <= 0:
             continue
 
-        if pend["dir"] == "long":
-            touched = l[t] <= lvl + tol and h[t] >= lvl - tol
-            cname, cq = candle_quality(ltf, t, a, "long")
-            reject = c[t] > lvl and cq >= 60
-            if touched and (reject or not cfg.structure.require_rejection_candle):
+        for pend in pends:
+            lvl = pend["level"]
+            if pend["dir"] == "long":
+                touched = l[t] <= lvl + tol and h[t] >= lvl - tol
+                if not touched:
+                    continue
+                cname, cq = candle_quality(ltf, t, a, "long")
+                reject = c[t] > lvl and cq >= 60
+                if not (reject or not cfg.structure.require_rejection_candle):
+                    continue
                 entry = float(c[t])
                 stop = min(float(l[t]), lvl - tol) - cfg.risk.stop_buffer_atr * a
                 risk = entry - stop
                 if risk <= 0:
-                    pend = None
+                    pend["used"] = True
                     continue
                 tp1 = entry + 1.5 * risk
                 nxt = [z for z in zones_up if z["mid"] > entry + 0.5 * risk]
@@ -100,21 +119,24 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                 setups.append(Setup(
                     sym, "long", "BOS_retest_long", ltf.index[t], entry, stop,
                     tp1, tp2, a, (tp2 - entry) / risk, 0.0,
-                    ["HTF bias up", f"bullish BOS above {lvl:,.6g}",
+                    ["HTF not against", f"bullish BOS above {lvl:,.6g}",
                      f"retest held with {cname or 'rejection'} ({cq})",
                      f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
-                    {"candle": cname, "candle_q": cq}))
-                pend = None
-        else:
-            touched = h[t] >= lvl - tol and l[t] <= lvl + tol
-            cname, cq = candle_quality(ltf, t, a, "short")
-            reject = c[t] < lvl and cq >= 60
-            if touched and (reject or not cfg.structure.require_rejection_candle):
+                    {"candle": cname, "candle_q": cq, "htf": str(bias)}))
+                pend["used"] = True
+            else:
+                touched = h[t] >= lvl - tol and l[t] <= lvl + tol
+                if not touched:
+                    continue
+                cname, cq = candle_quality(ltf, t, a, "short")
+                reject = c[t] < lvl and cq >= 60
+                if not (reject or not cfg.structure.require_rejection_candle):
+                    continue
                 entry = float(c[t])
                 stop = max(float(h[t]), lvl + tol) + cfg.risk.stop_buffer_atr * a
                 risk = stop - entry
                 if risk <= 0:
-                    pend = None
+                    pend["used"] = True
                     continue
                 tp1 = entry - 1.5 * risk
                 nxt = [z for z in zones_dn if z["mid"] < entry - 0.5 * risk]
@@ -124,10 +146,10 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                 setups.append(Setup(
                     sym, "short", "BOS_retest_short", ltf.index[t], entry, stop,
                     tp1, tp2, a, (entry - tp2) / risk, 0.0,
-                    ["HTF bias down", f"bearish BOS below {lvl:,.6g}",
+                    ["HTF not against", f"bearish BOS below {lvl:,.6g}",
                      f"retest rejected with {cname or 'rejection'} ({cq})",
                      f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
-                    {"candle": cname, "candle_q": cq}))
-                pend = None
+                    {"candle": cname, "candle_q": cq, "htf": str(bias)}))
+                pend["used"] = True
 
     return setups

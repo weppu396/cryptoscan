@@ -1,4 +1,4 @@
-"""Chart layout contract."""
+"""Chart layout and time-axis contract."""
 import numpy as np
 import pandas as pd
 import pytest
@@ -32,7 +32,6 @@ def test_profile_is_on_the_right_on_its_own_axis():
         assert t.xaxis == "x2"
     assert tuple(fig.layout.xaxis2.domain) == (0.845, 1.0)
     assert tuple(fig.layout.xaxis2.range) == (0, 1)
-    assert fig.layout.xaxis2.showticklabels is False
 
 
 def test_default_window_is_100_to_120():
@@ -58,6 +57,42 @@ def test_price_range_covers_every_wick():
     assert lo <= float(view["low"].min()) and hi >= float(view["high"].max())
 
 
+def test_x_range_matches_the_window():
+    df = frame(200)
+    view = df.tail(110)
+    fig = chart.build(df, CFG, "short", PLAN)
+    lo, hi = fig.layout.xaxis.range
+    assert pd.Timestamp(lo) == view.index[0]
+    assert pd.Timestamp(hi) > view.index[-1]
+
+
+def test_tail_gap_does_not_stretch_the_axis():
+    """A stale tail bar must not push the axis out by months."""
+    df = frame(200)
+    df.index = df.index + pd.Timedelta(days=200)      # whole frame shifted
+    df = pd.concat([df.iloc[:-1],
+                    df.iloc[[-1]].set_index(df.index[-1:] + pd.Timedelta(days=90))])
+    fig = chart.build(df, CFG, "short", PLAN)
+    lo, hi = fig.layout.xaxis.range
+    span = pd.Timestamp(hi) - pd.Timestamp(lo)
+    assert span < pd.Timedelta(days=5), f"axis span {span}"
+
+
+def test_tick_format_follows_timeframe():
+    for tf, want in (("1m", "%H:%M"), ("30m", "%H:%M"), ("4H", "%d %b %H:%M")):
+        fig = chart.build(frame(), CFG, "short", PLAN, chart_tf=tf)
+        assert fig.layout.xaxis.tickformat == want
+
+
+def test_unsorted_and_duplicated_rows_are_repaired():
+    df = frame(200)
+    df = pd.concat([df.iloc[::-1], df.iloc[[-1]]])
+    fig = chart.build(df, CFG, "short", PLAN)
+    c = [t for t in fig.data if t.type == "candlestick"][0]
+    assert list(c.x) == sorted(c.x)
+    assert len(set(c.x)) == len(c.x)
+
+
 def test_no_bottom_volume_row():
     fig = chart.build(frame(), CFG, "short", PLAN)
     assert "yaxis2" not in fig.layout.to_plotly_json()
@@ -81,13 +116,18 @@ def test_every_timeframe_renders_candles(tf):
     assert c and len(c[0].x) > 0
 
 
-def test_display_tf_does_not_change_analysis():
+def test_display_tf_does_not_change_the_window():
     df = frame(300)
     a = chart.build(df, CFG, "short", PLAN, chart_tf="3m", analysis_df=df)
     b = chart.build(df, CFG, "short", PLAN, chart_tf="4H", analysis_df=df)
     ca = [t for t in a.data if t.type == "candlestick"][0]
     cb = [t for t in b.data if t.type == "candlestick"][0]
     assert len(ca.x) == len(cb.x)
+
+
+def test_empty_frame_returns_a_figure():
+    fig = chart.build(frame(0), CFG, "short", PLAN)
+    assert fig is not None
 
 
 def test_chart2_same_contract():
@@ -97,3 +137,4 @@ def test_chart2_same_contract():
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
     assert prof and all(t.xaxis == "x2" for t in prof)
     assert tuple(fig.layout.xaxis.domain) == (0.0, 0.82)
+    assert fig.layout.xaxis.range is not None

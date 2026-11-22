@@ -1,10 +1,7 @@
 """strategy/reversal.py - 30m context, 3m trigger.
 
-Nothing here is new maths. It calls the existing engines:
-  zones      core.levels.build_zones
-  structure  core.structure.build_structure
-  candles    core.candles.quality   (the ATR-normalised grader already used
-                                    by strategy/setups.py)
+No new maths. Reuses core.levels.build_zones, core.structure.build_structure
+and core.candles.quality (the existing ATR grader).
 """
 import numpy as np
 
@@ -15,10 +12,10 @@ from core.structure import build_structure, find_swings
 
 HTF, LTF = "30m", "3m"
 
-APPROACH_ATR = 1.5     # "approaching" band
-WATCH_ATR = 6.0        # furthest a coin stays on the radar
-BEYOND_ATR = 1.0       # past this, the entry window is gone
-MAX_EXT_ATR = 4.0      # travel over the lookback that counts as extended
+APPROACH_ATR = 1.5
+WATCH_ATR = 6.0
+BEYOND_ATR = 1.0
+MAX_EXT_ATR = 4.0
 EXT_LOOKBACK = 12
 CONFIRM_WINDOW = 15
 MIN_CANDLE_Q = 60
@@ -66,10 +63,9 @@ def _targets(zones, entry, risk, long, cap_r):
 
 
 def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
-    """One coin. Returns a dict or None when it is not worth a row."""
+    """One coin. Returns a dict, or None when it is not worth a row."""
     if hdf is None or ldf is None or len(hdf) < 60 or len(ldf) < 120:
         return None
-
     ah, al = _atr(hdf, cfg), _atr(ldf, cfg)
     if ah <= 0 or al <= 0:
         return None
@@ -83,18 +79,16 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
     dem = build_zones(hdf, sw, ind_h["atr"], cfg.structure, "sup")
     sup = build_zones(hdf, sw, ind_h["atr"], cfg.structure, "res")
 
-    long_hit = _candidate(dem, price, ah, True)
-    short_hit = _candidate(sup, price, ah, False)
-
-    if long_hit and (not short_hit or long_hit[1] <= short_hit[1]):
-        long, (zone, dist) = True, long_hit
-    elif short_hit:
-        long, (zone, dist) = False, short_hit
+    lh, sh = _candidate(dem, price, ah, True), _candidate(sup, price, ah, False)
+    if lh and (not sh or lh[1] <= sh[1]):
+        long, (zone, dist) = True, lh
+    elif sh:
+        long, (zone, dist) = False, sh
     else:
         return None
 
     if long and bias == "up":
-        return None          # continuation, not a reversal
+        return None
     if not long and bias == "down":
         return None
 
@@ -108,12 +102,8 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
     tp1, tp2 = _targets(sup if long else dem, entry, risk, long, cfg.risk.max_tp_r)
     rr = abs(tp1 - entry) / risk
 
-    if long:
-        inside = zone["low"] <= price <= zone["high"]
-        beyond = price > zone["high"]
-    else:
-        inside = zone["low"] <= price <= zone["high"]
-        beyond = price < zone["low"]
+    inside = zone["low"] <= price <= zone["high"]
+    beyond = price > zone["high"] if long else price < zone["low"]
 
     lb = min(EXT_LOOKBACK, len(hdf) - 1)
     travel = abs(price - float(hdf["close"].iloc[-1 - lb])) / ah if lb else 0.0
@@ -121,10 +111,10 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
 
     stt_l = build_structure(ldf, cfg.structure)
     win = len(ldf) - 1 - CONFIRM_WINDOW
-    chop_key = "choch_up" if long else "choch_dn"
-    bos_key = "bos_up" if long else "bos_dn"
-    sweep = bool(stt_l[chop_key].iloc[win:].any())
-    broken = bool(stt_l[bos_key].iloc[win:].any() or sweep)
+    chop = "choch_up" if long else "choch_dn"
+    bos = "bos_up" if long else "bos_dn"
+    sweep = bool(stt_l[chop].iloc[win:].any())
+    broken = bool(stt_l[bos].iloc[win:].any() or sweep)
 
     cq = 0
     for i in range(max(2, len(ldf) - 5), len(ldf)):
@@ -143,12 +133,9 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
     else:
         status = "APPROACHING"
 
-    score = RANK[status]
-    score += 6.0 * min(int(zone.get("touches", 1)), 4)
-    score += min(rr, cfg.risk.max_tp_r) * 4.0
-    score += 10.0 if sweep else 0.0
-    score -= min(dist, 8.0) * 2.5
-    score -= 15.0 if extended else 0.0
+    score = RANK[status] + 6.0 * min(int(zone.get("touches", 1)), 4)
+    score += min(rr, cfg.risk.max_tp_r) * 4.0 + (10.0 if sweep else 0.0)
+    score -= min(dist, 8.0) * 2.5 + (15.0 if extended else 0.0)
 
     reasons = []
     if sweep:
@@ -172,8 +159,6 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
 
 
 def rank(rows):
-    """(live, dead). Approaching first, never an unconfirmed row above a
-    confirmed one."""
     live = [r for r in rows if r["status"] in
             ("ACTIVE_ENTRY", "CONFIRMED", "DEVELOPING", "APPROACHING")]
     dead = [r for r in rows if r["status"] in ("MISSED", "INVALIDATED")]

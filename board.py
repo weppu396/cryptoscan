@@ -5,25 +5,48 @@ import pandas as pd
 import chart
 import paper
 import ui
-from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf
+from config import CFG
+from core.tfs import CHART_TFS, cap_htf, cap_ltf, chart_minutes, data_tf
+from strategy import reversal
 from strategy.risk import plan_rr
 
 FUTURE = {"ACTIONABLE", "BETTER_PRICE"}
 DEFAULT_CTF = "30m"
 
 
+def _auto_pair(load_fn, ex, sym):
+    """(htf, ltf, frames). HTF 30m/1h, LTF 3m/5m, chosen on structure."""
+    cached = st.session_state.get(f"pair{sym}")
+    if cached:
+        return cached[0], cached[1], cached[2]
+    frames = {}
+    for tf in ("3m", "5m", "15m"):
+        try:
+            d, _u = load_fn(ex, sym, tf, 1200, 200)
+        except Exception:
+            d = None
+        if d is not None and len(d) > 2:
+            frames[tf] = d.iloc[:-1]
+    htf, ltf, _q = reversal.choose_pair(frames, CFG)
+    st.session_state[f"pair{sym}"] = (htf, ltf, frames)
+    return htf, ltf, frames
+
+
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
           exch, proxy, cfg_fn, resolve_fn, load_fn, order_card, notify):
     conf = r["confidence"]
-    pair = (cap_htf(s.meta.get("htf") or "30m"), s.meta.get("ltf") or ltf)
+    pair = (cap_htf(s.meta.get("htf") or "30m"), cap_ltf(s.meta.get("ltf") or "5m"))
     with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
                      f"{s.meta.get('status')} · conf {conf:.0f}/100"):
-        st.caption(f"structure pair **{pair[0]} HTF / {pair[1]} LTF** · HTF auto-"
-                   f"selected, capped at 1h · LTF by best setup")
+        st.caption(f"structure pair **{pair[0]} HTF / {pair[1]} LTF** · HTF from "
+                   f"30m/1h, LTF from 3m/5m, both by setup quality")
         try:
             cfg = cfg_fn(exch, top, min_vol, ltf, min_rr, max_stop_atr,
                          risk_pct, equity)
             ex, _ = resolve_fn(cfg, exch, proxy)
+            htf, trig, frames = _auto_pair(load_fn, ex, s.symbol)
+            pair = (htf, trig)
+            st.caption(f"live pair **{htf} HTF / {trig} LTF**")
             df, _u = load_fn(ex, s.symbol, ltf, 1500)
             if df is None:
                 st.caption("chart: not enough candles")
@@ -31,18 +54,21 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                 ctf = st.selectbox("Chart timeframe", CHART_TFS,
                                    index=CHART_TFS.index(DEFAULT_CTF),
                                    key=f"ctf{s.symbol}",
-                                   help="Display only. Structure and the plan "
-                                        "use the auto-selected pair.")
+                                   help="Display only. Structure uses the live "
+                                        "pair above.")
                 disp = df
                 if chart_minutes(ctf) < chart_minutes(ltf):
                     d2, _v = load_fn(ex, s.symbol, data_tf(ctf), 800)
                     if d2 is not None:
                         disp = d2
                 cdf = df.iloc[:-1] if len(df) > 2 else df
+                htf_df = reversal._frame(frames, htf)
+                ltf_df = frames.get(trig)
                 plan = {"entry": s.entry, "sl": s.stop, "tp1": s.tp1,
                         "tp2": s.tp2}
                 st.plotly_chart(chart.build(disp, cfg, s.direction, plan,
                                             chart_tf=ctf, analysis_df=cdf,
+                                            htf_df=htf_df, ltf_df=ltf_df,
                                             pair=pair),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
@@ -114,6 +140,8 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
                                       False, need_mtf, need_vol)
             st.session_state["board"] = found
             st.session_state["board_diag"] = diag
+            for k in [k for k in st.session_state if k.startswith("pair")]:
+                st.session_state.pop(k, None)
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
             st.exception(e)

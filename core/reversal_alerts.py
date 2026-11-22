@@ -1,8 +1,7 @@
 """core/reversal_alerts.py - early warnings and entry alerts.
 
-Separate from alerts.py on purpose: alerts.py dedupes once per calendar day,
-which is useless inside a 5-10 minute arrival window. This one uses a TTL.
-Nothing here places an order.
+alerts.py dedupes once per calendar day; useless inside a 5-10 minute window.
+This uses a TTL instead. Nothing here places an order.
 """
 import hashlib
 from datetime import datetime, timedelta, timezone
@@ -11,9 +10,8 @@ EARLY_MIN, EARLY_MAX = 5.0, 10.0
 
 
 class State:
-    def __init__(self, ttl_min: float = 45.0, stale_min: float = 25.0):
+    def __init__(self, ttl_min: float = 45.0):
         self.ttl = timedelta(minutes=ttl_min)
-        self.stale = timedelta(minutes=stale_min)
         self.seen: dict[str, datetime] = {}
 
     @staticmethod
@@ -32,11 +30,14 @@ class State:
     def message(r, kind: str) -> str:
         head = "EARLY WARNING" if kind == "early" else "CONFIRMED REVERSAL"
         lines = [f"[{head}] {r['symbol']} {r['direction'].upper()}",
+                 f"status {r['status']}",
                  f"zone {r['zone'][0]:,.6g} - {r['zone'][1]:,.6g}",
                  f"entry {r['entry']:,.6g}  stop {r['stop']:,.6g}",
-                 f"tp1 {r['tp1']:,.6g}  tp2 {r['tp2']:,.6g}  R:R {r['rr']:.2f}"]
+                 f"tp1 {r['tp1']:,.6g} ({abs(r['tp1'] - r['entry']) / max(abs(r['entry'] - r['stop']), 1e-12):.2f}R)"
+                 f"  tp2 {r['tp2']:,.6g} ({abs(r['tp2'] - r['entry']) / max(abs(r['entry'] - r['stop']), 1e-12):.2f}R)",
+                 f"R:R {r['rr']:.2f}"]
         if r.get("eta_min") is not None:
-            lines.append(f"ETA ~{r['eta_min']:.0f} min (estimate, not a promise)")
+            lines.append(f"ETA ~{r['eta_min']:.0f} min (estimate, not guaranteed)")
         lines.append("30m context / 3m trigger. Paper only, no auto-execution.")
         return "\n".join(lines)
 
@@ -47,14 +48,14 @@ class State:
             if r["status"] == "APPROACHING" and r.get("eta_min") is not None:
                 if not (EARLY_MIN <= r["eta_min"] <= EARLY_MAX):
                     continue
-                key = self._key(r, f"eta{int(r['eta_min'] // 2) * 2}")
-                if self._fresh(key, now):
+                k = self._key(r, f"eta{int(r['eta_min'] // 2) * 2}")
+                if self._fresh(k, now):
                     out.append((r, "early", self.message(r, "early")))
             elif r["status"] == "ACTIVE_ENTRY" and r["is_new"]:
                 if r["rr"] < min_rr:
                     continue
-                key = self._key(r, "entry")
-                if self._fresh(key, now):
+                k = self._key(r, "entry")
+                if self._fresh(k, now):
                     out.append((r, "entry", self.message(r, "entry")))
         return out
 

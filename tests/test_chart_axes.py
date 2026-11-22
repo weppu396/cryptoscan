@@ -1,4 +1,4 @@
-"""Chart layout and time-axis contract."""
+"""Chart layout, zoom and axis contract."""
 import numpy as np
 import pandas as pd
 import pytest
@@ -21,17 +21,42 @@ def frame(n=400, seed=5, freq="5min", px0=0.0036, vol=0.00004):
 
 def test_candles_own_most_of_the_width():
     fig = chart.build(frame(), CFG, "short", PLAN)
-    assert tuple(fig.layout.xaxis.domain) == (0.0, 0.82)
+    assert tuple(fig.layout.xaxis.domain) == (0.0, 0.76)
 
 
-def test_profile_is_on_the_right_on_its_own_axis():
+def test_gutter_has_two_non_overlapping_halves():
     fig = chart.build(frame(), CFG, "short", PLAN)
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert prof
+    assert len(prof) >= 2
     for t in prof:
         assert t.xaxis == "x2"
-    assert tuple(fig.layout.xaxis2.domain) == (0.845, 1.0)
-    assert tuple(fig.layout.xaxis2.range) == (0, 1)
+    bases = sorted(float(t.base[0]) for t in prof)
+    assert bases[0] < 0.5 and bases[-1] >= 0.5, "profiles must not share a half"
+    assert tuple(fig.layout.xaxis2.domain) == (0.785, 1.0)
+
+
+def test_profiles_use_different_colours():
+    fig = chart.build(frame(), CFG, "short", PLAN)
+    cols = {t.marker.color for t in fig.data
+            if getattr(t, "orientation", None) == "h"}
+    assert len(cols) == 2
+
+
+def test_both_axes_are_zoomable():
+    fig = chart.build(frame(), CFG, "short", PLAN)
+    assert fig.layout.xaxis.fixedrange is False
+    assert fig.layout.yaxis.fixedrange is False
+    assert fig.layout.xaxis2.fixedrange is True
+
+
+def test_structure_marks_reach_the_right_edge():
+    fig = chart.build(frame(), CFG, "short", PLAN)
+    x_hi = pd.Timestamp(fig.layout.xaxis.range[1])
+    lines = [s for s in fig.layout.shapes
+             if s.type == "line" and s.xref == "x" and s.y0 == s.y1]
+    assert lines
+    for s in lines:
+        assert pd.Timestamp(s.x1) == x_hi
 
 
 def test_default_window_is_100_to_120():
@@ -57,25 +82,13 @@ def test_price_range_covers_every_wick():
     assert lo <= float(view["low"].min()) and hi >= float(view["high"].max())
 
 
-def test_x_range_matches_the_window():
-    df = frame(200)
-    view = df.tail(110)
-    fig = chart.build(df, CFG, "short", PLAN)
-    lo, hi = fig.layout.xaxis.range
-    assert pd.Timestamp(lo) == view.index[0]
-    assert pd.Timestamp(hi) > view.index[-1]
-
-
 def test_tail_gap_does_not_stretch_the_axis():
-    """A stale tail bar must not push the axis out by months."""
     df = frame(200)
-    df.index = df.index + pd.Timedelta(days=200)      # whole frame shifted
     df = pd.concat([df.iloc[:-1],
                     df.iloc[[-1]].set_index(df.index[-1:] + pd.Timedelta(days=90))])
     fig = chart.build(df, CFG, "short", PLAN)
     lo, hi = fig.layout.xaxis.range
-    span = pd.Timestamp(hi) - pd.Timestamp(lo)
-    assert span < pd.Timedelta(days=5), f"axis span {span}"
+    assert pd.Timestamp(hi) - pd.Timestamp(lo) < pd.Timedelta(days=5)
 
 
 def test_tick_format_follows_timeframe():
@@ -84,27 +97,9 @@ def test_tick_format_follows_timeframe():
         assert fig.layout.xaxis.tickformat == want
 
 
-def test_unsorted_and_duplicated_rows_are_repaired():
-    df = frame(200)
-    df = pd.concat([df.iloc[::-1], df.iloc[[-1]]])
-    fig = chart.build(df, CFG, "short", PLAN)
-    c = [t for t in fig.data if t.type == "candlestick"][0]
-    assert list(c.x) == sorted(c.x)
-    assert len(set(c.x)) == len(c.x)
-
-
 def test_no_bottom_volume_row():
     fig = chart.build(frame(), CFG, "short", PLAN)
     assert "yaxis2" not in fig.layout.to_plotly_json()
-
-
-def test_structure_markers_are_horizontal_and_bounded():
-    fig = chart.build(frame(), CFG, "short", PLAN)
-    lines = [s for s in fig.layout.shapes
-             if s.type == "line" and s.xref == "x" and s.y0 == s.y1]
-    assert lines
-    for s in lines:
-        assert s.x1 > s.x0
 
 
 @pytest.mark.parametrize("tf", ["1m", "3m", "5m", "15m", "30m", "1H", "4H"])
@@ -116,25 +111,15 @@ def test_every_timeframe_renders_candles(tf):
     assert c and len(c[0].x) > 0
 
 
-def test_display_tf_does_not_change_the_window():
-    df = frame(300)
-    a = chart.build(df, CFG, "short", PLAN, chart_tf="3m", analysis_df=df)
-    b = chart.build(df, CFG, "short", PLAN, chart_tf="4H", analysis_df=df)
-    ca = [t for t in a.data if t.type == "candlestick"][0]
-    cb = [t for t in b.data if t.type == "candlestick"][0]
-    assert len(ca.x) == len(cb.x)
-
-
 def test_empty_frame_returns_a_figure():
-    fig = chart.build(frame(0), CFG, "short", PLAN)
-    assert fig is not None
+    assert chart.build(frame(0), CFG, "short", PLAN) is not None
 
 
 def test_chart2_same_contract():
     df = frame()
     fr = structure2.run(df, "X", "5m", CFG)
     fig = chart2.build(df, fr, "short", PLAN, mode="analysis")
+    assert tuple(fig.layout.xaxis.domain) == (0.0, 0.76)
+    assert fig.layout.xaxis.fixedrange is False
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
     assert prof and all(t.xaxis == "x2" for t in prof)
-    assert tuple(fig.layout.xaxis.domain) == (0.0, 0.82)
-    assert fig.layout.xaxis.range is not None

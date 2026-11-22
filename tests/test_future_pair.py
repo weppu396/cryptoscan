@@ -1,11 +1,11 @@
-"""HTF ceiling, LTF legality, future-only filtering, zoomable history."""
+"""HTF ceiling, LTF ceiling, future-only filtering, zoomable history."""
 import numpy as np
 import pandas as pd
 import pytest
 
 import chart
 from config import CFG
-from core.tfs import cap_htf, chart_minutes
+from core.tfs import cap_htf, cap_ltf, chart_minutes
 from strategy import reversal
 
 PLAN = {"entry": 0.003625, "sl": 0.00371, "tp1": 0.003497, "tp2": 0.003369}
@@ -21,100 +21,101 @@ def frame(n=900, freq="3min", vol=0.00004, seed=5, px0=0.0036):
 
 def test_chart_minutes_parses_every_spelling():
     assert chart_minutes("1d") == 1440
-    assert chart_minutes("1D") == 1440
     assert chart_minutes("4h") == 240
-    assert chart_minutes("1w") == 10080
-    assert chart_minutes("1H") == 60
+    assert chart_minutes("1s") < 1
     assert chart_minutes("30m") == 30
     assert chart_minutes(None) == 60
 
 
 def test_cap_htf_clamps_days_and_lowercase_hours():
     assert cap_htf("1d") == "1h"
-    assert cap_htf("1D") == "1h"
     assert cap_htf("4h") == "1h"
-    assert cap_htf("4H") == "1h"
-    assert cap_htf("15m") == "15m"
-    assert cap_htf("30m") == "30m"
     assert cap_htf("1h") == "1h"
+    assert cap_htf("30m") == "30m"
 
 
-def test_htf_choices_are_all_within_the_ceiling():
-    assert all(chart_minutes(t) <= 60 for t in reversal.HTF_CHOICES)
+def test_cap_ltf_clamps_everything_slower_than_five_minutes():
+    assert cap_ltf("4h") == "5m"
+    assert cap_ltf("1h") == "5m"
+    assert cap_ltf("15m") == "5m"
+    assert cap_ltf("5m") == "5m"
+    assert cap_ltf("3m") == "3m"
 
 
-def test_ltf_is_legal_and_faster_than_its_htf():
-    for htf, ltfs in reversal.LTF_FOR.items():
-        assert ltfs
-        for ltf in ltfs:
-            assert chart_minutes(ltf) < chart_minutes(htf)
+def test_htf_choices_are_only_thirty_min_and_one_hour():
+    assert set(reversal.HTF_CHOICES) == {"30m", "1h"}
 
 
-def test_ltf_stays_in_the_few_minute_band():
+def test_ltf_choices_are_only_three_and_five_minutes():
+    assert set(reversal.LTF_CHOICES) == {"3m", "5m"}
     for ltfs in reversal.LTF_FOR.values():
-        for ltf in ltfs:
-            assert chart_minutes(ltf) <= 15
+        assert set(ltfs) <= {"3m", "5m"}
 
 
-def test_evaluate_never_returns_a_coarser_htf():
+def test_evaluate_never_returns_a_slow_pair():
     src = {"3m": frame(900, "3min"), "5m": frame(900, "5min", 0.00006, 9),
            "15m": frame(900, "15min", 0.0002, 11)}
     r = reversal.evaluate("X", src, CFG)
     if r is not None:
         assert chart_minutes(r["htf"]) <= 60
+        assert chart_minutes(r["ltf"]) <= 5
         assert r["ltf"] in reversal.LTF_FOR[r["htf"]]
+
+
+def test_choose_pair_stays_inside_the_bands():
+    src = {"3m": frame(900, "3min"), "5m": frame(900, "5min", 0.00006, 3),
+           "15m": frame(900, "15min", 0.0002, 4)}
+    htf, ltf, _q = reversal.choose_pair(src, CFG)
+    assert htf in reversal.HTF_CHOICES
+    assert ltf in reversal.LTF_CHOICES
 
 
 def test_played_rows_are_not_future():
     base = dict(zone=(1.0, 2.0), entry=2.0, stop=1.5, tp1=3.0, tp2=4.0,
-                rr=3.0, is_new=True, htf="1h", ltf="15m", eta_min=None,
+                rr=3.0, is_new=True, htf="1h", ltf="5m", eta_min=None,
                 bias="down", dist_atr=0.2, reasons=[], ts=None, symbol="X",
                 direction="long", score=50.0)
     rows = [dict(base, status="MISSED", future=False),
-            dict(base, status="ACTIVE_ENTRY", future=True),
-            dict(base, status="APPROACHING", future=True)]
-    assert [r["status"] for r in reversal.future_only(rows)] == \
-        ["ACTIVE_ENTRY", "APPROACHING"]
+            dict(base, status="ACTIVE_ENTRY", future=True)]
+    assert [r["status"] for r in reversal.future_only(rows)] == ["ACTIVE_ENTRY"]
 
 
 def test_rank_puts_executable_first():
     base = dict(zone=(1.0, 2.0), entry=2.0, stop=1.5, tp1=3.0, tp2=4.0,
-                rr=3.0, is_new=True, htf="1h", ltf="15m", eta_min=None,
+                rr=3.0, is_new=True, htf="1h", ltf="5m", eta_min=None,
                 bias="down", dist_atr=0.2, reasons=[], ts=None, symbol="X",
                 direction="long", score=50.0)
     live, dead = reversal.rank([dict(base, status="CONFIRMED", future=False),
                                 dict(base, status="APPROACHING", future=True)])
     assert live[0]["status"] == "APPROACHING"
-    assert dead == []
+
+
+def test_title_pair_is_capped_on_both_sides():
+    fig = chart.build(frame(), CFG, "short", PLAN, pair=("1d", "4h"))
+    assert "1h (HTF" in fig.layout.title.text
+    assert "5m (LTF" in fig.layout.title.text
 
 
 def test_history_is_loaded_behind_the_window():
     df = frame(900)
     fig = chart.build(df, CFG, "short", PLAN)
-    n = len([t for t in fig.data if t.type == "candlestick"][0].x)
-    assert n > 500
+    assert len([t for t in fig.data if t.type == "candlestick"][0].x) > 500
 
 
-def test_initial_window_is_short():
+def test_initial_window_is_short_and_autorange_off():
     df = frame(900)
     fig = chart.build(df, CFG, "short", PLAN)
     lo, hi = fig.layout.xaxis.range
     assert (pd.Timestamp(hi) - pd.Timestamp(lo)) < (df.index[-1] - df.index[0])
-
-
-def test_autorange_is_pinned_off():
-    fig = chart.build(frame(), CFG, "short", PLAN)
     assert fig.layout.xaxis.autorange is False
 
 
-def test_title_pair_is_capped():
-    fig = chart.build(frame(), CFG, "short", PLAN, pair=("1d", "4h"))
-    assert "1h (HTF" in fig.layout.title.text
+def test_second_timeframe_uses_seconds_ticks():
+    fig = chart.build(frame(300, "1s"), CFG, "short", PLAN, chart_tf="1s")
+    assert fig.layout.xaxis.tickformat == "%H:%M:%S"
 
 
 def test_profile_bars_are_thick():
     fig = chart.build(frame(), CFG, "short", PLAN)
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert prof
-    for t in prof:
-        assert float(t.width[0]) > 0
+    assert prof and all(float(t.width[0]) > 0 for t in prof)

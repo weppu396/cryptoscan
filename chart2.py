@@ -2,7 +2,7 @@
 
 Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves,
 bounded history with a short initial window, all marks to the right edge, both
-axes free for independent zoom.
+axes free for independent zoom, HTF capped at 1h and LTF at 5m.
 """
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 import smc
 from core.models import Layer
 from core.structure_map import thin, volume_zones
-from core.tfs import cap_htf, chart_minutes, resample
+from core.tfs import cap_htf, cap_ltf, chart_minutes, resample
 from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL, BLUE = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6", "#3b82f6"
@@ -78,6 +78,8 @@ def _future(last, step, bars=6):
 
 def _tick(tf):
     m = chart_minutes(tf) if tf else 15
+    if m < 1:
+        return "%H:%M:%S"
     if m < 60:
         return "%H:%M"
     if m < 1440:
@@ -167,7 +169,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         return fig
 
     htf_label, ltf_label = (pair if pair else ("30m", "3m"))
-    htf_label = cap_htf(htf_label)
+    htf_label, ltf_label = cap_htf(htf_label), cap_ltf(ltf_label)
     if htf_df is None:
         try:
             htf_df = resample(adf, htf_label) if len(adf) > 60 else None

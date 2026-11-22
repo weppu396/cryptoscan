@@ -1,7 +1,8 @@
 """core/structure_map.py - pick the few structure marks worth drawing.
 
-Detection is unchanged: it is core.structure.build_structure. This module
-only ranks, caps and de-duplicates so the chart stops drowning.
+Detection is core.structure.build_structure. This only ranks, caps and
+de-duplicates. The final bar is dropped so a forming break never shows as
+confirmed.
 """
 import numpy as np
 
@@ -9,6 +10,10 @@ from core.structure import build_structure
 
 KEYS = (("bos_up", "BOS", "bull"), ("choch_up", "CHoCH", "bull"),
         ("bos_dn", "BOS", "bear"), ("choch_dn", "CHoCH", "bear"))
+
+
+def _closed(frame):
+    return frame.iloc[:-1] if len(frame) > 2 else frame
 
 
 def collect(stt, frame, limit: int) -> list[dict]:
@@ -27,7 +32,6 @@ def collect(stt, frame, limit: int) -> list[dict]:
 
 
 def thin(rows: list[dict], gap: float) -> list[dict]:
-    """Keep the newest of any two marks priced within `gap`."""
     kept = []
     for r in sorted(rows, key=lambda x: x["ts"], reverse=True):
         if all(abs(r["level"] - k["level"]) > gap for k in kept):
@@ -37,23 +41,23 @@ def thin(rows: list[dict], gap: float) -> list[dict]:
 
 def marks(adf, cfg, htf_df, gap: float,
           max_major: int = 2, max_minor: int = 3):
-    """(majors, minors). Majors from the 30m frame, minors from the trigger
-    frame. Minors that collide with a major are dropped."""
+    """(majors, minors). Majors from 30m, minors from the trigger frame.
+    Minors colliding with a major are dropped."""
     majors, minors = [], []
+    if htf_df is not None and len(htf_df) > 30:
+        h = _closed(htf_df)
+        try:
+            majors = collect(build_structure(h, cfg.structure), h, max_major)
+        except Exception:
+            majors = []
+    m = _closed(adf)
     try:
-        if htf_df is not None and len(htf_df) > 30:
-            majors = collect(build_structure(htf_df, cfg.structure),
-                             htf_df, max_major)
-    except Exception:
-        majors = []
-    try:
-        minors = collect(build_structure(adf, cfg.structure), adf, max_minor)
+        minors = collect(build_structure(m, cfg.structure), m, max_minor)
     except Exception:
         minors = []
-
     majors = thin(majors, gap)
-    minors = [m for m in thin(minors, gap)
-              if all(abs(m["level"] - k["level"]) > gap for k in majors)]
+    minors = [x for x in thin(minors, gap)
+              if all(abs(x["level"] - k["level"]) > gap for k in majors)]
     return majors, minors
 
 

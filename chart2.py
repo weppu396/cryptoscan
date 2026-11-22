@@ -1,8 +1,8 @@
 """chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
 
-Same contract as chart.py: candles 0-76%, gutter 78.5-100% in two halves
-(30m HTF blue right, 3m LTF orange left). All structure and zone marks run to
-the right edge. Both axes are free for independent zoom.
+Same contract as chart.py. Pivots come from the frame's own swings; exactly two
+per layer, four total, HTF yellow / LTF cyan, each starting on the wick and
+running right.
 """
 import numpy as np
 import pandas as pd
@@ -11,11 +11,17 @@ from plotly.subplots import make_subplots
 
 import smc
 from core.models import Layer
-from core.structure_map import thin
+from core.structure_map import thin, volume_zones
 from core.tfs import chart_minutes, resample
 from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL, BLUE = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6", "#3b82f6"
+HTF_LINE = "#f5d90a"
+LTF_LINE = "#22d3ee"
+SUPPLY_FILL = "rgba(190,110,120,0.14)"
+SUPPLY_EDGE = "rgba(190,110,120,0.42)"
+DEMAND_FILL = "rgba(120,200,160,0.13)"
+DEMAND_EDGE = "rgba(120,200,160,0.42)"
 BG = "#0f1116"
 MODES = ("structure", "analysis", "execution")
 LAYERS = {
@@ -24,14 +30,13 @@ LAYERS = {
                  "vp", "avwap"},
     "execution": {"candles", "zone", "plan"},
 }
-STYLE = {Layer.EXTERNAL: (1.6, "rgba(96,152,255,0.55)"),
-         Layer.INTERNAL: (1.0, "rgba(140,148,160,0.28)")}
-VP_HTF = "rgba(96,152,255,0.22)"
-VP_LTF = "rgba(240,140,11,0.20)"
+STYLE = {Layer.EXTERNAL: (1.8, HTF_LINE), Layer.INTERNAL: (1.4, LTF_LINE)}
+VP_HTF = "rgba(96,152,255,0.30)"
+VP_LTF = "rgba(240,140,11,0.28)"
 PRICE_DOMAIN = [0.0, 0.76]
 PROFILE_DOMAIN = [0.785, 1.0]
 HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
-MAX_MARKS = {Layer.EXTERNAL: 2, Layer.INTERNAL: 3}
+MAX_MARKS = {Layer.EXTERNAL: 2, Layer.INTERNAL: 2}
 DEFAULT_BARS = 110
 OHLC = ("open", "high", "low", "close")
 
@@ -98,7 +103,7 @@ def _profile(fig, df, bars, color, axis, side):
     fig.add_trace(go.Bar(y=vp["centers"], x=vp["hist"] * span, base=b0,
                          orientation="h",
                          marker=dict(color=color, line=dict(width=0)),
-                         width=step * 0.9 if step else None,
+                         width=step * 1.6 if step else None,
                          hoverinfo="skip", showlegend=False), row=1, col=1)
     fig.data[-1].xaxis = axis
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
@@ -111,32 +116,46 @@ def _profile(fig, df, bars, color, axis, side):
                                text=tag, showarrow=False, xanchor="right",
                                font=dict(size=7, color=tone), opacity=0.85)
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.45,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.5,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.34)", width=1))
+                      line=dict(color="rgba(170,170,180,0.40)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.22,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.25,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.20)", width=1))
+                      line=dict(color="rgba(170,170,180,0.24)", width=1))
 
 
-def _mark(fig, x0, x1, level, color, width, label=None, yshift=0):
-    fig.add_shape(type="line", row=1, col=1, x0=x0, x1=x1,
-                  y0=level, y1=level, line=dict(color=color, width=width))
-    if label:
-        fig.add_annotation(x=x0, y=level, row=1, col=1, text=label,
-                           showarrow=False, xanchor="left", yshift=yshift,
-                           font=dict(size=8, color=color))
+def _struct(fig, ts, price, x1, color, width, label, tag):
+    fig.add_shape(type="line", row=1, col=1, x0=ts, x1=x1,
+                  y0=price, y1=price, line=dict(color=color, width=width))
+    txt = f"{label} {price:,.6g}" + (f" {tag}" if tag else "")
+    fig.add_annotation(x=ts, y=price, row=1, col=1, text=txt, showarrow=False,
+                       xanchor="left", yshift=9, font=dict(size=8, color=color))
+
+
+def _zone(fig, z, x0, x1, label):
+    fill = SUPPLY_FILL if z["side"] == "supply" else DEMAND_FILL
+    edge = SUPPLY_EDGE if z["side"] == "supply" else DEMAND_EDGE
+    fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=x1,
+                  y0=z["low"], y1=z["high"],
+                  fillcolor=fill, line=dict(width=1, color=edge))
+    fig.add_annotation(x=x1, y=(z["low"] + z["high"]) / 2, row=1, col=1,
+                       text=f" {label} {z['side']} {z['ratio']:.1f}x "
+                            f"{z['low']:,.6g}–{z['high']:,.6g} ",
+                       showarrow=False, xanchor="right",
+                       font=dict(size=7, color=edge),
+                       bgcolor="rgba(15,17,22,0.65)")
 
 
 def build(df, frame, direction, plan=None, mode="analysis", layers=None,
           bars=DEFAULT_BARS, chart_tf=None, analysis_df=None,
-          htf_df=None) -> go.Figure:
+          htf_df=None, ltf_df=None, pair=None) -> go.Figure:
     if mode not in MODES:
         raise ValueError(mode)
     df = _clean(df)
     adf = _clean(analysis_df) if analysis_df is not None else df
     htf_df = _clean(htf_df) if htf_df is not None else None
+    ltf_df = _clean(ltf_df) if ltf_df is not None else None
     if df is None or not len(df):
         fig = go.Figure()
         fig.update_layout(template="plotly_dark", paper_bgcolor=BG,
@@ -146,6 +165,15 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                             x=0.5, y=0.5)])
         return fig
 
+    htf_label, ltf_label = (pair if pair else ("30m", "3m"))
+    if htf_df is None:
+        try:
+            htf_df = resample(adf, htf_label) if len(adf) > 60 else None
+        except Exception:
+            htf_df = None
+    if ltf_df is None:
+        ltf_df = adf
+
     on = set(layers) if layers else LAYERS[mode]
     view = df.tail(bars)
     step = _step(view)
@@ -153,12 +181,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     long = direction == "long"
     last_x = view.index[-1]
     right = _future(last_x, step, 6)
-
-    if htf_df is None:
-        try:
-            htf_df = resample(adf, "30m") if len(adf) > 60 else None
-        except Exception:
-            htf_df = None
+    start = view.index[0]
 
     fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
@@ -174,65 +197,58 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         key = "ext_swing" if layer == Layer.EXTERNAL else "int_swing"
         if key in on:
             pts = [s for s in frame.swings if s.layer == layer
-                   and adf.index[s.idx] >= view.index[0]]
+                   and adf.index[s.idx] >= start]
             for s in pts:
-                fig.add_shape(type="line", row=1, col=1, x0=adf.index[s.idx],
-                              x1=right, y0=s.price, y1=s.price,
-                              line=dict(color="rgba(140,148,160,0.18)", width=1))
-            for kind, sym in (("H", "triangle-down"), ("L", "triangle-up")):
-                sub = [s for s in pts if s.kind == kind]
-                if sub:
-                    fig.add_trace(go.Scatter(
-                        x=[adf.index[s.idx] for s in sub],
-                        y=[s.price for s in sub], mode="markers",
-                        marker=dict(symbol=sym, size=6, color=MUT, opacity=.5),
-                        showlegend=False), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=[adf.index[s.idx]], y=[s.price], mode="markers",
+                    marker=dict(symbol="triangle-down" if s.kind == "H"
+                                else "triangle-up", size=5, color=MUT,
+                                opacity=.4), showlegend=False), row=1, col=1)
 
     if "breaks" in on:
         for layer in (Layer.EXTERNAL, Layer.INTERNAL):
             live = [e for e in frame.live(t) if e.layer == layer
-                    and adf.index[e.break_idx] >= view.index[0]
+                    and adf.index[e.break_idx] >= start
                     and e.confirm_idx <= len(adf) - 2]
             live = thin([{"ts": adf.index[e.break_idx], "level": e.level, "e": e}
                          for e in live], 0.0)
+            w, col = STYLE[layer]
+            label = "HTF" if layer == Layer.EXTERNAL else "LTF"
             for row in live[-MAX_MARKS[layer]:]:
                 e = row["e"]
-                w, col = STYLE[layer]
-                if e.label.value == "CHoCH":
-                    col = WARN if layer == Layer.EXTERNAL \
-                        else "rgba(240,185,11,0.30)"
-                label = None
-                if layer == Layer.EXTERNAL:
-                    side = "Bullish" if e.direction == "bull" else "Bearish"
-                    label = f"{side} {e.label.value}"
-                _mark(fig, adf.index[e.break_idx], right, e.level, col, w, label,
-                      9 if e.direction == "bull" else -9)
+                c = WARN if (e.label.value == "CHoCH"
+                             and layer == Layer.EXTERNAL) else col
+                _struct(fig, adf.index[e.break_idx], e.level, right, c, w,
+                        f"{e.direction.upper()}", e.label.value)
 
     if "zones" in on:
-        for z in [z for z in smc.supply_demand(adf)
-                  if z["dir"] == ("demand" if long else "supply")][:2]:
-            x0 = max(adf.index[z["idx"]], view.index[0])
-            fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=right,
-                          y0=z["bot"], y1=z["top"], line=dict(width=1),
-                          line_color="rgba(20,184,166,0.30)" if long
-                          else "rgba(240,185,11,0.30)",
-                          fillcolor="rgba(20,184,166,0.085)" if long
-                          else "rgba(240,185,11,0.085)")
+        try:
+            for z in volume_zones(htf_df, cfg_or_default(), htf_label, "HTF",
+                                  direction, keep=1):
+                _zone(fig, z, max(z["ts"], start), right, "HTF " + htf_label)
+        except Exception:
+            pass
+        try:
+            for z in volume_zones(ltf_df, cfg_or_default(), ltf_label, "LTF",
+                                  direction, keep=1):
+                _zone(fig, z, max(z["ts"], start), right, "LTF " + ltf_label)
+        except Exception:
+            pass
 
     if "fvg" in on:
         for g in [g for g in smc.fair_value_gaps(adf)
-                  if g["dir"] == ("bull" if long else "bear")][:3]:
-            if adf.index[g["idx"]] < view.index[0]:
+                  if g["dir"] == ("bull" if long else "bear")][:2]:
+            if adf.index[g["idx"]] < start:
                 continue
             fig.add_shape(type="rect", row=1, col=1, x0=adf.index[g["idx"]], x1=right,
                           y0=g["bot"], y1=g["top"], line=dict(width=0),
-                          fillcolor="rgba(22,199,132,0.055)" if long
-                          else "rgba(234,57,67,0.055)")
+                          fillcolor="rgba(22,199,132,0.05)" if long
+                          else "rgba(234,57,67,0.05)")
 
     if "sweeps" in on:
         for s in [s for s in smc.liquidity_sweeps(adf)
                   if s["dir"] == ("bull" if long else "bear")][:3]:
-            if adf.index[s["idx"]] < view.index[0]:
+            if adf.index[s["idx"]] < start:
                 continue
             fig.add_trace(go.Scatter(x=[adf.index[s["idx"]]], y=[s.level],
                                      mode="markers",
@@ -258,7 +274,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         except Exception:
             pass
         try:
-            _profile(fig, adf, bars, VP_LTF, gutter_ref, "ltf")
+            _profile(fig, ltf_df, bars, VP_LTF, gutter_ref, "ltf")
         except Exception:
             pass
 
@@ -266,7 +282,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         for y, col, txt in ((plan["entry"], BLUE, "ENTRY"), (plan["stop"], DN, "SL"),
                             (plan["tp1"], UP, "TP1"), (plan["tp2"], UP, "TP2")):
             fig.add_shape(type="line", row=1, col=1, x0=last_x, x1=right,
-                          y0=y, y1=y, line=dict(color=col, width=1.1))
+                          y0=y, y1=y, line=dict(color=col, width=1.4))
             fig.add_annotation(x=right, y=y, row=1, col=1, xanchor="left",
                                text=f" {txt} {y:,.6g}", showarrow=False,
                                font=dict(size=8, color=col))
@@ -284,10 +300,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         right = x_lo + (step or pd.Timedelta(minutes=1)) * 6
 
     fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
-                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=40, b=22),
-                      showlegend=False, hovermode="x unified", dragmode="pan",
-                      title=dict(text=f"chart {chart_tf or ''} · gutter: blue = "
-                                      f"30m HTF, orange = 3m LTF (estimate)",
+                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=42, b=22),
+                      showlegend=False, hovermode="x unified", dragmode="zoom",
+                      title=dict(text=f"chart {chart_tf or ''} · structure "
+                                      f"{htf_label} (HTF) / {ltf_label} (LTF) · "
+                                      f"gutter blue = HTF, orange = LTF",
                                  x=0, xanchor="left", font=dict(size=10, color=MUT)),
                       xaxis=dict(domain=PRICE_DOMAIN, type="date",
                                  showgrid=False, range=[x_lo, right], nticks=8,
@@ -304,3 +321,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="left",
                      tickformat=",.6g", fixedrange=False)
     return fig
+
+
+def cfg_or_default():
+    from config import CFG
+    return CFG

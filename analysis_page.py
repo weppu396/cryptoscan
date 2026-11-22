@@ -27,7 +27,6 @@ STAGE_OF = {Decision.WAIT: Stage.NEW_SETUP, Decision.PREPARE: Stage.APPROACHING,
 
 
 def _g(obj, key, default=None):
-    """structure2 hands back Swing objects; dict shapes exist in older paths."""
     if obj is None:
         return default
     if isinstance(obj, dict):
@@ -101,7 +100,7 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
             return
 
         bias_tf = TF_BIAS.get(setup_tf, "4h")
-        htf, _ = load(ex, used, bias_tf, 300, 60)
+        htf, _ = load(ex, used, bias_tf, cfg.scan.htf_bars, 60)
         bias = (pit.bias_at(htf, df.index[-1], lambda f: _bias(f, cfg))
                 if htf is not None else "unclear")
 
@@ -191,14 +190,14 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
             st.plotly_chart(
                 chart2.build(df, frame, side,
                              {"entry": entry, "stop": inval, "tp1": tp1, "tp2": tp2},
-                             mode=mode),
+                             mode=mode, cfg=cfg),
                 use_container_width=True, config={"scrollZoom": True})
         except Exception as e:
             st.warning(f"chart unavailable: {type(e).__name__}: {e}")
             st.caption("The metrics above do not depend on the chart. It is "
                        "display only.")
 
-        if LIVE_OK and st.toggle("Live 1s tape", key="an_live"):
+        if LIVE_OK and st.toggle("Live ticks", key="an_live"):
             live.render(ex, used, side, "an_live_seed")
 
         st.divider()

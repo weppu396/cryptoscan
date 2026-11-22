@@ -187,10 +187,14 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         _panel(nav)
 
         try:
+            frames = {}
+            if htf is not None and len(htf):
+                frames[Layer.EXTERNAL] = htf
+            frames[Layer.INTERNAL] = df
             st.plotly_chart(
                 chart2.build(df, frame, side,
                              {"entry": entry, "stop": inval, "tp1": tp1, "tp2": tp2},
-                             mode=mode, cfg=cfg),
+                             mode=mode, cfg=cfg, frames=frames),
                 use_container_width=True, config={"scrollZoom": True})
         except Exception as e:
             st.warning(f"chart unavailable: {type(e).__name__}: {e}")

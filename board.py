@@ -9,6 +9,7 @@ from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf
 from strategy.risk import plan_rr
 
 FUTURE = {"ACTIONABLE", "BETTER_PRICE"}
+DEFAULT_CTF = "30m"
 
 
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
@@ -27,8 +28,8 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
             if df is None:
                 st.caption("chart: not enough candles")
             else:
-                idx = CHART_TFS.index(ltf) if ltf in CHART_TFS else 3
-                ctf = st.selectbox("Chart timeframe", CHART_TFS, index=idx,
+                ctf = st.selectbox("Chart timeframe", CHART_TFS,
+                                   index=CHART_TFS.index(DEFAULT_CTF),
                                    key=f"ctf{s.symbol}",
                                    help="Display only. Structure and the plan "
                                         "use the auto-selected pair.")
@@ -124,7 +125,7 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
                    f"kept {bd['kept']} · stale {bd['stale']} · played "
                    f"{bd.get('past_skip', 0)} · below grade {bd['below_grade']} "
                    f"· mtf {bd['mtf_skip']} · volume {bd['vol_skip']} · no "
-                   f"anchor {bd['no_anchor']}")
+                   f"anchor {bd['no_anchor']} · HTF {bd.get('htf', '1h')}")
         if bd["universe"] < 8:
             st.warning(f"Only {bd['universe']} symbols on this venue. If it is "
                        f"binanceus, pick okx or bybit — it has almost no perps.")

@@ -5,23 +5,25 @@ import pandas as pd
 import chart
 import paper
 import ui
-from core.tfs import CHART_TFS, chart_minutes, data_tf
+from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf
 from strategy.risk import plan_rr
+
+FUTURE = {"ACTIONABLE", "BETTER_PRICE"}
 
 
 def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
           exch, proxy, cfg_fn, resolve_fn, load_fn, order_card, notify):
     conf = r["confidence"]
-    pair = (s.meta.get("htf") or "30m", s.meta.get("ltf") or ltf)
+    pair = (cap_htf(s.meta.get("htf") or "30m"), s.meta.get("ltf") or ltf)
     with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
                      f"{s.meta.get('status')} · conf {conf:.0f}/100"):
-        st.caption(f"structure pair **{pair[0]} HTF / {pair[1]} LTF** · auto-"
-                   f"selected on swing separation and density")
+        st.caption(f"structure pair **{pair[0]} HTF / {pair[1]} LTF** · HTF auto-"
+                   f"selected, capped at 1h · LTF by best setup")
         try:
             cfg = cfg_fn(exch, top, min_vol, ltf, min_rr, max_stop_atr,
                          risk_pct, equity)
             ex, _ = resolve_fn(cfg, exch, proxy)
-            df, _u = load_fn(ex, s.symbol, ltf, 500)
+            df, _u = load_fn(ex, s.symbol, ltf, 1500)
             if df is None:
                 st.caption("chart: not enough candles")
             else:
@@ -32,7 +34,7 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                                         "use the auto-selected pair.")
                 disp = df
                 if chart_minutes(ctf) < chart_minutes(ltf):
-                    d2, _v = load_fn(ex, s.symbol, data_tf(ctf), 400)
+                    d2, _v = load_fn(ex, s.symbol, data_tf(ctf), 800)
                     if d2 is not None:
                         disp = d2
                 cdf = df.iloc[:-1] if len(df) > 2 else df
@@ -93,8 +95,9 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
            exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
            recent, proxy, relax, need_smc, need_mtf, need_vol):
     ui.section("Setups board", "Ranked, charted, with the reasoning shown.")
-    st.caption("Press Build board. Charts are capped at 6 to stay inside rate "
-               "limits. Work down the list, skip anything not ACTIONABLE.")
+    st.caption("Press Build board. Only setups still executable from here are "
+               "listed — played and invalidated ones are dropped. Charts are "
+               "capped at 6 to stay inside rate limits.")
 
     g1, g2 = st.columns(2)
     b_top = g1.slider("Universe size", 10, 60, 25, step=5, key="b_top")
@@ -118,9 +121,10 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
     if bd:
         st.caption(f"venue {bd['venue']} · universe {bd['universe']} · loaded "
                    f"{bd['loaded']} · failed {bd['err']} · raw {bd['raw']} · "
-                   f"kept {bd['kept']} · stale {bd['stale']} · below grade "
-                   f"{bd['below_grade']} · mtf {bd['mtf_skip']} · volume "
-                   f"{bd['vol_skip']} · no anchor {bd['no_anchor']}")
+                   f"kept {bd['kept']} · stale {bd['stale']} · played "
+                   f"{bd.get('past_skip', 0)} · below grade {bd['below_grade']} "
+                   f"· mtf {bd['mtf_skip']} · volume {bd['vol_skip']} · no "
+                   f"anchor {bd['no_anchor']}")
         if bd["universe"] < 8:
             st.warning(f"Only {bd['universe']} symbols on this venue. If it is "
                        f"binanceus, pick okx or bybit — it has almost no perps.")
@@ -134,9 +138,10 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
             st.caption(f"{bd['stale']} setups fell outside the {bd['recent']}-bar "
                        f"freshness window. Raise it to see more.")
 
-    board = st.session_state.get("board", [])
+    board = [s for s in st.session_state.get("board", [])
+             if s.meta.get("status") in FUTURE]
     if not board:
-        st.info("No board yet.")
+        st.info("No board yet, or every setup has already played out.")
         return
 
     st.dataframe(pd.DataFrame([{

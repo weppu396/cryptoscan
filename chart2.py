@@ -1,4 +1,11 @@
-"""chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it."""
+"""chart2.py - authoritative renderer. Consumes a StructureFrame, never recomputes it.
+
+Axis map:
+  x    price row time axis
+  x2   volume row time axis from make_subplots(shared_xaxes=True), matches="x",
+       so it must keep x's domain
+  x3   the profile gutter, resolved at runtime. Never reuse x2.
+"""
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -33,7 +40,16 @@ def _future(df, bars=14):
     return df.index[-1] + (df.index[-1] - df.index[-2]) * bars
 
 
-def _profile(fig, df, bars, color):
+def _gutter_axis(fig) -> str:
+    """First x-axis name not already owned by the subplot grid."""
+    used = {k for k in fig.layout.to_plotly_json() if k.startswith("xaxis")}
+    i = 2
+    while f"xaxis{i}" in used:
+        i += 1
+    return f"x{i}"
+
+
+def _profile(fig, df, bars, color, axis):
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
     if not vp or not len(vp["centers"]):
         return
@@ -42,21 +58,23 @@ def _profile(fig, df, bars, color):
                          marker=dict(color=color, line=dict(width=0)),
                          width=step * 0.9 if step else None,
                          hoverinfo="skip", showlegend=False), row=1, col=1)
-    fig.data[-1].xaxis = "x2"
+    fig.data[-1].xaxis = axis
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
                                  (vp["vah"], MUT, "VAH", "dot"),
                                  (vp["val"], MUT, "VAL", "dot")):
-        fig.add_shape(type="line", xref="x2", yref="y", x0=0, x1=1,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=1,
                       y0=lvl, y1=lvl, line=dict(color=tone, width=1, dash=dash))
         fig.add_annotation(xref="paper", yref="y", x=PRICE_DOMAIN[0], y=lvl,
                            text=tag, showarrow=False, xanchor="left",
                            font=dict(size=7, color=tone), opacity=0.75)
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref="x2", yref="y", x0=0, x1=0.45,
-                      y0=lvl, y1=lvl, line=dict(color="rgba(150,150,160,0.30)", width=1))
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.45,
+                      y0=lvl, y1=lvl,
+                      line=dict(color="rgba(150,150,160,0.30)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref="x2", yref="y", x0=0, x1=0.22,
-                      y0=lvl, y1=lvl, line=dict(color="rgba(150,150,160,0.18)", width=1))
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.22,
+                      y0=lvl, y1=lvl,
+                      line=dict(color="rgba(150,150,160,0.18)", width=1))
 
 
 def build(df, frame, direction, plan=None, mode="analysis", layers=None,
@@ -81,6 +99,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
                         row_heights=[0.78, 0.22] if rows == 2 else [1.0],
                         vertical_spacing=0.03)
+    gutter = _gutter_axis(fig)
 
     fig.add_trace(go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"],
@@ -176,11 +195,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     if "vp" in on:
         try:
             if htf_df is not None and len(htf_df) >= 30:
-                _profile(fig, htf_df, bars * 2, VP_HTF)
+                _profile(fig, htf_df, bars * 2, VP_HTF, gutter)
         except Exception:
             pass
         try:
-            _profile(fig, adf, bars, VP_LTF)
+            _profile(fig, adf, bars, VP_LTF, gutter)
         except Exception:
             pass
 
@@ -193,17 +212,31 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                text=f" {txt} {y:,.6g}", showarrow=False,
                                font=dict(size=8, color=col))
 
+    try:
+        lo = float(view["low"].min())
+        hi = float(view["high"].max())
+        pad = (hi - lo) * 0.02 or max(abs(hi), 1.0) * 0.001
+        y_range = [lo - pad, hi + pad]
+    except Exception:
+        y_range = None
+
     fig.update_layout(height=620, template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=6, r=78, t=34, b=6),
                       xaxis_rangeslider_visible=False, hovermode="x unified",
                       dragmode="pan", showlegend=False,
                       title=dict(text=f"chart {chart_tf or ''} · profile = "
                                       f"OHLCV estimate", x=0, xanchor="left",
-                                 font=dict(size=10, color=MUT)),
-                      xaxis=dict(domain=PRICE_DOMAIN),
-                      xaxis2=dict(domain=PROFILE_DOMAIN, anchor="y", range=[0, 1],
-                                  showgrid=False, showticklabels=False,
-                                  zeroline=False))
+                                 font=dict(size=10, color=MUT)))
+    # x and x2 are a matched pair: identical domains or plotly rejects the layout
+    fig.update_layout(xaxis=dict(domain=PRICE_DOMAIN))
+    if rows == 2:
+        fig.update_layout(xaxis2=dict(domain=PRICE_DOMAIN))
+    fig.update_layout(**{gutter: dict(domain=PROFILE_DOMAIN, anchor="y",
+                                      range=[0, 1], showgrid=False,
+                                      showticklabels=False, zeroline=False,
+                                      fixedrange=True)})
+    if y_range:
+        fig.update_layout(yaxis=dict(range=y_range))
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="right")
     return fig

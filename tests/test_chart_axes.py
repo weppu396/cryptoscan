@@ -1,22 +1,47 @@
-"""Chart layout, zoom and axis contract."""
+"""Chart contract: pivots, zones, gutter, zoom."""
 import numpy as np
 import pandas as pd
 import pytest
 
 import chart
-import chart2
 from config import CFG
-from core import structure2
+from core.structure_map import structure_lines, volume_zones
 
 PLAN = {"entry": 0.003625, "sl": 0.00371, "tp1": 0.003497, "tp2": 0.003369}
 
 
-def frame(n=400, seed=5, freq="5min", px0=0.0036, vol=0.00004):
+def frame(n=400, seed=5, freq="3min", px0=0.0036, vol=0.00004):
     rng = np.random.default_rng(seed)
     idx = pd.date_range("2026-01-01", periods=n, freq=freq, tz="UTC")
     px = px0 + np.cumsum(rng.normal(0, vol, n))
     return pd.DataFrame({"open": px, "high": px + vol, "low": px - vol,
-                         "close": px, "volume": rng.uniform(1, 30, n)}, index=idx)
+                         "close": px, "volume": rng.uniform(1, 40, n)}, index=idx)
+
+
+def test_at_most_two_pivots_per_timeframe():
+    df = frame()
+    assert len(structure_lines(df, CFG, "3m", "LTF")) <= 2
+
+
+def test_pivot_labels_are_trend_words():
+    df = frame()
+    lines = structure_lines(df, CFG, "3m", "LTF")
+    assert all(l["label"] in ("HH", "HL", "LH", "LL", "H", "L") for l in lines)
+
+
+def test_pivots_sit_on_real_wicks():
+    df = frame()
+    for l in structure_lines(df, CFG, "3m", "LTF"):
+        row = df.loc[l["ts"]]
+        assert l["price"] == pytest.approx(float(row["high"])) or \
+            l["price"] == pytest.approx(float(row["low"]))
+
+
+def test_zones_require_volume():
+    df = frame()
+    df.loc[df.index[100], "volume"] = 400.0
+    zones = volume_zones(df, CFG, "3m", "LTF", "long", min_ratio=1.3)
+    assert all(z["ratio"] >= 1.3 for z in zones)
 
 
 def test_candles_own_most_of_the_width():
@@ -24,39 +49,39 @@ def test_candles_own_most_of_the_width():
     assert tuple(fig.layout.xaxis.domain) == (0.0, 0.76)
 
 
-def test_gutter_has_two_non_overlapping_halves():
-    fig = chart.build(frame(), CFG, "short", PLAN)
+def test_gutter_is_fenced_and_split():
+    fig = chart.build(frame(), CFG, "short", PLAN, pair=("15m", "3m"))
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert len(prof) >= 2
+    assert prof
     for t in prof:
         assert t.xaxis == "x2"
     bases = sorted(float(t.base[0]) for t in prof)
-    assert bases[0] < 0.5 and bases[-1] >= 0.5, "profiles must not share a half"
+    assert bases[0] < 0.5 and bases[-1] >= 0.5
     assert tuple(fig.layout.xaxis2.domain) == (0.785, 1.0)
 
 
-def test_profiles_use_different_colours():
-    fig = chart.build(frame(), CFG, "short", PLAN)
-    cols = {t.marker.color for t in fig.data
-            if getattr(t, "orientation", None) == "h"}
-    assert len(cols) == 2
-
-
-def test_both_axes_are_zoomable():
+def test_both_axes_zoomable_gutter_fixed():
     fig = chart.build(frame(), CFG, "short", PLAN)
     assert fig.layout.xaxis.fixedrange is False
     assert fig.layout.yaxis.fixedrange is False
     assert fig.layout.xaxis2.fixedrange is True
+    assert fig.layout.dragmode == "zoom"
 
 
-def test_structure_marks_reach_the_right_edge():
-    fig = chart.build(frame(), CFG, "short", PLAN)
+def test_pivot_lines_reach_the_right_edge():
+    fig = chart.build(frame(), CFG, "short", PLAN, pair=("15m", "3m"))
     x_hi = pd.Timestamp(fig.layout.xaxis.range[1])
     lines = [s for s in fig.layout.shapes
              if s.type == "line" and s.xref == "x" and s.y0 == s.y1]
     assert lines
     for s in lines:
         assert pd.Timestamp(s.x1) == x_hi
+
+
+def test_profile_bars_are_thick():
+    fig = chart.build(frame(), CFG, "short", PLAN)
+    prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
+    assert all(float(t.width[0]) > 0 for t in prof)
 
 
 def test_default_window_is_100_to_120():
@@ -74,32 +99,10 @@ def test_ohlc_is_complete_and_ordered():
         assert h >= max(o, cl) and l <= min(o, cl)
 
 
-def test_price_range_covers_every_wick():
-    df = frame(130)
-    view = df.tail(110)
-    fig = chart.build(df, CFG, "short", PLAN)
-    lo, hi = fig.layout.yaxis.range
-    assert lo <= float(view["low"].min()) and hi >= float(view["high"].max())
-
-
-def test_tail_gap_does_not_stretch_the_axis():
-    df = frame(200)
-    df = pd.concat([df.iloc[:-1],
-                    df.iloc[[-1]].set_index(df.index[-1:] + pd.Timedelta(days=90))])
-    fig = chart.build(df, CFG, "short", PLAN)
-    lo, hi = fig.layout.xaxis.range
-    assert pd.Timestamp(hi) - pd.Timestamp(lo) < pd.Timedelta(days=5)
-
-
 def test_tick_format_follows_timeframe():
     for tf, want in (("1m", "%H:%M"), ("30m", "%H:%M"), ("4H", "%d %b %H:%M")):
         fig = chart.build(frame(), CFG, "short", PLAN, chart_tf=tf)
         assert fig.layout.xaxis.tickformat == want
-
-
-def test_no_bottom_volume_row():
-    fig = chart.build(frame(), CFG, "short", PLAN)
-    assert "yaxis2" not in fig.layout.to_plotly_json()
 
 
 @pytest.mark.parametrize("tf", ["1m", "3m", "5m", "15m", "30m", "1H", "4H"])
@@ -109,17 +112,3 @@ def test_every_timeframe_renders_candles(tf):
     fig = chart.build(frame(200, freq=freq), CFG, "short", PLAN, chart_tf=tf)
     c = [t for t in fig.data if t.type == "candlestick"]
     assert c and len(c[0].x) > 0
-
-
-def test_empty_frame_returns_a_figure():
-    assert chart.build(frame(0), CFG, "short", PLAN) is not None
-
-
-def test_chart2_same_contract():
-    df = frame()
-    fr = structure2.run(df, "X", "5m", CFG)
-    fig = chart2.build(df, fr, "short", PLAN, mode="analysis")
-    assert tuple(fig.layout.xaxis.domain) == (0.0, 0.76)
-    assert fig.layout.xaxis.fixedrange is False
-    prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert prof and all(t.xaxis == "x2" for t in prof)

@@ -30,7 +30,7 @@ import sop
 import ui
 from config import AUTH_ENABLED, CFG
 from core import reversal_alerts
-from core.tfs import CHART_TFS, chart_minutes, data_tf
+from core.tfs import CHART_TFS, cap_htf, chart_minutes, data_tf
 from strategy import reversal
 
 try:
@@ -76,6 +76,7 @@ GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
 HAS_FRAGMENT = hasattr(st, "fragment")
+CHART_BARS = 1500
 
 RATIO = {"3m": 5, "5m": 6, "15m": 4, "1h": 4, "4h": 6, "1d": 1, "1w": 1}
 HTF_BARS = 260
@@ -84,13 +85,17 @@ TF_MIN = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
 OHLC = ("open", "high", "low", "close")
 
 LOGIC_MD = """
-### The timeframe pair is chosen, not fixed
+### The pair is chosen, and the higher side is capped at 1h
 
-Three candidate pairs are scored per coin: `15m/3m`, `30m/15m`, `1h/30m`. The
-score is swing separation measured in ATR, swing density, and whether
-volatility sits in a workable band. The clearest pair wins and is printed on
-every card, alert and chart title. 30m and 1h are resampled from 15m, so a
-lower timeframe is never invented.
+The higher timeframe is picked from **15m / 30m / 1h** — never above 1h — by how
+cleanly the market is structured: swing separation measured in ATR, swing
+density, and whether volatility sits in a workable band. 30m and 1h are
+resampled from the loaded 15m frame, so a lower timeframe is never invented.
+
+Once the HTF is fixed, **every legal lower timeframe for it is fully assessed**
+and the one whose setup scores highest is kept. The HTF decides location; the
+LTF decides whether the trigger actually fired. Both are printed on every card,
+alert and chart title.
 
 | role | higher timeframe | lower timeframe |
 |---|---|---|
@@ -112,8 +117,15 @@ lower timeframe is never invented.
    0.35 × LTF ATR. TP1 is the next opposing zone or 1.5R, TP2 the next one or
    3.0R, capped by `max_tp_r`.
 6. **Gates.** `ACTIVE_ENTRY` needs R:R ≥ `min_rr`, stop ≤ `max_stop_atr`,
-   travel over 12 bars ≤ 4 ATR, and no open paper position. Failing a gate
-   downgrades to `CONFIRMED` — still visible, not a new entry.
+   travel over 12 bars ≤ 4 ATR, and no open paper position.
+
+### Only future trades are listed
+
+A row is `executable` only when it is `APPROACHING`, `DEVELOPING` or
+`ACTIVE_ENTRY`, **and** R:R still clears `min_rr`, **and** the move is not
+extended, **and** you are not already in it. Anything else is marked
+`past / played` and pushed below the live rows, or dropped from the board.
+`MISSED` and `INVALIDATED` never appear as live.
 
 ### Statuses
 
@@ -218,7 +230,8 @@ def _tidy(df):
 def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
     """Plain candle chart collapsing only real holes. No candle is invented."""
     d = _tidy(df)
-    view = d.tail(bars)
+    hist = d.tail(1200)
+    view = hist.tail(bars)
     diffs = pd.Series(view.index).diff().dropna()
     good = diffs[diffs > pd.Timedelta(0)]
     step = good.median() if len(good) else pd.Timedelta(minutes=1)
@@ -234,20 +247,22 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
         "%d %b %H:%M" if TF_MIN.get(tf, 60) < 1440 else "%d %b")
 
     fig = go.Figure(go.Candlestick(
-        x=view.index, open=view["open"], high=view["high"], low=view["low"],
-        close=view["close"], increasing_line_color="#16c784",
+        x=hist.index, open=hist["open"], high=hist["high"], low=hist["low"],
+        close=hist["close"], increasing_line_color="#16c784",
         decreasing_line_color="#ea3943", increasing_fillcolor="#16c784",
         decreasing_fillcolor="#ea3943", whiskerwidth=0.6))
     fig.update_layout(height=460, template="plotly_dark",
                       paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
                       margin=dict(l=58, r=10, t=26, b=22), showlegend=False,
-                      dragmode="zoom",
-                      title=dict(text=f"{tf} · {len(view)} bars · "
+                      dragmode="zoom", uirevision="detail",
+                      title=dict(text=f"{tf} · {len(view)} shown of "
+                                      f"{len(hist)} loaded · "
                                       f"{len(breaks)} real gap(s) collapsed",
                                  x=0, xanchor="left",
                                  font=dict(size=10, color="#7f8798")),
                       xaxis=dict(type="date", showgrid=False, nticks=8,
                                  tickformat=tick, rangeslider=dict(visible=False),
+                                 range=[view.index[0], view.index[-1]],
                                  rangebreaks=breaks, fixedrange=False,
                                  constrain="range"),
                       yaxis=dict(range=[lo - pad, hi + pad], side="left",
@@ -529,7 +544,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             "floor": floor, "loaded": 0, "err": 0, "raw": 0, "kept": 0,
             "stale": 0, "graded": 0, "below_grade": 0, "smc_skip": 0,
             "mtf_skip": 0, "vol_skip": 0, "no_anchor": 0, "bias_blank": 0,
-            "htf": cfg.scan.htf, "bars": bars, "recent": recent_bars}
+            "past_skip": 0, "htf": cap_htf(cfg.scan.htf), "bars": bars,
+            "recent": recent_bars}
 
     for sym in universe:
         df, used_sym = _load(ex, sym, cfg.scan.ltf, bars)
@@ -559,8 +575,11 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 kept = fresh
             for s in kept:
                 s.meta["status"] = setup_status(s, df)
-                s.meta["htf"] = cfg.scan.htf
+                s.meta["htf"] = cap_htf(cfg.scan.htf)
                 s.meta["ltf"] = cfg.scan.ltf
+                if s.meta["status"] not in OK_STATUS:
+                    diag["past_skip"] += 1
+                    continue
                 zone = (zu[0] if zu else None) if s.direction == "long" \
                     else (zd[0] if zd else None)
                 s.meta["r"] = _norm(rate(s, ind.loc[s.ts], zone, cfg, stats))
@@ -595,8 +614,8 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     continue
 
                 if need_mtf:
-                    htf_df, _ = _load(ex, used_sym, cfg.scan.htf, max(HTF_BARS, 250),
-                                      60)
+                    htf_df, _ = _load(ex, used_sym, cap_htf(cfg.scan.htf),
+                                      max(HTF_BARS, 250), 60)
                     hb_s = structure_bias(_closed(htf_df), cfg) \
                         if htf_df is not None else "range"
                     ok_mtf, why = aligned(hb_s, str(stt["trend"].iloc[-1]), s.direction)
@@ -678,8 +697,8 @@ def cached_radar(exchange, preferred, proxy):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_reversal(exchange, preferred, proxy, symbols):
-    """Two requests per symbol: 3m and 15m. The pair is then auto-selected."""
-    cfg = build_cfg(exchange, 40, 30e6, "15m", 2.0, 3.5, 0.5, 10000)
+    """Two requests per symbol: 3m and 15m. HTF capped at 1h, LTF by best setup."""
+    cfg = build_cfg(exchange, 40, 30e6, reversal.SCALP, 2.0, 3.5, 0.5, 10000)
     ex, name = _resolve(cfg, preferred, proxy)
     try:
         held = {r["symbol"] for r in paper.open_rows()}
@@ -688,13 +707,14 @@ def cached_reversal(exchange, preferred, proxy, symbols):
     rows = []
     for c in symbols:
         try:
-            ldf, used = _load(ex, f"{c}/USDT:USDT", "3m", 500, 200)
+            ldf, used = _load(ex, f"{c}/USDT:USDT", reversal.SCALP, 1500, 200)
             if ldf is None:
                 continue
-            mdf, _ = _load(ex, used, "15m", 500, 200)
+            mdf, _ = _load(ex, used, reversal.BASE, 1500, 200)
             if mdf is None:
                 continue
-            r = reversal.evaluate(used, {"3m": _closed(ldf), "15m": _closed(mdf)},
+            r = reversal.evaluate(used, {reversal.SCALP: _closed(ldf),
+                                         reversal.BASE: _closed(mdf)},
                                   cfg, already=used in held)
             if r:
                 rows.append(r)
@@ -739,7 +759,7 @@ with st.sidebar:
     st.divider()
     ltf = st.selectbox("Timeframe", ["4h", "1d"] if MODE == "Spot" else ["1h", "4h", "1d"],
                        index=1)
-    st.caption(f"bias from {htf_for(ltf)} · {_scan_bars(ltf)} bars")
+    st.caption(f"bias from {cap_htf(htf_for(ltf))} · {_scan_bars(ltf)} bars")
     top = st.slider("Symbols to scan", 10, 150, 25, step=5)
     min_vol = st.select_slider("Min 24h volume",
                                [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
@@ -876,7 +896,7 @@ with T["Overview"]:
             cfg = build_cfg(exch, top, min_vol, detail_tf, min_rr, max_stop_atr,
                             risk_pct, equity)
             ex, ex_name = _resolve(cfg, exch, proxy.strip() or None)
-            df, used = _load(ex, detail_sym, detail_tf, 400)
+            df, used = _load(ex, detail_sym, detail_tf, CHART_BARS, 200)
             if df is None:
                 st.warning(f"Not enough candles for {detail_sym} on {ex_name}.")
             else:
@@ -899,9 +919,9 @@ with T["Overview"]:
                                         "displaylogo": False})
                 st.caption(
                     f"{used} · {detail_tf} · real venue holes collapsed: {gaps}. "
-                    "No candle is invented — the axis hides dead space and the "
-                    "count is printed. Drag to zoom, right-drag to pan, "
-                    "double-click to reset.")
+                    "No candle is invented. The whole loaded history is in the "
+                    "chart, so zooming out reveals earlier candles. Drag to "
+                    "zoom, right-drag to pan, double-click to reset.")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
 
@@ -967,11 +987,13 @@ if MODE == "Bot":
         if diag:
             st.caption(f"venue {diag['venue']} · universe {diag['universe']} · "
                        f"loaded {diag['loaded']} · failed {diag['err']} · raw "
-                       f"{diag['raw']} · kept {diag['kept']} · graded "
-                       f"{diag['graded']} · below grade {diag['below_grade']} · "
-                       f"blank bias {diag['bias_blank']}")
-        for s in [s for s in st.session_state.get("setups", [])
-                  if (not only_ok) or s.meta.get("status") in OK_STATUS][:10]:
+                       f"{diag['raw']} · kept {diag['kept']} · played "
+                       f"{diag.get('past_skip', 0)} · graded {diag['graded']} · "
+                       f"below grade {diag['below_grade']} · blank bias "
+                       f"{diag['bias_blank']}")
+        live = [s for s in st.session_state.get("setups", [])
+                if s.meta.get("status") in OK_STATUS]
+        for s in live[:10]:
             r = _norm(s.meta.get("r"))
             with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
                              f"{s.meta.get('status')}"):
@@ -985,9 +1007,9 @@ if MODE == "Bot":
 with T["SMC"]:
     ui.section("Smart money map",
                "Structure, zones, volume, the trade and its invalidation.")
-    st.caption("Two pivots per timeframe are drawn — yellow HTF, cyan LTF — "
-               "each from the wick to the right edge. Drag horizontally to "
-               "compress/expand time, vertically for price; right-drag to pan.")
+    st.caption("Two pivots per timeframe — yellow HTF, cyan LTF — each from the "
+               "wick to the right edge. HTF is capped at 1h. Drag horizontally "
+               "to compress/expand time, vertically for price; right-drag pans.")
     s1, s2, s3 = st.columns([2, 1, 1])
     smc_sym = s1.text_input("Symbol", "BTC/USDT:USDT", key="smc_sym")
     smc_tf = s2.selectbox("Entry timeframe", ["3m", "5m", "15m", "1h", "4h", "1d"],
@@ -1005,7 +1027,8 @@ with T["SMC"]:
                 st.warning(f"No data for {smc_sym} on {ex_name}.")
             else:
                 cdf = _closed(df)
-                hdf, _ = _load(ex, used, cfg.scan.htf, max(HTF_BARS, 250), 60)
+                htf_tf = cap_htf(cfg.scan.htf)
+                hdf, _ = _load(ex, used, htf_tf, max(HTF_BARS, 250), 60)
                 hdf_c = _closed(hdf) if hdf is not None else None
                 hb = structure_bias(hdf_c, cfg) if hdf_c is not None else "range"
                 stt_tab = build_structure(df, cfg.structure)
@@ -1032,22 +1055,24 @@ with T["SMC"]:
                         "up" if av["score"] >= 40 else "dn")
                 ui.stat(k[4], "In value area", "yes" if in_va else "no",
                         "up" if in_va else "warn")
-                st.caption(f"HTF {cfg.scan.htf} · LTF {smc_tf} · {why} · "
-                           f"closed candles only")
+                st.caption(f"HTF {htf_tf} (capped at 1h) · LTF {smc_tf} · {why} "
+                           f"· closed candles only")
 
                 disp = df
                 if chart_minutes(chart_tf) < chart_minutes(smc_tf):
-                    d2, _v = _load(ex, used, data_tf(chart_tf), 400)
+                    d2, _v = _load(ex, used, data_tf(chart_tf), 800)
                     if d2 is not None:
                         disp = d2
                 st.plotly_chart(chart.build(disp, cfg, side, plan,
                                             chart_tf=chart_tf, analysis_df=cdf,
                                             htf_df=hdf_c, ltf_df=cdf,
-                                            pair=(cfg.scan.htf, smc_tf)),
+                                            pair=(htf_tf, smc_tf)),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 st.caption("Gutter: blue = HTF profile (left half), orange = "
-                           "LTF profile (right half), both estimates.")
+                           "LTF profile (right half), both estimates. The whole "
+                           "loaded history is in the chart, so zooming out keeps "
+                           "revealing earlier candles.")
                 with st.expander("How to read this chart"):
                     st.markdown(chart.legend_md())
                 st.divider()
@@ -1096,16 +1121,16 @@ with T["Radar"]:
 
     st.divider()
     ui.section("Reversal radar",
-               "Pair auto-selected per coin. Approaching first. Active entries "
-               "are new, confirmed and still in range.")
+               "Pair auto-selected per coin, HTF capped at 1h. Approaching "
+               "first. Only setups still executable are listed.")
     st.caption("Zones from the HTF engine. Confirmation from the LTF CHoCH/BOS "
-               "plus the ATR candle grader. Extended moves and coins already in "
-               "the paper book are kept out. Closed candles only.")
+               "plus the ATR candle grader. Played, extended and already-held "
+               "coins are kept out of the live table. Closed candles only.")
     with st.expander("How the pair and the statuses are produced"):
         st.markdown(LOGIC_MD)
     if st.button("Scan reversals", key="rev_scan", type="primary"):
         try:
-            with st.spinner("scoring pairs and reading structure..."):
+            with st.spinner("scoring HTF, then triggers..."):
                 rows, venue = cached_reversal(exch, exch, proxy.strip() or None,
                                               MAJORS[:12])
             st.session_state["rev_rows"] = rows
@@ -1116,8 +1141,10 @@ with T["Radar"]:
     rev_rows = st.session_state.get("rev_rows", [])
     if rev_rows:
         live, dead = reversal.rank(rev_rows)
+        future = reversal.future_only(rev_rows)
         st.caption(f"venue {st.session_state.get('rev_venue', '—')} · "
-                   f"{len(live)} live · {len(dead)} stale")
+                   f"{len(future)} executable · {len(live) - len(future)} "
+                   f"played · {len(dead)} stale")
         if live:
             st.dataframe(pd.DataFrame([{
                 "status": r["status"], "pair": f"{r['htf']}/{r['ltf']}",
@@ -1127,6 +1154,7 @@ with T["Radar"]:
                 "stop": f"{r['stop']:,.6g}", "tp1": f"{r['tp1']:,.6g}",
                 "rr": round(r["rr"], 2),
                 "eta": f"~{r['eta_min']:.0f}m" if r["eta_min"] else "—",
+                "exec": "yes" if r.get("future") else "past",
                 "why": " · ".join(r["reasons"]) or "—"} for r in live]),
                 hide_index=True, use_container_width=True)
 
@@ -1283,9 +1311,10 @@ if MODE == "Bot":
                    "Early warning 5-10 minutes out, then a separate confirmed "
                    "entry. Reuses the same Telegram credentials.")
         st.caption("ETA comes from distance divided by the HTF ATR per bar. It "
-                   "is an estimate. Duplicate and stale alerts are suppressed. "
-                   "Nothing is auto-traded. Polling runs while this tab is open "
-                   "or on button press — there is no background worker.")
+                   "is an estimate. Duplicate and stale alerts are suppressed, "
+                   "and only executable rows are sent. Nothing is auto-traded. "
+                   "Polling runs while this tab is open or on button press — "
+                   "there is no background worker.")
         a1, a2 = st.columns(2)
         auto = a1.checkbox("Poll automatically", value=False,
                            help="Re-scans every 90s while this tab is open.")
@@ -1296,9 +1325,9 @@ if MODE == "Bot":
             try:
                 rows, _v = cached_reversal(exch, exch, proxy.strip() or None,
                                            MAJORS[:12])
-                cfg = build_cfg(exch, top, min_vol, "15m", min_rr,
+                cfg = build_cfg(exch, top, min_vol, reversal.SCALP, min_rr,
                                 max_stop_atr, risk_pct, equity)
-                batch = state.due(rows, cfg.risk.min_rr)
+                batch = state.due(reversal.future_only(rows), cfg.risk.min_rr)
                 state.prune()
                 for r, kind, text in batch:
                     notify(text)
@@ -1383,19 +1412,21 @@ directly — `okx` or `bybit` work from Cloud, `binanceus` has almost no perps.
 
 ### Chart timeframes
 The chart selector (1m to 4H) is display-only. It re-reads candles, never the
-strategy. Lower timeframes are fetched directly, higher ones are resampled.
+strategy. The higher timeframe the engine uses is capped at 1h.
+
+### Zoom and history
+The whole loaded history is in every chart, so zooming out keeps revealing
+earlier candles instead of empty space. Drag horizontally to compress or expand
+time, vertically to compress or expand price, right-drag to pan, double-click
+to reset.
 
 ### Coin detail gaps
 Sparse history on 1H, 4H and 1D is a venue fact. The detail chart collapses
 only real holes and prints how many it hid.
 
-### Chart interaction
-Drag horizontally to compress or expand time. Drag vertically to compress or
-expand price. Right-drag to pan. Double-click to reset. All marks are in
-price/time space and stay locked while you move.
-
 ### Setups vs Analysis
-Setups is the scanner board. Analysis is the point-in-time workflow.
+Setups is the scanner board, filtered to what can still be executed. Analysis
+is the point-in-time workflow.
 
 ### Reading a card
 Chart top to bottom: structure, location, liquidity, volume, acceptance, break,

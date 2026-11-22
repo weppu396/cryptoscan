@@ -12,11 +12,27 @@ from core.candles import latest as latest_candle
 from core.indicators import compute_all
 from core.models import Decision, Layer, ReadinessInput, Stage, new_id
 from core.volume import avwap_context, volume_profile
+from strategy.risk import plan_rr
+
+try:
+    import live
+    LIVE_OK = True
+except Exception:
+    LIVE_OK = False
 
 MODE_LABEL = {"structure": "Structure", "analysis": "Analysis", "execution": "Execution"}
 TF_BIAS = {"4h": "1d", "1h": "4h", "15m": "1h"}
 STAGE_OF = {Decision.WAIT: Stage.NEW_SETUP, Decision.PREPARE: Stage.APPROACHING,
             Decision.READY: Stage.READY, Decision.TRIGGERED: Stage.TRIGGERED}
+
+
+def _g(obj, key, default=None):
+    """structure2 hands back Swing objects; dict shapes exist in older paths."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 def _bias(htf, cfg) -> str:
@@ -103,6 +119,7 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         bias_reason = f"HTF {bias} vs {side}"
         struct = frame.last(Layer.INTERNAL, "bull" if side == "long" else "bear", t)
         struct_ok = struct is not None
+        struct_level = float(_g(struct, "level")) if struct_ok else None
 
         _, cname, cq = latest_candle(df, atr, side)
         candle_ok = cq >= 60
@@ -118,11 +135,12 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
             dist, in_zone = 99.0, False
 
         anchor = None
-        pool = [s for s in frame.swings if s.layer == Layer.EXTERNAL
-                and s.kind == ("L" if side == "long" else "H")
-                and s.confirmed_at <= t]
+        pool = [s for s in (getattr(frame, "swings", None) or [])
+                if _g(s, "layer") == Layer.EXTERNAL
+                and _g(s, "kind") == ("L" if side == "long" else "H")
+                and int(_g(s, "confirmed_at", 0)) <= t]
         if pool:
-            anchor = pool[-1].idx
+            anchor = int(_g(pool[-1], "idx"))
         av = (avwap_context(df, side, atr, anchor) if anchor is not None
               else {"score": 0, "dist": 0.0})
         vp = volume_profile(df)
@@ -134,8 +152,11 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         else:
             entry = price
             inval = price - 1.5 * atr if side == "long" else price + 1.5 * atr
-        risk = abs(entry - inval) or atr
-        rr = (3.0 * atr) / risk if risk else 0.0
+        sign = 1.0 if side == "long" else -1.0
+        tp1 = entry + sign * 3.0 * atr
+        tp2 = entry + sign * 5.0 * atr
+        rr_map = plan_rr(entry, inval, tp1, tp2)
+        rr = rr_map["rr1"]
         risk_ok = rr >= cfg.risk.min_rr
 
         optional = {}
@@ -152,8 +173,7 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         decision, missing = readiness.evaluate(ri)
 
         nav = nextaction.build(decision, used, side, price,
-                               struct.level if struct_ok else None, zone,
-                               missing, setup_tf, inval)
+                               struct_level, zone, missing, setup_tf, inval)
 
         k = st.columns(5)
         ui.stat(k[0], "HTF bias", bias,
@@ -167,16 +187,26 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
 
         _panel(nav)
 
-        st.plotly_chart(chart2.build(df, frame, side,
-                                     {"entry": entry, "stop": inval,
-                                      "tp1": entry + (3 if side == "long" else -3) * atr,
-                                      "tp2": entry + (5 if side == "long" else -5) * atr},
-                                     mode=mode),
-                        use_container_width=True, config={"scrollZoom": True})
+        try:
+            st.plotly_chart(
+                chart2.build(df, frame, side,
+                             {"entry": entry, "stop": inval, "tp1": tp1, "tp2": tp2},
+                             mode=mode),
+                use_container_width=True, config={"scrollZoom": True})
+        except Exception as e:
+            st.warning(f"chart unavailable: {type(e).__name__}: {e}")
+            st.caption("The metrics above do not depend on the chart. It is "
+                       "display only.")
+
+        if LIVE_OK and st.toggle("Live 1s tape", key="an_live"):
+            live.render(ex, used, side, "an_live_seed")
 
         st.divider()
         sid = st.session_state.setdefault("an_sid", new_id())
         st.code(f"setup {sid}\nentry {entry:,.6g}\nstop {inval:,.6g}\n"
+                f"tp1 {tp1:,.6g} ({rr_map['rr1']:.2f}R)\n"
+                f"tp2 {tp2:,.6g} ({rr_map['rr2']:.2f}R)\n"
+                f"weighted {rr_map['weighted']:.2f}R\n"
                 f"invalidate {'close below' if side == 'long' else 'close above'} "
                 f"{inval:,.6g}", language="text")
 

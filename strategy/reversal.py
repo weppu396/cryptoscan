@@ -2,7 +2,8 @@
 
 The higher timeframe is chosen from 15m / 30m / 1h by structure quality, never
 above 1h. The lower timeframe is then chosen from the legal triggers for that
-HTF by running the full assessment on each and keeping the best setup.
+HTF — 3m, 5m or 15m depending on the HTF — by running the full assessment on
+each and keeping the best setup.
 
 30m and 1h are resampled from the loaded 15m frame, so a lower timeframe is
 never invented. Confirmation reuses core.candles.quality, the existing ATR
@@ -25,12 +26,13 @@ CONFIRM_WINDOW = 15
 MIN_CANDLE_Q = 60
 
 # loaded frames the caller must supply
-BASE = "15m"
+BASE = "15m"          # context frame, also the parent for 30m / 1h
+FAST = "5m"
 SCALP = "3m"
 
 # HTF is capped at 1h by cap_htf(). LTFs are the legal triggers per HTF.
 HTF_CHOICES = ("15m", "30m", "1h")
-LTF_FOR = {"15m": ("3m",), "30m": ("3m", "15m"), "1h": ("15m", "30m")}
+LTF_FOR = {"15m": ("3m",), "30m": ("3m", "5m"), "1h": ("5m", "15m")}
 COARSE = ("30m", "1h")
 
 STATUSES = ("APPROACHING", "DEVELOPING", "CONFIRMED", "ACTIVE_ENTRY",

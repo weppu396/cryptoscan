@@ -12,11 +12,11 @@ Every mark is drawn from the engine's own state, never hand-placed:
   volume bars      raw volume            conviction behind each bar
   entry/stop/TP    smc.playbook          the trade, with risk and reward shaded
 
-Clutter rules, added 2026-11: at most two 30m majors and three 3m minors are
-drawn, anything priced within half an ATR of a newer mark is dropped, minors
-carry no text, and every fill is under 0.20 alpha. Major marks are blue,
-minor marks grey, so a 30m structural break can never be mistaken for a 3m
-twitch.
+Axis map, and why it matters:
+  x    price row time axis
+  x2   volume row time axis, created by make_subplots(shared_xaxes=True) and
+       therefore carrying matches="x" — it MUST keep x's domain
+  x3   the profile gutter, a fresh axis resolved at runtime. Never reuse x2.
 
 Green = reward, red = risk. Read-only: nothing here changes the plan.
 """
@@ -66,8 +66,19 @@ def _anchor(stt, long: bool, span: int = ANCHOR_BARS):
         return None
 
 
-def _draw_profile(fig, df, bars: int, color: str, right: object) -> None:
-    """Horizontal volume profile in the left gutter. Estimate, not tick data."""
+def _gutter_axis(fig) -> str:
+    """First x-axis name not already used by the subplot grid. make_subplots
+    owns 'x' and 'x2', so the profile must never take either."""
+    used = {k for k in fig.layout.to_plotly_json() if k.startswith("xaxis")}
+    i = 2
+    while f"xaxis{i}" in used:
+        i += 1
+    return f"x{i}"
+
+
+def _draw_profile(fig, df, bars: int, color: str, axis: str) -> None:
+    """Horizontal volume profile in the left gutter, on its own axis.
+    Estimate, not tick data."""
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
     if not vp or not len(vp["centers"]):
         return
@@ -77,25 +88,24 @@ def _draw_profile(fig, df, bars: int, color: str, right: object) -> None:
         marker=dict(color=color, line=dict(width=0)),
         width=step * 0.9 if step else None,
         hoverinfo="skip", showlegend=False), row=1, col=1)
-    fig.data[-1].xaxis = "x2"
+    fig.data[-1].xaxis = axis
 
-    for lvl, tone, tag in ((vp["poc"], WARN, "POC"),
-                           (vp["vah"], MUT, "VAH"),
-                           (vp["val"], MUT, "VAL")):
-        fig.add_shape(type="line", xref="x2", yref="y", x0=0, x1=1,
+    for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
+                                 (vp["vah"], MUT, "VAH", "dot"),
+                                 (vp["val"], MUT, "VAL", "dot")):
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=1,
                       y0=lvl, y1=lvl,
-                      line=dict(color=tone, width=1 if tag == "POC" else 1,
-                                dash="solid" if tag == "POC" else "dot"))
+                      line=dict(color=tone, width=1, dash=dash))
         fig.add_annotation(xref="paper", yref="y", x=PRICE_DOMAIN[0], y=lvl,
                            text=tag, showarrow=False, xanchor="left",
                            font=dict(size=7, color=tone), opacity=0.75)
 
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref="x2", yref="y", x0=0, x1=0.45,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.45,
                       y0=lvl, y1=lvl,
                       line=dict(color="rgba(150,150,160,0.30)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref="x2", yref="y", x0=0, x1=0.22,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0, x1=0.22,
                       y0=lvl, y1=lvl,
                       line=dict(color="rgba(150,150,160,0.18)", width=1))
 
@@ -125,6 +135,7 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.78, 0.22], vertical_spacing=0.03)
+    gutter = _gutter_axis(fig)
 
     fig.add_trace(go.Candlestick(
         x=view.index, open=view["open"], high=view["high"], low=view["low"],
@@ -228,11 +239,11 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
     # two profiles, two colours, both labelled as estimates
     try:
         if htf_df is not None and len(htf_df) >= 30:
-            _draw_profile(fig, htf_df, bars * 2, VP_HTF, right)
+            _draw_profile(fig, htf_df, bars * 2, VP_HTF, gutter)
     except Exception:
         pass
     try:
-        _draw_profile(fig, adf, bars, VP_LTF, right)
+        _draw_profile(fig, adf, bars, VP_LTF, gutter)
     except Exception:
         pass
 
@@ -268,6 +279,15 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
     except Exception:
         pass
 
+    # pin the price scale to the visible candles so the gutter cannot stretch it
+    try:
+        lo = float(view["low"].min())
+        hi = float(view["high"].max())
+        pad = (hi - lo) * 0.02 or max(abs(hi), 1.0) * 0.001
+        y_range = [lo - pad, hi + pad]
+    except Exception:
+        y_range = None
+
     shown_tf = chart_tf or ""
     fig.update_layout(
         height=640, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
@@ -276,10 +296,16 @@ def build(df, cfg, direction: str, plan: dict | None = None, bars: int = 260,
         hovermode="x unified", dragmode="pan",
         title=dict(text=f"chart {shown_tf} · structure 30m/3m · "
                         f"profile = OHLCV estimate",
-                   x=0, xanchor="left", font=dict(size=10, color=MUT)),
-        xaxis=dict(domain=PRICE_DOMAIN),
-        xaxis2=dict(domain=PROFILE_DOMAIN, anchor="y", range=[0, 1],
-                    showgrid=False, showticklabels=False, zeroline=False))
+                   x=0, xanchor="left", font=dict(size=10, color=MUT)))
+    # x and x2 are a matched pair: identical domains, or plotly rejects them
+    fig.update_layout(xaxis=dict(domain=PRICE_DOMAIN),
+                      xaxis2=dict(domain=PRICE_DOMAIN))
+    fig.update_layout(**{gutter: dict(domain=PROFILE_DOMAIN, anchor="y",
+                                      range=[0, 1], showgrid=False,
+                                      showticklabels=False, zeroline=False,
+                                      fixedrange=True)})
+    if y_range:
+        fig.update_layout(yaxis=dict(range=y_range))
     fig.update_xaxes(showgrid=False, gridcolor="#1b1f28")
     fig.update_yaxes(showgrid=True, gridcolor="#1b1f28", side="right")
     return fig

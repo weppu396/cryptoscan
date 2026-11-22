@@ -32,15 +32,23 @@ class Structure:
     zone_lookback: int = 400
     max_wait_bars: int = 20
     require_rejection_candle: bool = True
+    line_keep: int = 2          # structure lines drawn per timeframe
+    zone_keep: int = 1          # supply/demand zones drawn per timeframe
 
 
 @dataclass(frozen=True)
 class StructCfg:
-    """External/internal structure engine. Engineering defaults, not optimised."""
+    """External/internal structure engine.
+
+    Internal pivots are 3 left + 3 right, external 5 left + 5 right. A pivot is
+    only knowable right+1 bars later, which is the anti-repainting lag. Both
+    sides are configurable because neither is universally optimal — 3+3/5+5 is
+    a starting point for backtesting, not a result.
+    """
     ext_left: int = 5
     ext_right: int = 5
-    int_left: int = 2
-    int_right: int = 2
+    int_left: int = 3
+    int_right: int = 3
     eq_tol_atr: float = 0.25
     invalidate_bars: int = 5
     close_based: bool = True
@@ -63,10 +71,10 @@ class Regime:
     ema_fast: int = 50
     ema_slow: int = 200
     adx_period: int = 14
-    adx_trend_min: float = 20.0
+    adx_trend_min: float = 15.0
     atr_period: int = 14
-    atr_pct_min: float = 0.40
-    atr_pct_max: float = 6.00
+    atr_pct_min: float = 0.20
+    atr_pct_max: float = 8.00
     rsi_period: int = 14
     rsi_long_max: float = 78.0
     rsi_short_min: float = 22.0
@@ -84,11 +92,13 @@ class Costs:
 class Scan:
     exchange: str = "binanceusdm"
     quote: str = "USDT"
-    htf: str = "1d"
-    ltf: str = "4h"
+    htf: str = "1h"
+    ltf: str = "5m"
     min_quote_vol_24h: float = 30_000_000
     top_n_symbols: int = 150
     exclude_suffixes: tuple = ("USDC", "BUSD", "DAI", "TUSD", "FDUSD")
+    htf_bars: int = 250         # HTF context budget
+    ltf_bars: int = 400         # LTF trigger budget
 
 
 @dataclass(frozen=True)

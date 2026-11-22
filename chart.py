@@ -1,43 +1,50 @@
 """chart.py - annotated decision chart.
 
-Layout contract: one row. Candles own 0-76% of the width on a datetime axis.
-The volume profile owns 78.5-100% in two halves: 30m HTF blue on the right
-half, 3m LTF orange on the left half. They never overlap and never touch the
-candle axis. Traces reference the gutter as 'x2'; update_layout names it
-'xaxis2'.
+Candles 0-76% on a datetime axis. Profile gutter 78.5-100% in two halves,
+HTF left-in-gutter blue, LTF right-in-gutter orange, own numeric axis.
 
-Every structure mark, swing line and active zone runs to the right edge.
-Both axes are free for independent zoom; only the initial view is pinned.
+Structure: exactly two pivots per timeframe, four total. Up = HH + HL, down =
+LH + LL, range = H + L. Each line starts on the pivot wick, runs to the right
+edge, carries the exact price and a BOS/CHoCH chip. HTF vibrant yellow, LTF
+bright cyan.
 
-Read-only: nothing here changes the plan.
+Zones: only unmitigated zones with above-average volume behind the touch.
+Dusty rose supply, mint demand, both low opacity and labelled with timeframe
+and multiple.
+
+Drag to zoom: horizontal compresses/expands time, vertical compresses/expands
+price. Right-drag pans, double-click resets. Every mark is in data space so it
+stays locked while zooming.
 """
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from subprocess import SubprocessError
 from plotly.subplots import make_subplots
 
 import smc
 from core.candles import latest as latest_candle
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
-from core.structure_map import live_zones, marks
+from core.structure_map import structure_lines, volume_zones
 from core.tfs import CHART_TFS, chart_minutes, data_tf, resample
 from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6"
+HTF_LINE = "#f5d90a"
+LTF_LINE = "#22d3ee"
+SUPPLY_FILL = "rgba(190,110,120,0.14)"
+SUPPLY_EDGE = "rgba(190,110,120,0.42)"
+DEMAND_FILL = "rgba(120,200,160,0.13)"
+DEMAND_EDGE = "rgba(120,200,160,0.42)"
 BG = "#0f1116"
 ANCHOR_BARS = 60
 DEFAULT_BARS = 110
 
-MAJOR_LINE = "rgba(96,152,255,0.55)"
-MINOR_LINE = "rgba(140,148,160,0.28)"
-MAJOR_TEXT = "rgba(96,152,255,0.90)"
-SWING_LINE = "rgba(140,148,160,0.18)"
-ZONE_FILL = {"long": "rgba(20,184,166,0.085)", "short": "rgba(240,185,11,0.085)"}
-ZONE_EDGE = {"long": "rgba(20,184,166,0.30)", "short": "rgba(240,185,11,0.30)"}
-FVG_FILL = {"long": "rgba(22,199,132,0.055)", "short": "rgba(234,57,67,0.055)"}
-VP_HTF = "rgba(96,152,255,0.22)"
-VP_LTF = "rgba(240,140,11,0.20)"
+ZONE_FILL = {"long": "rgba(20,184,166,0.075)", "short": "rgba(240,185,11,0.075)"}
+FVG_FILL = {"long": "rgba(22,199,132,0.05)", "short": "rgba(234,57,67,0.05)"}
+VP_HTF = "rgba(96,152,255,0.30)"
+VP_LTF = "rgba(240,140,11,0.28)"
 
 PRICE_DOMAIN = [0.0, 0.76]
 PROFILE_DOMAIN = [0.785, 1.0]
@@ -66,7 +73,6 @@ def _clean(df):
 
 
 def _step(df) -> pd.Timedelta:
-    """Median positive bar gap. Robust to holes."""
     if len(df) < 3:
         return pd.Timedelta(0)
     d = pd.Series(df.index).diff().dropna()
@@ -108,7 +114,6 @@ def _gutter(fig) -> tuple[str, str]:
 
 
 def _draw_profile(fig, df, bars: int, color: str, axis: str, side: str) -> None:
-    """One profile in its own half of the gutter. No overlap between sides."""
     b0, b1 = HALF[side]
     span = b1 - b0
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
@@ -118,7 +123,7 @@ def _draw_profile(fig, df, bars: int, color: str, axis: str, side: str) -> None:
     fig.add_trace(go.Bar(
         y=vp["centers"], x=vp["hist"] * span, base=b0, orientation="h",
         marker=dict(color=color, line=dict(width=0)),
-        width=step * 0.9 if step else None,
+        width=step * 1.6 if step else None,
         hoverinfo="skip", showlegend=False), row=1, col=1)
     fig.data[-1].xaxis = axis
 
@@ -133,31 +138,49 @@ def _draw_profile(fig, df, bars: int, color: str, axis: str, side: str) -> None:
                                font=dict(size=7, color=tone), opacity=0.85)
 
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.45,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.5,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.34)", width=1))
+                      line=dict(color="rgba(170,170,180,0.40)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.22,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.25,
                       y0=lvl, y1=lvl,
-                      line=dict(color="rgba(150,150,160,0.20)", width=1))
+                      line=dict(color="rgba(170,170,180,0.24)", width=1))
 
 
-def _mark(fig, x0, x1, level, color, width, label=None, yshift=0):
-    """Horizontal structure level running to the right edge."""
-    fig.add_shape(type="line", row=1, col=1, x0=x0, x1=x1,
-                  y0=level, y1=level, line=dict(color=color, width=width))
-    if label:
-        fig.add_annotation(x=x0, y=level, row=1, col=1, text=label,
-                           showarrow=False, xanchor="left", yshift=yshift,
-                           font=dict(size=8, color=color))
+def _struct(fig, line, x1, color, width):
+    """Pivot line from the wick to the right edge, price + tag chip."""
+    fig.add_shape(type="line", row=1, col=1, x0=line["ts"], x1=x1,
+                  y0=line["price"], y1=line["price"],
+                  line=dict(color=color, width=width))
+    txt = f"{line['label']} {line['price']:,.6g}"
+    if line["tag"]:
+        txt += f" {line['tag']}"
+    fig.add_annotation(x=line["ts"], y=line["price"], row=1, col=1, text=txt,
+                       showarrow=False, xanchor="left", yshift=9,
+                       font=dict(size=8, color=color))
+
+
+def _zone(fig, z, x0, x1):
+    fill = SUPPLY_FILL if z["side"] == "supply" else DEMAND_FILL
+    edge = SUPPLY_EDGE if z["side"] == "supply" else DEMAND_EDGE
+    fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=x1,
+                  y0=z["low"], y1=z["high"],
+                  fillcolor=fill, line=dict(width=1, color=edge))
+    fig.add_annotation(x=x1, y=(z["low"] + z["high"]) / 2, row=1, col=1,
+                       text=f" {z['grade']} {z['tf']} {z['side']} "
+                            f"{z['ratio']:.1f}x  {z['low']:,.6g}–{z['high']:,.6g} ",
+                       showarrow=False, xanchor="right",
+                       font=dict(size=7, color=edge), bgcolor="rgba(15,17,22,0.65)")
 
 
 def build(df, cfg, direction: str, plan: dict | None = None,
           bars: int = DEFAULT_BARS, chart_tf: str | None = None,
-          analysis_df=None, htf_df=None) -> go.Figure:
+          analysis_df=None, htf_df=None, ltf_df=None,
+          pair: tuple | None = None) -> go.Figure:
     df = _clean(df)
     adf = _clean(analysis_df) if analysis_df is not None else df
     htf_df = _clean(htf_df) if htf_df is not None else None
+    ltf_df = _clean(ltf_df) if ltf_df is not None else None
     if df is None or not len(df):
         fig = go.Figure()
         fig.update_layout(template="plotly_dark", paper_bgcolor=BG,
@@ -166,6 +189,15 @@ def build(df, cfg, direction: str, plan: dict | None = None,
                                             xref="paper", yref="paper",
                                             x=0.5, y=0.5)])
         return fig
+
+    htf_label, ltf_label = (pair if pair else ("30m", "3m"))
+    if htf_df is None:
+        try:
+            htf_df = resample(adf, htf_label) if len(adf) > 60 else None
+        except Exception:
+            htf_df = None
+    if ltf_df is None:
+        ltf_df = adf
 
     view = df.tail(bars)
     step = _step(view)
@@ -177,12 +209,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     want = "bull" if long else "bear"
     last_x = view.index[-1]
     right = _future(last_x, step, 6)
-
-    if htf_df is None:
-        try:
-            htf_df = resample(adf, "30m") if len(adf) > 60 else None
-        except Exception:
-            htf_df = None
+    start = view.index[0]
 
     fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
@@ -198,47 +225,45 @@ def build(df, cfg, direction: str, plan: dict | None = None,
 
     try:
         sw = find_swings(adf, cfg.structure.swing_left, cfg.structure.swing_right)
-        start = view.index[0]
         for kind, sym in (("H", "triangle-down"), ("L", "triangle-up")):
             pts = [s for s in sw if s["type"] == kind and adf.index[s["idx"]] >= start]
-            for s in pts:
-                fig.add_shape(type="line", row=1, col=1, x0=adf.index[s["idx"]],
-                              x1=right, y0=s["price"], y1=s["price"],
-                              line=dict(color=SWING_LINE, width=1))
             if pts:
                 fig.add_trace(go.Scatter(
                     x=[adf.index[s["idx"]] for s in pts],
                     y=[s["price"] for s in pts], mode="markers",
-                    marker=dict(symbol=sym, size=6, color=MUT, opacity=.5),
+                    marker=dict(symbol=sym, size=5, color=MUT, opacity=.4),
                     name="swing", showlegend=False), row=1, col=1)
     except Exception:
         pass
 
+    # exactly two pivots per timeframe, four total
     try:
-        majors, minors = marks(adf, cfg, htf_df, atr * 0.5)
-        for m in minors:
-            _mark(fig, m["ts"], right, m["level"], MINOR_LINE, 1)
-        for m in majors:
-            side = "Bullish" if m["dir"] == "bull" else "Bearish"
-            _mark(fig, m["ts"], right, m["level"], MAJOR_LINE, 1.6,
-                  f"{side} {m['kind']}", 9 if m["dir"] == "bull" else -9)
+        for line in structure_lines(htf_df, cfg, htf_label, "HTF"):
+            _struct(fig, line, right, HTF_LINE, 1.8)
+    except Exception:
+        pass
+    try:
+        for line in structure_lines(ltf_df, cfg, ltf_label, "LTF"):
+            _struct(fig, line, right, LTF_LINE, 1.4)
+    except Exception:
+        pass
+
+    # volume-backed zones only, one per side
+    try:
+        for z in volume_zones(htf_df, cfg, htf_label, "HTF", direction, keep=1):
+            _zone(fig, z, max(z["ts"], start), right)
+    except Exception:
+        pass
+    try:
+        for z in volume_zones(ltf_df, cfg, ltf_label, "LTF", direction, keep=1):
+            _zone(fig, z, max(z["ts"], start), right)
     except Exception:
         pass
 
     try:
-        for z in live_zones(smc.supply_demand(adf), adf, direction, keep=2):
-            x0 = max(adf.index[z["idx"]], view.index[0])
-            fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=right,
-                          y0=z["bot"], y1=z["top"],
-                          fillcolor=ZONE_FILL[direction],
-                          line=dict(width=1, color=ZONE_EDGE[direction]))
-    except Exception:
-        pass
-
-    try:
-        for g in [g for g in smc.fair_value_gaps(adf) if g["dir"] == want][:3]:
+        for g in [g for g in smc.fair_value_gaps(adf) if g["dir"] == want][:2]:
             x0 = adf.index[g["idx"]]
-            if x0 < view.index[0]:
+            if x0 < start:
                 continue
             fig.add_shape(type="rect", row=1, col=1, x0=x0, x1=right,
                           y0=g["bot"], y1=g["top"],
@@ -248,7 +273,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
 
     try:
         for s in [s for s in smc.liquidity_sweeps(adf) if s["dir"] == want][:3]:
-            if adf.index[s["idx"]] < view.index[0]:
+            if adf.index[s["idx"]] < start:
                 continue
             fig.add_trace(go.Scatter(
                 x=[adf.index[s["idx"]]], y=[s["level"]], mode="markers",
@@ -273,7 +298,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
     except Exception:
         pass
     try:
-        _draw_profile(fig, adf, bars, VP_LTF, gutter_ref, "ltf")
+        _draw_profile(fig, ltf_df, bars, VP_LTF, gutter_ref, "ltf")
     except Exception:
         pass
 
@@ -282,7 +307,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
         for y, col, txt in ((entry, "#e7eaf0", "ENTRY"), (sl, DN, "STOP"),
                             (tp1, UP, "TP1 50%"), (tp2, UP, "TP2")):
             fig.add_shape(type="line", row=1, col=1, x0=last_x, x1=right, y0=y, y1=y,
-                          line=dict(color=col, width=1.1))
+                          line=dict(color=col, width=1.4))
             fig.add_annotation(x=right, y=y, row=1, col=1, xanchor="left",
                                text=f" {txt} {y:,.6g}", showarrow=False,
                                font=dict(size=9, color=col))
@@ -295,7 +320,7 @@ def build(df, cfg, direction: str, plan: dict | None = None,
 
     try:
         ci, cname, cq = latest_candle(adf, atr, direction)
-        if ci is not None and cq >= 60 and adf.index[ci] >= view.index[0]:
+        if ci is not None and cq >= 60 and adf.index[ci] >= start:
             fig.add_annotation(x=adf.index[ci],
                                y=float(adf["low"].iat[ci]) if long
                                else float(adf["high"].iat[ci]),
@@ -320,11 +345,11 @@ def build(df, cfg, direction: str, plan: dict | None = None,
 
     fig.update_layout(
         height=640, template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
-        margin=dict(l=62, r=10, t=40, b=22), showlegend=False,
-        hovermode="x unified", dragmode="pan",
-        title=dict(text=f"chart {chart_tf or ''} · structure 30m/3m · "
-                        f"gutter: blue = 30m HTF profile, orange = 3m LTF "
-                        f"profile (OHLCV estimate)",
+        margin=dict(l=62, r=10, t=42, b=22), showlegend=False,
+        hovermode="x unified", dragmode="zoom",
+        title=dict(text=f"chart {chart_tf or ''} · structure {htf_label} (HTF, "
+                        f"yellow) / {ltf_label} (LTF, cyan) · gutter blue = HTF "
+                        f"profile, orange = LTF profile (estimate)",
                    x=0, xanchor="left", font=dict(size=10, color=MUT)),
         xaxis=dict(domain=PRICE_DOMAIN, type="date", showgrid=False,
                    range=[x_lo, right], nticks=8, tickformat=_tick(chart_tf),
@@ -345,8 +370,8 @@ def build(df, cfg, direction: str, plan: dict | None = None,
 def st_selectbox(key: str, idx: int) -> str:
     import streamlit as st
     return st.selectbox("Chart timeframe", CHART_TFS, index=idx, key=key,
-                        help="Display only. Structure and the plan stay on "
-                             "30m context / 3m trigger.")
+                        help="Display only. Structure and the plan use the "
+                             "auto-selected HTF/LTF pair.")
 
 
 def legend_md() -> str:
@@ -355,30 +380,26 @@ def legend_md() -> str:
 
 | mark | meaning |
 |---|---|
-| blue horizontal level, `Bullish BOS` / `Bearish CHOCH` | **30m major** structural break, run to the right edge |
-| grey horizontal level, no text | **3m minor** structural break, run to the right edge |
-| faint grey horizontal line | swing high / low projection |
-| grey triangles | confirmed swing high / low |
-| teal box | active demand zone. Amber box: active supply zone |
+| yellow level + `HH 0.00362 BOS` | **HTF** pivot. HH/HL in an uptrend, LH/LL in a downtrend |
+| cyan level + `LL 0.00340 CHoCH` | **LTF** pivot, same labels |
+| dusty rose box | **supply** zone, labelled `HTF 1h supply 2.4x 0.00351–0.00356` |
+| mint box | **demand** zone, same label format |
 | faint box, no border | unfilled fair value gap |
-| amber ✕ | liquidity sweep — stops taken, closed back inside |
-| teal dashed line | anchored VWAP from the origin of the leg |
-| right gutter, blue bars | **30m HTF** volume profile, right half |
-| right gutter, orange bars | **3m LTF** volume profile, left half |
+| amber ✕ | liquidity sweep |
+| teal dashed line | anchored VWAP |
+| right gutter, blue | HTF volume profile (left half of the gutter) |
+| right gutter, orange | LTF volume profile (right half) |
 | amber line in gutter | POC |
 | grey dotted in gutter | VAH / VAL |
-| short grey ticks | HVN (longer) and LVN (shorter) |
 | green / red boxes | reward to TP1/TP2 and risk to stop |
 
-Structure, swings and zones all terminate at the right edge so the levels in
-force now are the ones you can see. Only the newest two 30m and three 3m marks
-survive, and anything within half an ATR of a newer one is dropped. Only closed
-bars produce a mark.
+Exactly two pivots per timeframe, four total. The `x` in a zone label is the
+touch-bar volume against its 20-bar average — anything under 1.3x is dropped,
+so only zones with real participation appear.
 
-Scroll to zoom. Drag to pan. The X and Y axes scale independently; double-click
-the modebar to reset. Bar spacing uses the median gap, so a cache hole cannot
-stretch the axis.
+**Zoom:** drag horizontally to compress or expand time, drag vertically to
+compress or expand price, right-drag to pan, double-click to reset. Every mark
+is in price/time space and stays locked while you move.
 
-The gutter is an estimate: candles carry no trade direction, so volume is
-spread evenly across each bar's range.
+Only closed bars produce a pivot. The gutter is an OHLCV estimate.
 """

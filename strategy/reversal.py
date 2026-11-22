@@ -1,7 +1,11 @@
-"""strategy/reversal.py - 30m context, 3m trigger.
+"""strategy/reversal.py - auto-selected timeframe pair.
 
-No new maths. Reuses core.levels.build_zones, core.structure.build_structure
-and core.candles.quality (the existing ATR grader).
+No fixed 30m/3m. Three candidate pairs are scored on how cleanly the market is
+structured (swing separation in ATR, swing density, volatility band) and the
+clearest is used. 30m and 1h are resampled from 15m, so no lower timeframe is
+ever invented.
+
+Confirmation reuses core.candles.quality — the existing ATR grader.
 """
 import numpy as np
 
@@ -9,8 +13,7 @@ from core.candles import quality as candle_quality
 from core.indicators import compute_all
 from core.levels import build_zones
 from core.structure import build_structure, find_swings
-
-HTF, LTF = "30m", "3m"
+from core.tfs import resample
 
 APPROACH_ATR = 1.5
 WATCH_ATR = 6.0
@@ -19,6 +22,9 @@ MAX_EXT_ATR = 4.0
 EXT_LOOKBACK = 12
 CONFIRM_WINDOW = 15
 MIN_CANDLE_Q = 60
+
+# (htf, ltf, htf_source) - source tells us which loaded frame to use
+PAIRS = (("15m", "3m", "15m"), ("30m", "15m", "15m"), ("1h", "30m", "15m"))
 
 STATUSES = ("APPROACHING", "DEVELOPING", "CONFIRMED", "ACTIVE_ENTRY",
             "MISSED", "INVALIDATED")
@@ -32,6 +38,53 @@ def _atr(df, cfg) -> float:
         return v if np.isfinite(v) else 0.0
     except Exception:
         return 0.0
+
+
+def _frame(src: dict, name: str, source: str):
+    """The loaded frame, or a resample of its parent when `name` is coarser."""
+    if name == source:
+        return src.get(name)
+    parent = src.get(source)
+    if parent is None or not len(parent):
+        return None
+    try:
+        return resample(parent, name)
+    except Exception:
+        return None
+
+
+def quality(hdf, ldf, cfg) -> float:
+    """Higher = cleaner structure. -1 means unusable."""
+    if hdf is None or ldf is None or len(hdf) < 60 or len(ldf) < 120:
+        return -1.0
+    atr = _atr(hdf, cfg)
+    if atr <= 0:
+        return -1.0
+    sw = find_swings(hdf, cfg.structure.swing_left, cfg.structure.swing_right)
+    highs = [s for s in sw if s["type"] == "H"]
+    lows = [s for s in sw if s["type"] == "L"]
+    if len(highs) < 3 or len(lows) < 3:
+        return -1.0
+    sep = abs(highs[-1]["price"] - lows[-1]["price"]) / atr
+    q = min(sep, 12.0) * 2.0
+    q += min(len(highs) + len(lows), 12) * 0.6
+    px = float(hdf["close"].iloc[-1])
+    atr_pct = atr / px * 100 if px else 0.0
+    if 0.25 <= atr_pct <= 4.0:
+        q += 4.0
+    return q
+
+
+def choose_pair(src: dict, cfg) -> tuple:
+    """(htf, ltf, quality) for the clearest available pair."""
+    best = (PAIRS[0][0], PAIRS[0][1], -1.0)
+    for htf, ltf, source in PAIRS:
+        h = _frame(src, htf, source)
+        l = src.get(ltf)
+        q = quality(h, l, cfg)
+        if q > best[2]:
+            best = (htf, ltf, q)
+    return best
 
 
 def _candidate(zones, price, atr, long):
@@ -62,10 +115,14 @@ def _targets(zones, entry, risk, long, cap_r):
     return tp1, max(tp2, entry - cap_r * risk)
 
 
-def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
-    """One coin. Returns a dict, or None when it is not worth a row."""
+def evaluate(symbol, src: dict, cfg, already: bool = False):
+    """One coin. `src` holds at least '3m' and '15m'."""
+    htf, ltf, q = choose_pair(src, cfg)
+    hdf = _frame(src, htf, dict((p[0], p[2]) for p in PAIRS)[htf])
+    ldf = src.get(ltf)
     if hdf is None or ldf is None or len(hdf) < 60 or len(ldf) < 120:
         return None
+
     ah, al = _atr(hdf, cfg), _atr(ldf, cfg)
     if ah <= 0 or al <= 0:
         return None
@@ -135,11 +192,12 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
 
     score = RANK[status] + 6.0 * min(int(zone.get("touches", 1)), 4)
     score += min(rr, cfg.risk.max_tp_r) * 4.0 + (10.0 if sweep else 0.0)
+    score += max(q, 0.0) * 0.5
     score -= min(dist, 8.0) * 2.5 + (15.0 if extended else 0.0)
 
-    reasons = []
+    reasons = [f"pair {htf}/{ltf}"]
     if sweep:
-        reasons.append("3m CHoCH")
+        reasons.append(f"{ltf} CHoCH")
     if cq:
         reasons.append(f"candle {cq}")
     if extended:
@@ -153,6 +211,7 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
             "status": status, "zone": (zone["low"], zone["high"]),
             "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2, "rr": rr,
             "score": round(score, 1), "is_new": not already,
+            "htf": htf, "ltf": ltf, "pair_q": round(max(q, 0.0), 1),
             "eta_min": round(dist * 30.0, 1) if status == "APPROACHING" else None,
             "bias": bias, "dist_atr": round(dist, 2),
             "reasons": reasons, "ts": ldf.index[-1]}

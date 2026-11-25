@@ -57,8 +57,10 @@ def test_gutter_is_fenced_and_split():
     assert len(prof) == 2
     for t in prof:
         assert t.xaxis == "x2"
-    bases = sorted(float(t.base) for t in prof)
-    assert bases[0] < 0.5 and bases[-1] >= 0.5
+    for trace in prof:
+        assert trace.base == 1.0
+        assert min(trace.x) == pytest.approx(-1.0)
+        assert max(trace.x) <= 0.0
     assert tuple(fig.layout.xaxis2.domain) == (0.785, 1.0)
 
 
@@ -86,7 +88,7 @@ def test_profile_bars_are_thick():
     assert prof
     for trace in prof:
         centers = np.asarray(trace.y, dtype=float)
-        assert trace.width > np.min(np.diff(centers))
+        assert 0 < trace.width <= np.min(np.diff(centers))
 
 
 def test_initial_window_keeps_full_pan_history():

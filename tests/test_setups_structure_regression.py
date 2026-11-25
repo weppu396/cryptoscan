@@ -106,9 +106,10 @@ def test_close_through_protected_higher_low_turns_bullish_layer_bearish():
     fig = chart2.build(df, f, "short", layers={"breaks"}, cfg=cfg,
                        frames={Layer.INTERNAL: df})
     lines = [s for s in fig.layout.shapes if s.line.color == chart2.LTF_LINE]
-    assert len(lines) == 1
-    assert lines[0].line.dash == "dash"
-    assert lines[0].x0 == df.index[7].tz_localize('UTC')
+    assert {line.line.dash for line in lines} == {"dot", "dash"}
+    choch = next(line for line in lines if line.line.dash == "dash")
+    assert choch.x0 == df.index[7].tz_localize('UTC')
+    assert any("historical" in a.text for a in fig.layout.annotations)
     assert any(trace.x[0] == df.index[9].tz_localize('UTC')
                for trace in fig.data if trace.type == 'scatter')
     assert any("BEAR CHoCH" in a.text for a in fig.layout.annotations)

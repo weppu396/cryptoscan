@@ -34,7 +34,7 @@ from core.volume import anchored_vwap, profile_histogram
 
 UP, DN, MUT, WARN, TEAL, BLUE = "#16c784", "#ea3943", "#7f8798", "#f0b90b", "#14b8a6", "#3b82f6"
 HTF_LINE = "#f5d90a"
-LTF_LINE = "#22d3ee"
+LTF_LINE = "#58a6ff"
 SL_DARK = "#a61b1b"
 TP_DARK = "#1a7f37"
 ENTRY_DARK = "#1d4ed8"
@@ -51,11 +51,10 @@ LAYERS = {
     "execution": {"candles", "zones", "plan"},
 }
 STYLE = {Layer.EXTERNAL: (2.2, HTF_LINE), Layer.INTERNAL: (1.8, LTF_LINE)}
-VP_HTF = "rgba(96,152,255,0.34)"
+VP_HTF = "rgba(96,152,255,0.52)"
 VP_LTF = "rgba(240,140,11,0.30)"
 PRICE_DOMAIN = [0.0, 0.76]
 PROFILE_DOMAIN = [0.785, 1.0]
-HALF = {"htf": (0.52, 1.0), "ltf": (0.0, 0.48)}
 MAX_MARKS = 2
 LABEL_KEEP = 4
 DEFAULT_BARS = 70
@@ -192,18 +191,17 @@ def _classify(swings, atr, eq_tol):
 
 
 def _profile(fig, df, bars, color, axis, side):
-    """Proportional bars in the dedicated gutter half. Thicker than the bar step
-    so they read as one band, never touching the candles."""
-    b0, b1 = HALF[side]
-    span = b1 - b0
+    """Right-align both profiles on a volume axis separate from candle time."""
+    b0, b1 = 0.0, 1.0
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
     if not vp or not len(vp["centers"]):
         return
     step = float(vp["centers"][1] - vp["centers"][0]) if len(vp["centers"]) > 1 else 0.0
-    fig.add_trace(go.Bar(y=vp["centers"], x=vp["hist"] * span, base=b0,
+    lengths = vp["hist"] / vp["hist"].max()
+    fig.add_trace(go.Bar(y=vp["centers"], x=-lengths, base=b1,
                          orientation="h",
                          marker=dict(color=color, line=dict(width=0)),
-                         width=step * 6.0 if step else None,
+                         width=step * (0.95 if side == "htf" else 0.55) if step else None,
                          hoverinfo="skip", showlegend=False), row=1, col=1)
     fig.data[-1].xaxis = axis
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
@@ -217,11 +215,11 @@ def _profile(fig, df, bars, color, axis, side):
                                yanchor="middle", font=dict(size=8, color=tone),
                                opacity=0.9)
     for lvl in vp["hvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.6,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0.40, x1=b1,
                       y0=lvl, y1=lvl,
                       line=dict(color="rgba(180,180,190,0.45)", width=1))
     for lvl in vp["lvn"][:2]:
-        fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.3,
+        fig.add_shape(type="line", xref=axis, yref="y", x0=0.70, x1=b1,
                       y0=lvl, y1=lvl,
                       line=dict(color="rgba(180,180,190,0.26)", width=1))
     return vp
@@ -385,10 +383,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                             and 0 <= int(_sv(e, "confirm_idx", -1)) <= t_l]
             shift = max((int(_sv(e, "confirm_idx")) for e in layer_events
                          if _lab(e) == "CHoCH"), default=-1)
-            visible_events = [e for e in _live(frame, t_l) if _lay(e) == layer.value
-                              and 0 <= int(_sv(e, "swing_idx", -1)) < len(f)
+            displayed_events = [e for e in layer_events
+                              if 0 <= int(_sv(e, "swing_idx", -1)) < len(f)
                               and 0 <= int(_sv(e, "break_idx", -1)) < len(f)
                               and start <= f.index[int(_sv(e, "break_idx"))] <= structure_end]
+            live_ids = {id(e) for e in _live(frame, t_l)}
+            visible_events = [e for e in displayed_events if id(e) in live_ids]
             bos = [e for e in visible_events if _lab(e) in BOS_LABELS
                    and int(_sv(e, "confirm_idx")) > shift]
             bos = thin([{"ts": f.index[int(_sv(e, "break_idx", 0))],
@@ -398,6 +398,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             tags = tags_by_layer[layer]
             by_idx = idx_by_layer[layer]
             marks = bos[-keep:]
+            if not marks:
+                history = [e for e in displayed_events if _lab(e) == "BOS"]
+                if history:
+                    last = max(history, key=lambda e: int(_sv(e, "confirm_idx")))
+                    marks.append({"e": last, "level": float(_sv(last, "level")),
+                                  "historical": True})
             marks += [{"e": e, "level": float(_sv(e, "level"))} for e in visible_events
                       if _lab(e) == "CHoCH" and int(_sv(e, "confirm_idx")) == shift]
             labels = []
@@ -417,6 +423,9 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 text = f"{break_side.upper()} {_lab(e)} {row['level']:,.6g}"
                 if tag:
                     text += f" {tag}"
+                historical = row.get("historical", False)
+                if historical:
+                    text += " (historical)"
                 labels.append(text)
                 wick_time = f.index[swing_idx]
                 wick_column = "high" if break_side == "bull" else "low"
@@ -427,7 +436,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                     if exact.any():
                         wick_time = matching.index[np.flatnonzero(exact)[0]]
                 _struct(fig, wick_time, row["level"], structure_end, col_line, w,
-                        dash="dash" if _lab(e) == "CHoCH" else "solid")
+                        dash="dot" if historical else "dash" if _lab(e) == "CHoCH" else "solid")
                 if wick_time in hist.index and np.isclose(
                         hist.at[wick_time, wick_column], row["level"], rtol=1e-10, atol=0):
                     fig.add_trace(go.Scatter(
@@ -587,8 +596,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     fig.update_layout(height=640 + 17 * len(legend_rows), template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=62, r=10, t=100, b=45 + 17 * len(legend_rows)),
-                      showlegend=False, hovermode="x unified", dragmode="pan",
-                      uirevision=f"layout-2|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
+                      showlegend=False, hovermode="x unified", dragmode="pan", barmode="overlay",
+                      uirevision=f"layout-3|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
                                       f"gutter blue = HTF, orange = LTF",

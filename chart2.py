@@ -448,7 +448,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                     if exact.any():
                         wick_time = matching.index[np.flatnonzero(exact)[0]]
                 _struct(fig, wick_time, row["level"], structure_end, col_line, w,
-                        dash="dot" if historical else "dash" if _lab(e) == "CHoCH" else "solid")
+                        dash="dash" if _lab(e) == "CHoCH" else "solid")
                 if layer == Layer.EXTERNAL and row is endpoint:
                     event_type = "BOS init" if _lab(e) == "BOS_INIT" else _lab(e)
                     history_text = " · historical" if historical else ""

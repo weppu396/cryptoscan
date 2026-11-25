@@ -26,7 +26,7 @@ def legend_md() -> str:
 
 - Yellow lines: higher-timeframe structure, anchored at the source pivot wick.
 - Blue lines: lower-timeframe structure, same anchoring. The two run independently.
-- `BOS` continues that layer's trend. A dashed `CHoCH` marks a close through its protected swing. A dotted BOS is the latest historical break when no current BOS is visible. Open circles mark matching swing wicks. Diamonds mark confirmation. On a finer chart they sit at the source candle’s close time.
+- `BOS` continues that layer's trend. A dashed `CHoCH` marks a close through its protected swing. BOS lines are solid, including levels labeled historical. Open circles mark matching swing wicks. Diamonds mark confirmation. On a finer chart they sit at the source candle’s close time.
 - Recent swing labels use `HH`, `HL`, `LH`, and `LL`. Use the LTF display to see
   its swing labels.
 - Red chart zones are supply and green chart zones are demand. Each shows its

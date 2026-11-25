@@ -47,7 +47,7 @@ try:
 except Exception as _e:
     ANALYSIS_OK, ANALYSIS_ERR = False, f"{type(_e).__name__}: {_e}"
 
-st.set_page_config(page_title="CryptoScan", page_icon="◈", layout="wide",
+st.set_page_config(page_title="CryptoScan by Chris", page_icon="◈", layout="wide",
                    initial_sidebar_state="expanded")
 ui.inject()
 
@@ -789,7 +789,7 @@ def cached_reversal(exchange, preferred, proxy, symbols):
 
 with st.sidebar:
     st.markdown('<div class="auth-logo">◈</div>', unsafe_allow_html=True)
-    st.markdown("**CryptoScan**")
+    st.markdown("**CryptoScan by Chris**")
     st.caption(f"signed in as {USER}" if AUTH_ON else "local mode · login disabled")
     if AUTH_ON and st.button("Sign out", use_container_width=True):
         auth.logout()
@@ -855,8 +855,9 @@ with st.sidebar:
 
 st.markdown(
     f"""<div class="hero">
-    <h1>{'Spot accumulation desk' if MODE == 'Spot' else 'Trade desk'}</h1>
-    <p>{'Long-only, daily structure, laddered entries into demand.' if MODE == 'Spot'
+    <h1>CryptoScan by Chris</h1>
+    <p><b>{'Spot accumulation desk' if MODE == 'Spot' else 'Trade desk'}</b><br>
+    {'Long-only, daily structure, laddered entries into demand.' if MODE == 'Spot'
         else 'Long and short break-of-structure scanner with full playbook.'}
     {f'Signed in as <b>{USER}</b>.' if AUTH_ON else 'Local mode.'}</p>
     </div>""",

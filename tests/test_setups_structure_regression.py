@@ -106,7 +106,7 @@ def test_close_through_protected_higher_low_turns_bullish_layer_bearish():
     fig = chart2.build(df, f, "short", layers={"breaks"}, cfg=cfg,
                        frames={Layer.INTERNAL: df})
     lines = [s for s in fig.layout.shapes if s.line.color == chart2.LTF_LINE]
-    assert {line.line.dash for line in lines} == {"dot", "dash"}
+    assert {line.line.dash for line in lines} == {"solid", "dash"}
     choch = next(line for line in lines if line.line.dash == "dash")
     assert choch.x0 == df.index[7].tz_localize('UTC')
     assert any("historical" in a.text for a in fig.layout.annotations)
@@ -214,6 +214,7 @@ def test_overlapping_structure_lines_keep_yellow_visible():
                           layers={"breaks"}, frames={layer: df for layer in Layer})
     matches = [shape for shape in figure.layout.shapes if shape.y0 == df.high.iloc[3]]
     assert [shape.line.color for shape in matches] == [chart2.HTF_LINE, chart2.LTF_LINE]
+    assert all(shape.line.dash == "solid" for shape in matches)
     assert matches[0].line.width >= matches[1].line.width + 2
     badge = next(a for a in figure.layout.annotations if a.name == "htf-structure-endpoint")
     assert badge.x == matches[0].x1 and badge.y == matches[0].y0

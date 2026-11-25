@@ -573,8 +573,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                    and (target > entry if long else target < entry)]
         target = (max(targets) if long else min(targets)) if targets else None
         for level, fill, edge, name in (
-            (stop, "rgba(234,57,67,0.36)", DN, "Stop-loss risk"),
-            (target, "rgba(22,199,132,0.36)", UP, "Take-profit reward"),
+            (stop, "rgba(234,57,67,0.20)", DN, "Stop-loss risk"),
+            (target, "rgba(22,199,132,0.20)", UP, "Take-profit reward"),
         ):
             if (entry is None or level is None or not np.isfinite(entry)
                     or not np.isfinite(level) or entry == level):
@@ -583,7 +583,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 continue
             lo, hi = sorted((entry, level))
             fig.add_shape(type="rect", xref="x", yref="y", x0=plan_start, x1=plan_end,
-                          y0=lo, y1=hi, fillcolor=fill, line=dict(color=edge, width=1.5),
+                          y0=lo, y1=hi, fillcolor=fill, line=dict(color=edge, width=1),
                           name=name, layer="below")
         plan_labels = []
         for y, col, txt in ((plan.get("entry"), "#93b7ff", "Entry"),
@@ -594,7 +594,8 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 continue
             plan_levels.append(y)
             fig.add_shape(type="line", xref="x", yref="y", x0=plan_start, x1=plan_end,
-                          y0=y, y1=y, line=dict(color=col, width=1.2))
+                          y0=y, y1=y, line=dict(color=col, width=1.2),
+                          opacity=1.0 if txt == "Entry" else 0.65)
             plan_labels.append(f'<span style="color:{col}">{txt} {y:,.6g}</span>')
         if plan_labels:
             fig.add_annotation(x=PRICE_DOMAIN[1] - 0.012, y=0.98,

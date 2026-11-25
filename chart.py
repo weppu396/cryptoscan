@@ -33,8 +33,8 @@ def legend_md() -> str:
   timeframe and price band below the plot. Contains POC means that layer’s
   volume profile POC is inside the zone. Red beside the entry is stop risk, and green
   beside the entry is the target area.
-- Blue profile is HTF context, orange is LTF trigger. Both start at the far-right edge
-  and extend left within the separate profile panel.
+- The right-side volume bars estimate up-candle volume in green and down-candle
+  volume in red. Wider bars show HTF and narrower bars show LTF.
 - Drag to pan, scroll or drag a box to zoom, double-click to reset. X and Y zoom
   independently. Fit history shows the full loaded range.
 """

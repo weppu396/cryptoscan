@@ -103,7 +103,8 @@ def profile_histogram(df, lookback: int = 200, bins: int = 48,
 
     ESTIMATE. OHLCV carries no trade direction, so each bar's volume is
     spread evenly across the bins its range overlaps. Total volume is
-    conserved; distribution inside a bar is a guess.
+    conserved; distribution inside a bar is a guess. Green and red use candle direction,
+    with unchanged candles split evenly.
     """
     if df is None or len(df) < 20:
         return {}
@@ -113,7 +114,10 @@ def profile_histogram(df, lookback: int = 200, bins: int = 48,
         return {}
 
     edges = np.linspace(lo, hi, bins + 1)
-    hist = np.zeros(bins)
+    up = np.zeros(bins)
+    down = np.zeros(bins)
+    candle_move = seg["close"].to_numpy(float) - seg["open"].to_numpy(float)
+    up_share = np.where(candle_move > 0, 1.0, np.where(candle_move < 0, 0.0, 0.5))
     lows = seg["low"].to_numpy(float)
     highs = seg["high"].to_numpy(float)
     vols = np.nan_to_num(seg["volume"].to_numpy(float), nan=0.0)
@@ -125,13 +129,17 @@ def profile_histogram(df, lookback: int = 200, bins: int = 48,
         span = highs[i] - lows[i]
         if span <= 0:
             k = min(bins - 1, max(0, int((lows[i] - lo) / (hi - lo) * bins)))
-            hist[k] += v
+            up[k] += v * up_share[i]
+            down[k] += v * (1 - up_share[i])
             continue
         for k in range(bins):
             ov = min(highs[i], edges[k + 1]) - max(lows[i], edges[k])
             if ov > 0:
-                hist[k] += v * (ov / span)
+                portion = v * (ov / span)
+                up[k] += portion * up_share[i]
+                down[k] += portion * (1 - up_share[i])
 
+    hist = up + down
     total = float(hist.sum())
     if total <= 0:
         return {}
@@ -163,6 +171,7 @@ def profile_histogram(df, lookback: int = 200, bins: int = 48,
                if smooth[i] <= lo_cut]
 
     return {"centers": centers, "hist": hist / total,
+            "up": up / total, "down": down / total,
             "poc": float(centers[poc_i]),
             "val": float(edges[left]), "vah": float(edges[right + 1]),
             "hvn": hvn, "lvn": lvn, "estimate": True,

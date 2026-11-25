@@ -201,3 +201,31 @@ def test_zone_poc_tag_uses_the_matching_timeframe(monkeypatch):
     assert "contains POC" in htf and "POC 106" in htf
     assert "contains POC" not in ltf and "POC 102" in ltf
     assert len([s for s in figure.layout.shapes if s.name and s.name.endswith("supply")]) == 2
+
+
+def test_overlapping_structure_lines_keep_yellow_visible():
+    from tests.fixtures import price_series
+
+    df = price_series([100, 105, 102, 106, 104, 108])
+    struct = replace(CFG.struct, ext_left=1, ext_right=1, int_left=1, int_right=1,
+                     invalidate_bars=0)
+    cfg = replace(CFG, struct=struct)
+    figure = chart2.build(df, run(df, "TEST", "1h", cfg), "long", cfg=cfg,
+                          layers={"breaks"}, frames={layer: df for layer in Layer})
+    matches = [shape for shape in figure.layout.shapes if shape.y0 == df.high.iloc[3]]
+    assert [shape.line.color for shape in matches] == [chart2.HTF_LINE, chart2.LTF_LINE]
+    assert matches[0].line.width >= matches[1].line.width + 2
+
+
+def test_directional_volume_components_reconcile_to_original_total():
+    import numpy as np
+    from core.volume import profile_histogram
+    from tests.fixtures import price_series
+
+    df = price_series([100.0] * 24)
+    df.iloc[:6, df.columns.get_loc("open")] = 99.8
+    df.iloc[6:18, df.columns.get_loc("open")] = 100.2
+    profile = profile_histogram(df)
+    np.testing.assert_allclose(profile["hist"], profile["up"] + profile["down"])
+    assert profile["up"].sum() == pytest.approx(0.375)
+    assert profile["down"].sum() == pytest.approx(0.625)

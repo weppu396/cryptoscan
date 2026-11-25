@@ -54,13 +54,15 @@ def test_gutter_is_fenced_and_split():
     htf = frame(freq="30min")
     fig = chart.build(ltf, CFG, "short", PLAN, htf_df=htf, ltf_df=ltf)
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert len(prof) == 2
+    assert len(prof) == 4
     for t in prof:
         assert t.xaxis == "x2"
-    for trace in prof:
-        assert trace.base == 1.0
-        assert min(trace.x) == pytest.approx(-1.0)
-        assert max(trace.x) <= 0.0
+    for up, down in zip(prof[::2], prof[1::2]):
+        assert up.base == 1.0
+        np.testing.assert_allclose(np.asarray(down.base, dtype=float), 1.0 + np.asarray(up.x))
+        assert min(np.asarray(up.x) + np.asarray(down.x)) == pytest.approx(-1.0)
+        assert "22,199,132" in up.marker.color
+        assert "234,57,67" in down.marker.color
     assert tuple(fig.layout.xaxis2.domain) == (0.785, 1.0)
 
 

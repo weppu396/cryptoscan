@@ -1200,8 +1200,8 @@ with T["SMC"]:
                                             pair=(htf_tf, ltf_tf), symbol=used),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
-                st.caption("Gutter: blue = HTF profile (left half), orange = "
-                           "LTF profile (right half), both estimates. Eight "
+                st.caption("Volume profile: wider bars are HTF, narrower bars are LTF. "
+                           "Green and red estimate up- and down-candle volume. Eight "
                            "windows of history sit behind the visible bars, so "
                            "zooming out keeps revealing earlier candles.")
                 st.session_state["live_ctx"] = {"ex": ex, "sym": used, "side": side}

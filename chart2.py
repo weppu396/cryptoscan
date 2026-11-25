@@ -50,9 +50,7 @@ LAYERS = {
                  "vp", "avwap", "plan"},
     "execution": {"candles", "zones", "plan"},
 }
-STYLE = {Layer.EXTERNAL: (2.2, HTF_LINE), Layer.INTERNAL: (1.8, LTF_LINE)}
-VP_HTF = "rgba(96,152,255,0.52)"
-VP_LTF = "rgba(240,140,11,0.30)"
+STYLE = {Layer.EXTERNAL: (5.0, HTF_LINE), Layer.INTERNAL: (1.8, LTF_LINE)}
 PRICE_DOMAIN = [0.0, 0.76]
 PROFILE_DOMAIN = [0.785, 1.0]
 MAX_MARKS = 2
@@ -190,20 +188,30 @@ def _classify(swings, atr, eq_tol):
     return out
 
 
-def _profile(fig, df, bars, color, axis, side):
+def _profile(fig, df, bars, axis, side):
     """Right-align both profiles on a volume axis separate from candle time."""
     b0, b1 = 0.0, 1.0
     vp = profile_histogram(df, lookback=min(len(df), max(bars, 140)))
     if not vp or not len(vp["centers"]):
         return
     step = float(vp["centers"][1] - vp["centers"][0]) if len(vp["centers"]) > 1 else 0.0
-    lengths = vp["hist"] / vp["hist"].max()
-    fig.add_trace(go.Bar(y=vp["centers"], x=-lengths, base=b1,
-                         orientation="h",
-                         marker=dict(color=color, line=dict(width=0)),
-                         width=step * (0.95 if side == "htf" else 0.55) if step else None,
-                         hoverinfo="skip", showlegend=False), row=1, col=1)
-    fig.data[-1].xaxis = axis
+    scale = vp["hist"].max()
+    up = vp["up"] / scale
+    down = vp["down"] / scale
+    opacity = 0.53 if side == "htf" else 0.95
+    for label, lengths, base, color in (
+        ("Up-candle volume", up, b1, f"rgba(22,199,132,{opacity})"),
+        ("Down-candle volume", down, b1 - up, f"rgba(234,57,67,{opacity})"),
+    ):
+        fig.add_trace(go.Bar(y=vp["centers"], x=-lengths, base=base, orientation="h",
+                             marker=dict(color=color, line=dict(width=0)),
+                             width=step * (0.95 if side == "htf" else 0.45) if step else None,
+                             customdata=vp["up" if label.startswith("Up") else "down"],
+                             hovertemplate=(f"{side.upper()} · {label} estimate<br>"
+                                            "Price %{y:,.6g} · %{customdata:.2%} of profile"
+                                            "<extra></extra>"),
+                             showlegend=False), row=1, col=1)
+        fig.data[-1].xaxis = axis
     for lvl, tone, tag, dash in ((vp["poc"], WARN, "POC", "solid"),
                                  (vp["vah"], MUT, "VAH", "dot"),
                                  (vp["val"], MUT, "VAL", "dot")):
@@ -465,14 +473,14 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
 
     profiles = {}
     if "vp" in on:
-        for source, window, color, side in (
-            (htf_df, bars * 2, VP_HTF, "htf"),
-            (ltf_df, bars, VP_LTF, "ltf"),
+        for source, window, side in (
+            (htf_df, bars * 2, "htf"),
+            (ltf_df, bars, "ltf"),
         ):
             if source is None or (side == "htf" and len(source) < 30):
                 continue
             try:
-                profiles[side] = _profile(fig, source, window, color, gutter_ref, side) or {}
+                profiles[side] = _profile(fig, source, window, gutter_ref, side) or {}
             except Exception:
                 continue
 
@@ -597,10 +605,10 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_layout(height=640 + 17 * len(legend_rows), template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=62, r=10, t=100, b=45 + 17 * len(legend_rows)),
                       showlegend=False, hovermode="x unified", dragmode="pan", barmode="overlay",
-                      uirevision=f"layout-3|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
+                      uirevision=f"layout-4|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
-                                      f"gutter blue = HTF, orange = LTF",
+                                      f"volume estimate · green up / red down",
                                  x=0, xanchor="left", font=dict(size=10, color=MUT)),
                       xaxis=dict(domain=PRICE_DOMAIN, type="date",
                                  showgrid=False, range=[x_lo, right],

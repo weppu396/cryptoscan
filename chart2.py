@@ -226,14 +226,10 @@ def _profile(fig, df, bars, color, axis, side):
                       line=dict(color="rgba(180,180,190,0.26)", width=1))
 
 
-def _struct(fig, ts, price, x1, color, width, label, tag, dash="solid"):
-    """Wick-anchored BOS line, run to the right edge, exact price in the label."""
+def _struct(fig, ts, price, x1, color, width, dash):
+    """Start the level at its source wick and end at the latest candle."""
     fig.add_shape(type="line", xref="x", yref="y", x0=ts, x1=x1,
                   y0=price, y1=price, line=dict(color=color, width=width, dash=dash))
-    txt = f"{label} {price:,.6g}" + (f" {tag}" if tag else "")
-    fig.add_annotation(x=ts, xref="x", y=price, yref="y", text=txt,
-                       showarrow=False, xanchor="left", yanchor="bottom",
-                       xshift=5, yshift=3, font=dict(size=9, color=color))
 
 
 def _pivot_label(fig, ts, price, tag, kind, color):
@@ -252,12 +248,14 @@ def _zone(fig, z, x0, x1, label, tf):
                   y0=z["low"], y1=z["high"], fillcolor=fill,
                   line=dict(width=1.5, color=edge), layer="below",
                   name=f"{label} {tf} {z['side']}")
-    fig.add_annotation(x=x1, xref="x", y=(z["low"] + z["high"]) / 2, yref="y",
-                       text=f"{label} {tf} {z['side']} {z['low']:,.6g}–{z['high']:,.6g}",
-                       showarrow=False, xanchor="right", yanchor="middle",
-                       font=dict(size=8, color=edge),
-                       bgcolor="rgba(15,17,22,0.72)",
-                       bordercolor=edge, borderwidth=1, borderpad=2)
+    return f'<span style="color:{edge}">{z["side"].title()} {z["low"]:,.6g}–{z["high"]:,.6g}</span>'
+
+
+def _legend_row(fig, text, index):
+    fig.add_annotation(x=0, y=0, xref="paper", yref="paper",
+                       xanchor="left", yanchor="top", yshift=-37 - 17 * index,
+                       text=text, showarrow=False, align="left",
+                       font=dict(size=11, color="#c7cfda"))
 
 
 def build(df, frame, direction, plan=None, mode="analysis", layers=None,
@@ -323,8 +321,18 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     view = hist.tail(bars)
     long = direction == "long"
     last_x = hist.index[-1]
-    right = _future(last_x, step, 6)
+    has_plan = bool(plan and "plan" in on)
+    plot_step = step if step > pd.Timedelta(0) else pd.Timedelta(minutes=1)
+    plan_start = last_x + plot_step
+    if has_plan:
+        # Reserve a fixed fraction of the initial viewport, including for sparse markets.
+        right = last_x + max(last_x - view.index[0], plot_step * 4) * 0.30
+        plan_end = right - (right - last_x) * 0.06
+    else:
+        right = _future(last_x, step, 6)
+    structure_end = plan_start - plot_step * 0.10 if has_plan else right
     start = hist.index[0]
+    legend_rows = []
 
     fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
@@ -354,28 +362,18 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         key = "ext_swing" if layer == Layer.EXTERNAL else "int_swing"
         f = layer_frame(layer)
         tags = tags_by_layer[layer]
-        visible = []
-        for s in pts_by_layer[layer]:
-            idx = int(_sv(s, "idx", -1))
-            if idx < 0 or idx >= len(f):
-                continue
-            ts = f.index[idx]
-            if ts < start:
-                continue
-            visible.append((ts, s))
-            if key not in on:
-                continue
-            fig.add_trace(go.Scatter(
-                x=[ts], y=[float(_sv(s, "price"))], mode="markers",
-                marker=dict(symbol="triangle-down" if _sv(s, "kind") == "H"
-                            else "triangle-up", size=5, color=MUT,
-                            opacity=.45), showlegend=False), row=1, col=1)
-        if key in on:
-            for ts, s in visible[-LABEL_KEEP:]:
-                tag = tags.get(id(s), "")
-                if tag:
-                    _pivot_label(fig, ts, float(_sv(s, "price")), tag,
-                                 _sv(s, "kind"), MUT)
+        if key not in on:
+            continue
+        if layer == Layer.INTERNAL and chart_tf and chart_minutes(chart_tf) > chart_minutes(ltf_label):
+            continue
+        visible = [(f.index[idx], swing) for swing in pts_by_layer[layer]
+                   if 0 <= (idx := int(_sv(swing, "idx", -1))) < len(f)
+                   and view.index[0] <= f.index[idx] <= last_x]
+        for ts, swing in visible[-LABEL_KEEP:]:
+            tag = tags.get(id(swing), "")
+            if tag:
+                _pivot_label(fig, ts, float(_sv(swing, "price")), tag,
+                             _sv(swing, "kind"), MUT)
 
     if "breaks" in on:
         for layer in (Layer.EXTERNAL, Layer.INTERNAL):
@@ -389,7 +387,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             visible_events = [e for e in _live(frame, t_l) if _lay(e) == layer.value
                               and 0 <= int(_sv(e, "swing_idx", -1)) < len(f)
                               and 0 <= int(_sv(e, "break_idx", -1)) < len(f)
-                              and f.index[int(_sv(e, "break_idx"))] >= start]
+                              and start <= f.index[int(_sv(e, "break_idx"))] <= structure_end]
             bos = [e for e in visible_events if _lab(e) in BOS_LABELS
                    and int(_sv(e, "confirm_idx")) > shift]
             bos = thin([{"ts": f.index[int(_sv(e, "break_idx", 0))],
@@ -401,22 +399,32 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             marks = bos[-keep:]
             marks += [{"e": e, "level": float(_sv(e, "level"))} for e in visible_events
                       if _lab(e) == "CHoCH" and int(_sv(e, "confirm_idx")) == shift]
+            labels = []
+            tf = htf_label if layer == Layer.EXTERNAL else ltf_label
+            layer_name = "HTF" if layer == Layer.EXTERNAL else "LTF"
             for row in marks:
                 e = row["e"]
                 break_side = _sv(e, "direction", "")
                 swing_idx = int(_sv(e, "swing_idx"))
                 pivot = by_idx.get((swing_idx, "H" if break_side == "bull" else "L"))
                 tag = tags.get(id(pivot), "") if pivot is not None else ""
-                _struct(fig, f.index[swing_idx], row["level"], right, col_line, w,
-                        f"{break_side.upper()} {_lab(e)}", tag,
+                text = f"{break_side.upper()} {_lab(e)} {row['level']:,.6g}"
+                if tag:
+                    text += f" {tag}"
+                labels.append(text)
+                _struct(fig, f.index[swing_idx], row["level"], structure_end, col_line, w,
                         dash="dash" if _lab(e) == "CHoCH" else "solid")
                 confirmed = int(_sv(e, "confirm_idx"))
                 fig.add_trace(go.Scatter(
                     x=[f.index[confirmed]], y=[row["level"]], mode="markers",
                     marker=dict(symbol="diamond", size=6, color=col_line),
-                    hovertemplate=(f"{_lab(e)} confirmation · %{{x}}<br>"
-                                   f"Close {f['close'].iat[confirmed]:,.6g}<extra></extra>"),
+                    hovertemplate=(f"{layer_name} {tf} · {text}<br>"
+                                   f"Confirmation %{{x}} · close {f['close'].iat[confirmed]:,.6g}"
+                                   "<extra></extra>"),
                     showlegend=False), row=1, col=1)
+            if labels:
+                legend_rows.append(f'<span style="color:{col_line}">{layer_name} {tf}</span>'
+                                   f' · {" &nbsp; | &nbsp; ".join(labels)}')
 
     zone_levels = []
     if "zones" in on:
@@ -431,11 +439,14 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 zones = chart_zones(source, zone_cfg, left, right_bars, keep=zone_keep)
             except Exception:
                 continue
+            labels = []
             for zone in zones:
-                if zone["ts"] >= right:
+                if zone["ts"] >= structure_end:
                     continue
-                _zone(fig, zone, max(zone["ts"], start), right, label, tf)
+                labels.append(_zone(fig, zone, max(zone["ts"], start), structure_end, label, tf))
                 zone_levels.extend((zone["low"], zone["high"]))
+            if labels:
+                legend_rows.append(f'{label} {tf} · {" &nbsp; | &nbsp; ".join(labels)}')
 
     if "fvg" in on:
         for g in [g for g in smc.fair_value_gaps(adf)
@@ -444,7 +455,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             if adf.index[idx] < start:
                 continue
             fig.add_shape(type="rect", xref="x", yref="y", x0=adf.index[idx],
-                          x1=right, y0=float(_sv(g, "bot")), y1=float(_sv(g, "top")),
+                          x1=structure_end, y0=float(_sv(g, "bot")), y1=float(_sv(g, "top")),
                           line=dict(width=0),
                           fillcolor="rgba(22,199,132,0.05)" if long
                           else "rgba(234,57,67,0.05)")
@@ -486,7 +497,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             pass
 
     plan_levels = []
-    if plan and "plan" in on:
+    if has_plan:
         entry = plan.get("entry")
         stop = plan.get("stop")
         targets = [target for target in (plan.get("tp1"), plan.get("tp2"))
@@ -503,41 +514,45 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             if name == "Stop-loss risk" and (level > entry if long else level < entry):
                 continue
             lo, hi = sorted((entry, level))
-            fig.add_shape(type="rect", xref="x", yref="y", x0=last_x, x1=right,
+            fig.add_shape(type="rect", xref="x", yref="y", x0=plan_start, x1=plan_end,
                           y0=lo, y1=hi, fillcolor=fill, line=dict(color=edge, width=1.5),
                           name=name, layer="below")
-        for y, col, txt in ((plan.get("entry"), ENTRY_DARK, "ENTRY"),
-                            (plan.get("stop"), SL_DARK, "SL"),
-                            (plan.get("tp1"), TP_DARK, "TP1"),
-                            (plan.get("tp2"), TP_DARK, "TP2")):
+        plan_labels = []
+        for y, col, txt in ((plan.get("entry"), "#93b7ff", "Entry"),
+                            (plan.get("stop"), "#ff8a90", "SL"),
+                            (plan.get("tp1"), "#70e6ae", "TP1"),
+                            (plan.get("tp2"), "#70e6ae", "TP2")):
             if y is None or not np.isfinite(y):
                 continue
             plan_levels.append(y)
-            fig.add_shape(type="line", xref="x", yref="y", x0=last_x, x1=right,
-                          y0=y, y1=y, line=dict(color=col, width=1.6))
-            fig.add_annotation(x=right, xref="x", y=y, yref="y", xanchor="left",
-                               yanchor="middle", text=f" {txt} {y:,.6g}",
-                               showarrow=False,
-                               font=dict(size=9, color=col),
-                               bgcolor="rgba(15,17,22,0.72)")
+            fig.add_shape(type="line", xref="x", yref="y", x0=plan_start, x1=plan_end,
+                          y0=y, y1=y, line=dict(color=col, width=1.2))
+            plan_labels.append(f'<span style="color:{col}">{txt} {y:,.6g}</span>')
+        if plan_labels:
+            fig.add_annotation(x=PRICE_DOMAIN[1] - 0.012, y=0.98,
+                               xref="paper", yref="paper", xanchor="right", yanchor="top",
+                               text="<br>".join(plan_labels), align="left", showarrow=False,
+                               font=dict(size=11), bgcolor=BG, bordercolor="#38445a",
+                               borderwidth=1, borderpad=6)
 
-    try:
-        y_ref = hist  # keep all loaded historical price levels visible when panning
-        lo = min([float(y_ref["low"].min()), *zone_levels, *plan_levels])
-        hi = max([float(y_ref["high"].max()), *zone_levels, *plan_levels])
-        pad = (hi - lo) * 0.02 or max(abs(hi), 1.0) * 0.001
-        y_range = [lo - pad, hi + pad]
-    except Exception:
-        y_range = None
-
+    # Keep the history in the trace. Start planned trades at a readable price
+    # scale and offer a one-click fit for older candles.
+    y_ref = view if has_plan else hist
+    lo = min([float(y_ref["low"].min()), *zone_levels, *plan_levels])
+    hi = max([float(y_ref["high"].max()), *zone_levels, *plan_levels])
+    pad = (hi - lo) * 0.055 or max(abs(hi), 1.0) * 0.001
+    y_range = [lo - pad, hi + pad]
+    history_y = [min(y_range[0], float(hist["low"].min()) - pad),
+                 max(y_range[1], float(hist["high"].max()) + pad)]
     x_lo = view.index[0]
-    if x_lo >= right:
-        right = x_lo + (step or pd.Timedelta(minutes=1)) * 6
 
-    fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
-                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=100, b=22),
+    for index, text in enumerate(legend_rows):
+        _legend_row(fig, text, index)
+
+    fig.update_layout(height=640 + 17 * len(legend_rows), template="plotly_dark", paper_bgcolor=BG,
+                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=100, b=45 + 17 * len(legend_rows)),
                       showlegend=False, hovermode="x unified", dragmode="pan",
-                      uirevision=f"cs|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
+                      uirevision=f"layout-2|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
                                       f"gutter blue = HTF, orange = LTF",
@@ -565,5 +580,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                      spikecolor=MUT)
     from chart_axes import add_independent_axis_controls
     if y_range is not None:
-        add_independent_axis_controls(fig, [x_lo, right], y_range)
+        add_independent_axis_controls(fig, [x_lo, right], y_range,
+                                      history=([hist.index[0], right], history_y)
+                                      if has_plan else None)
     return fig

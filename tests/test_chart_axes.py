@@ -70,14 +70,14 @@ def test_both_axes_zoomable_gutter_fixed():
     assert fig.layout.dragmode == "pan"
 
 
-def test_pivot_lines_reach_the_right_edge():
+def test_trade_lines_stay_inside_the_price_axis():
     fig = chart.build(frame(), CFG, "short", PLAN, pair=("15m", "3m"))
     x_hi = pd.Timestamp(fig.layout.xaxis.range[1])
     lines = [s for s in fig.layout.shapes
              if s.type == "line" and s.xref == "x" and s.y0 == s.y1]
     assert lines
     for s in lines:
-        assert pd.Timestamp(s.x1) == x_hi
+        assert pd.Timestamp(s.x0) < pd.Timestamp(s.x1) < x_hi
 
 
 def test_profile_bars_are_thick():

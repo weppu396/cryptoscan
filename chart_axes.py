@@ -20,7 +20,7 @@ def _scaled_dates(lo, hi, factor):
     return [(middle - half).isoformat(), (middle + half).isoformat()]
 
 
-def add_independent_axis_controls(fig, x_range, y_range):
+def add_independent_axis_controls(fig, x_range, y_range, history=None):
     """Add independent time/price zoom buttons; keep pan and axis drag enabled.
 
     Buttons calculate from the initial view, while direct axis dragging gives
@@ -44,6 +44,14 @@ def add_independent_axis_controls(fig, x_range, y_range):
         "yaxis.range": [float(y0), float(y1)],
         "yaxis.autorange": False,
     }]))
+    if history:
+        history_x, history_y = history
+        buttons.append(dict(label="Fit history", method="relayout", args=[{
+            "xaxis.range": [pd.Timestamp(x).isoformat() for x in history_x],
+            "xaxis.autorange": False,
+            "yaxis.range": list(history_y),
+            "yaxis.autorange": False,
+        }]))
     fig.update_layout(
         dragmode="pan",
         xaxis_fixedrange=False,

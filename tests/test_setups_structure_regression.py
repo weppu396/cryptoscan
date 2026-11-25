@@ -136,4 +136,14 @@ def test_trade_boxes_and_both_zone_sides_render(side, stop, tp1, tp2):
     assert [reward.y0, reward.y1] == sorted((100, tp2))
     assert risk.line.color == chart2.DN
     assert reward.line.color == chart2.UP
-    assert any(a.text.strip().startswith("TP1 ") for a in fig.layout.annotations)
+    plan = next(a for a in fig.layout.annotations if "TP1 " in a.text)
+    assert plan.xref == plan.yref == "paper"
+    assert plan.text.count("<br>") == 3
+    assert "Entry 100" in plan.text and f"TP2 {tp2}" in plan.text
+    assert risk.x0 == reward.x0 > df.index[-1].tz_localize("UTC")
+    assert risk.x1 == reward.x1 < fig.layout.xaxis.range[1]
+    assert all(s.x1 < risk.x0 for name, s in boxes.items()
+               if name.endswith(("supply", "demand")))
+    assert len([a for a in fig.layout.annotations if "Supply " in a.text]) == 2
+    history = fig.layout.updatemenus[0].buttons[-1]
+    assert history.label == "Fit history"

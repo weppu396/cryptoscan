@@ -75,24 +75,46 @@ def _set(key: str, setup_id: str, stage: Stage, gen: int, status: Delivery,
 
 def eligible(setup_id: str, stage: Stage, generation: int = 0,
              now: float | None = None) -> bool:
-    now = now or time.time()
+    now = time.time() if now is None else now
     row = _row(f"{setup_id}:{stage.value}:{generation}")
     if row is None:
         return True
     status, attempts, next_at = row
-    if status in (Delivery.SENT.value, Delivery.DEAD.value):
+    if status in (Delivery.SENT.value, Delivery.DEAD.value, Delivery.PENDING.value):
         return False
     if attempts >= _max_attempts():
         return False
     return now >= (next_at or 0)
 
 
-def claim(setup_id: str, stage: Stage, generation: int = 0) -> str:
+def claim(setup_id: str, stage: Stage, generation: int = 0) -> str | None:
+    """Atomically claim one delivery; concurrent workers cannot both send it."""
     key = f"{setup_id}:{stage.value}:{generation}"
-    row = _row(key)
-    attempts = (row[1] if row else 0) + 1
-    _set(key, setup_id, stage, generation, Delivery.PENDING, attempts, 0.0)
-    return key
+    now = time.time()
+    with store.conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            row = c.execute("SELECT status,attempts,next_at FROM alerts WHERE key=?",
+                            (key,)).fetchone()
+            if row is not None:
+                status, attempts, next_at = row
+                if (status in (Delivery.SENT.value, Delivery.DEAD.value,
+                               Delivery.PENDING.value)
+                        or attempts >= _max_attempts() or now < (next_at or 0)):
+                    c.rollback()
+                    return None
+                attempts += 1
+                c.execute("UPDATE alerts SET status=?,attempts=?,next_at=?,updated=? WHERE key=?",
+                          (Delivery.PENDING.value, attempts, 0.0, now, key))
+            else:
+                c.execute("INSERT INTO alerts VALUES (?,?,?,?,?,?,?,?)",
+                          (key, setup_id, stage.value, generation,
+                           Delivery.PENDING.value, 1, 0.0, now))
+            c.commit()
+            return key
+        except Exception:
+            c.rollback()
+            raise
 
 
 def sent(key: str, setup_id: str, stage: Stage, gen: int):
@@ -142,6 +164,8 @@ def send(setup_id: str, stage: Stage, text: str, generation: int = 0,
     if not eligible(setup_id, stage, generation):
         return "skipped"
     key = claim(setup_id, stage, generation)
+    if key is None:
+        return "skipped"
     if poster is None:
         try:
             from app_alerts import post as poster

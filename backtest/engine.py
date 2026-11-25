@@ -20,15 +20,19 @@ def run(df, signals, cfg, symbol="X"):
         if pending is not None and pos is None:
             d = pending
             fill = o[t] * (1 + slip) if d["dir"] == "long" else o[t] * (1 - slip)
-            risk = abs(fill - d["stop"])
-            if risk > 0:
+            # Reject wrong-side stops rather than turning invalid trades into
+            # apparently positive risk/reward via abs().
+            risk = (fill - d["stop"]) if d["dir"] == "long" else (d["stop"] - fill)
+            if risk > 0 and np.isfinite(risk) and np.isfinite(fill) and fill > 0:
                 qty = (equity * cfg.risk.risk_per_trade_pct / 100.0) / risk
                 if qty > 0:
                     pos = {"dir": d["dir"], "stop": d["stop"], "tp1": d["tp1"],
-                           "tp2": d["tp2"], "entry": fill, "qty": qty,
+                           "tp2": d["tp2"], "entry": fill, "qty": qty, "initial_qty": qty,
+                           "realized_pnl": -qty * fill * fee,
                            "risk": risk, "bars": 0, "tp1_done": False,
                            "be": False, "entry_bar": t, "mae": 0.0,
-                           "score": d.get("score"), "grade": d.get("grade")}
+                           "score": d.get("score"), "grade": d.get("grade"),
+                           "strategy": d.get("strategy", "BOS Retest")}
                     equity -= qty * fill * fee
             pending = None
 
@@ -49,8 +53,10 @@ def run(df, signals, cfg, symbol="X"):
                 elif l[t] <= pos["stop"]:
                     exit_price, tag = pos["stop"] * (1 - slip), "stop"
                 elif not pos["tp1_done"] and h[t] >= pos["tp1"]:
-                    half = pos["qty"] * cfg.risk.partial_size
-                    equity += (pos["tp1"] - entry) * half - half * pos["tp1"] * fee
+                    half = pos["qty"] * max(0.0, min(1.0, cfg.risk.partial_size))
+                    tp1_pnl = (pos["tp1"] - entry) * half - half * pos["tp1"] * fee
+                    equity += tp1_pnl
+                    pos["realized_pnl"] += tp1_pnl
                     pos["qty"] -= half
                     pos["tp1_done"] = True
                     if not pos["be"] and (pos["tp1"] - entry) >= cfg.risk.move_stop_to_be_at_r * risk:
@@ -66,8 +72,10 @@ def run(df, signals, cfg, symbol="X"):
                 elif h[t] >= pos["stop"]:
                     exit_price, tag = pos["stop"] * (1 + slip), "stop"
                 elif not pos["tp1_done"] and l[t] <= pos["tp1"]:
-                    half = pos["qty"] * cfg.risk.partial_size
-                    equity += (entry - pos["tp1"]) * half - half * pos["tp1"] * fee
+                    half = pos["qty"] * max(0.0, min(1.0, cfg.risk.partial_size))
+                    tp1_pnl = (entry - pos["tp1"]) * half - half * pos["tp1"] * fee
+                    equity += tp1_pnl
+                    pos["realized_pnl"] += tp1_pnl
                     pos["qty"] -= half
                     pos["tp1_done"] = True
                     if not pos["be"] and (entry - pos["tp1"]) >= cfg.risk.move_stop_to_be_at_r * risk:
@@ -84,10 +92,14 @@ def run(df, signals, cfg, symbol="X"):
 
             if exit_price is not None:
                 sign = 1 if d == "long" else -1
-                equity += (exit_price - entry) * sign * pos["qty"] - pos["qty"] * exit_price * fee
+                exit_pnl = (exit_price - entry) * sign * pos["qty"] - pos["qty"] * exit_price * fee
+                equity += exit_pnl
+                pos["realized_pnl"] += exit_pnl
                 trades.append({
-                    "symbol": symbol, "dir": d, "entry": entry, "exit": exit_price,
-                    "r": (exit_price - entry) * sign / risk, "tag": tag,
+                    "symbol": symbol, "dir": d, "strategy": pos.get("strategy", "BOS Retest"),
+                    "entry": entry, "exit": exit_price,
+                    "r": pos["realized_pnl"] / (pos["initial_qty"] * risk),
+                    "net_pnl": pos["realized_pnl"], "tag": tag,
                     "bars": pos["bars"], "mae_r": pos["mae"],
                     "score": pos["score"], "grade": pos["grade"],
                     "entry_ts": df.index[pos["entry_bar"]], "exit_ts": df.index[t],

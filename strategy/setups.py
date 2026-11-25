@@ -76,12 +76,12 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
             lvl = st["active_high"].iat[t]
             if not np.isnan(lvl):
                 pends.append({"dir": "long", "level": float(lvl),
-                              "expiry": t + wait, "used": False})
+                              "expiry": t + wait, "created": t, "used": False})
         elif st["bos_dn"].iat[t] and bias != "up":
             lvl = st["active_low"].iat[t]
             if not np.isnan(lvl):
                 pends.append({"dir": "short", "level": float(lvl),
-                              "expiry": t + wait, "used": False})
+                              "expiry": t + wait, "created": t, "used": False})
 
         pends = [p for p in pends if t <= p["expiry"] and not p["used"]][-MAX_PENDING:]
         if not pends:
@@ -96,6 +96,8 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
             continue
 
         for pend in pends:
+            if t <= pend["created"]:
+                continue  # A breakout candle cannot also be its later retest.
             lvl = pend["level"]
             if pend["dir"] == "long":
                 touched = l[t] <= lvl + tol and h[t] >= lvl - tol

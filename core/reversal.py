@@ -38,14 +38,21 @@ def _atr(df, cfg) -> float:
 
 
 def _candidate(zones, price, atr, long):
+    """Nearest demand/supply band, including approaching and in-zone prices."""
+    if atr <= 0:
+        return None
     best = None
     for z in zones:
-        if long and z["high"] > price:
+        lo, hi = float(z["low"]), float(z["high"])
+        if lo > hi:
             continue
-        if not long and z["low"] < price:
-            continue
-        dist = ((price - z["high"]) if long else (z["low"] - price)) / atr
-        if dist < 0 or dist > WATCH_ATR:
+        if lo <= price <= hi:
+            dist = 0.0
+        elif long:
+            dist = (lo - price) / atr if price < lo else (price - hi) / atr
+        else:
+            dist = (price - hi) / atr if price > hi else (lo - price) / atr
+        if dist > WATCH_ATR:
             continue
         if best is None or dist < best[1]:
             best = (z, dist)
@@ -105,7 +112,7 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
         return None
 
     tp1, tp2 = _targets(sup if long else dem, entry, risk, long, cfg.risk.max_tp_r)
-    rr = abs(tp1 - entry) / risk
+    rr = ((tp1 - entry) if long else (entry - tp1)) / risk
 
     if long:
         inside = zone["low"] <= price <= zone["high"]
@@ -139,7 +146,7 @@ def evaluate(symbol, hdf, ldf, cfg, already: bool = False):
     elif inside:
         status = "DEVELOPING"
     elif beyond:
-        status = "MISSED" if (extended or dist > BEYOND_ATR) else "CONFIRMED"
+        status = "MISSED" if (extended or dist > BEYOND_ATR) else "DEVELOPING"
     else:
         status = "APPROACHING"
 

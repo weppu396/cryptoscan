@@ -50,7 +50,12 @@ def _atr(df, n=14):
 
 
 def _swings(df, left, right, layer):
-    """Strict fractal pivots on the wick. Confirmed at i + right, never before."""
+    """Fractal pivots on wicks; ties on the right belong to the first bar.
+
+    This avoids losing pivots when consecutive candles share a high/low
+    (common when a candle opens at the previous close). Confirmation
+    still requires all right-hand candles to have closed.
+    """
     h = df["high"].to_numpy(float)
     l = df["low"].to_numpy(float)
     n = len(df)
@@ -60,9 +65,9 @@ def _swings(df, left, right, layer):
     if n < left + right + 1:
         return out
     for i in range(left, n - right):
-        if (h[i] > h[i - left:i]).all() and (h[i] > h[i + 1:i + right + 1]).all():
+        if (h[i] > h[i - left:i]).all() and (h[i] >= h[i + 1:i + right + 1]).all():
             out.append(Swing(i, float(h[i]), "H", layer, i + right, "H"))
-        if (l[i] < l[i - left:i]).all() and (l[i] < l[i + 1:i + right + 1]).all():
+        if (l[i] < l[i - left:i]).all() and (l[i] <= l[i + 1:i + right + 1]).all():
             out.append(Swing(i, float(l[i]), "L", layer, i + right, "L"))
     return sorted(out, key=lambda s: s.idx)
 

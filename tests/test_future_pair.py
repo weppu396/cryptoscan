@@ -118,4 +118,4 @@ def test_second_timeframe_uses_seconds_ticks():
 def test_profile_bars_are_thick():
     fig = chart.build(frame(), CFG, "short", PLAN)
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert prof and all(float(t.width[0]) > 0 for t in prof)
+    assert prof and all(float(t.width if isinstance(t.width, (int, float)) else t.width[0]) > 0 for t in prof)

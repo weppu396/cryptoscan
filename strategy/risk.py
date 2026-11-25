@@ -12,8 +12,9 @@ def plan_rr(entry, stop, tp1, tp2, split=0.5) -> dict:
     risk = abs(entry - stop)
     if risk <= 0:
         return {"risk": 0.0, "rr1": 0.0, "rr2": 0.0, "weighted": 0.0}
-    rr1 = abs(tp1 - entry) / risk
-    rr2 = abs(tp2 - entry) / risk
+    direction = 1 if entry > stop else -1
+    rr1 = (tp1 - entry) * direction / risk
+    rr2 = (tp2 - entry) * direction / risk
     split = min(max(split, 0.0), 1.0)
     return {"risk": risk, "rr1": rr1, "rr2": rr2,
             "weighted": split * rr1 + (1.0 - split) * rr2}
@@ -66,6 +67,12 @@ def filter_setups(setups, ind, zones_up, zones_dn, cfg):
         except KeyError:
             continue
         ok, why = regime_ok(row, s.direction, cfg)
+        # Range reversals deliberately require a low-ADX environment; retain
+        # the volatility and RSI safety vetoes, but not the trend-strength veto.
+        if not ok and s.meta.get("strategy") == "Range Reversal" and "chop" in why:
+            ok = (cfg.regime.atr_pct_min <= row["atr_pct"] <= cfg.regime.atr_pct_max
+                  and (s.direction != "long" or row["rsi"] <= cfg.regime.rsi_long_max)
+                  and (s.direction != "short" or row["rsi"] >= cfg.regime.rsi_short_min))
         if not ok:
             continue
         g_ok, g_why = gate(s, row, cfg)

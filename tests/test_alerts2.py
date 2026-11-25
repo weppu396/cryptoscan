@@ -11,7 +11,9 @@ def tmp_db(tmp_path, monkeypatch):
     yield
 
 
-def test_failure_does_not_suppress():
+def test_failure_retries_after_backoff(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(a2.time, "time", lambda: clock[0])
     calls = []
 
     def poster(text):
@@ -19,6 +21,8 @@ def test_failure_does_not_suppress():
         return (len(calls) > 1), None
 
     assert a2.send("s1", Stage.APPROACHING, "x", 0, poster) == "RETRY"
+    assert a2.send("s1", Stage.APPROACHING, "x", 0, poster) == "skipped"
+    clock[0] += a2._backoff(1) + 1
     assert a2.send("s1", Stage.APPROACHING, "x", 0, poster) == "SENT"
     assert len(calls) == 2
 

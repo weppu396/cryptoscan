@@ -130,7 +130,7 @@ def marks(adf, cfg, htf_df, gap: float,
     majors = thin(majors, gap)
     minors = [x for x in thin(minors, gap)
               if all(abs(x["level"] - k["level"]) > gap for k in majors)]
-    return majors, minors
+    return majors[-max_major:], minors[-max_minor:]
 
 
 def volume_zones(df, cfg, tf_label: str, grade: str, direction: str,

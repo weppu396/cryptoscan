@@ -46,40 +46,57 @@ def walk_forward(pipe, df, cfg, folds=5, train_frac=0.7, grid=None):
         grid = [{"min_rr": r, "max_stop_atr": s}
                 for r in (1.5, 2.0, 2.5) for s in (2.5, 3.5)]
 
+    if folds < 1 or not 0 < train_frac < 1:
+        raise ValueError("folds must be positive and train_frac between 0 and 1")
     n = len(df)
-    fold_size = n // folds
+    first_test = max(400, int(n * train_frac))
+    remaining = n - first_test
+    if remaining < 100:
+        return pd.DataFrame()
+    test_size = max(100, remaining // folds)
     results = []
 
     for f in range(folds):
-        start = f * fold_size
-        end = start + fold_size if f < folds - 1 else n
-        seg = df.iloc[start:end]
-        cut = int(len(seg) * train_frac)
-        train, test = seg.iloc[:cut], seg.iloc[cut:]
-        if len(train) < 400 or len(test) < 100:
+        test_start = first_test + f * test_size
+        if test_start >= n:
+            break
+        test_end = min(n, test_start + test_size) if f < folds - 1 else n
+        train = df.iloc[:test_start]  # anchored, expanding training history
+        if len(train) < 400 or test_end - test_start < 100:
             continue
 
-        best_cfg, best_score = None, -1e9
+        best_cfg, best_score = None, float("-inf")
         for params in grid:
             trial = replace(cfg, risk=replace(cfg.risk, **params))
             try:
                 _, tr = pipe(train, trial)
             except Exception:
                 continue
-            if tr.empty:
+            if tr.empty or "r" not in tr:
                 continue
             score = float(tr["r"].sum())
-            if score > best_score:
+            if np.isfinite(score) and score > best_score:
                 best_score, best_cfg = score, trial
-
         if best_cfg is None:
             continue
 
-        _, tr_test = pipe(test, best_cfg)
+        # Include earlier candles for indicator warm-up; only score trades
+        # entered during the untouched OOS interval.
+        context = df.iloc[:test_end]
+        _, tr_all = pipe(context, best_cfg)
+        if tr_all.empty:
+            tr_test = tr_all
+        else:
+            if "entry_ts" not in tr_all:
+                raise ValueError("pipe must return entry_ts for leakage-safe OOS filtering")
+            tr_test = tr_all.loc[
+                (tr_all["entry_ts"] >= df.index[test_start]) &
+                (tr_all["entry_ts"] < df.index[test_end - 1] + pd.Timedelta(nanoseconds=1))
+            ]
         results.append({
             "fold": f + 1,
             "train_bars": len(train),
-            "test_bars": len(test),
+            "test_bars": test_end - test_start,
             "chosen_min_rr": best_cfg.risk.min_rr,
             "chosen_max_stop_atr": best_cfg.risk.max_stop_atr,
             "oos_trades": int(len(tr_test)),

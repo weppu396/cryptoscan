@@ -124,14 +124,21 @@ def choose_pair(src: dict, cfg) -> tuple:
 
 
 def _candidate(zones, price, atr, long):
+    """Nearest valid zone, including inside and approaching prices."""
+    if atr <= 0:
+        return None
     best = None
     for z in zones:
-        if long and z["high"] > price:
+        lo, hi = float(z["low"]), float(z["high"])
+        if lo > hi:
             continue
-        if not long and z["low"] < price:
-            continue
-        dist = ((price - z["high"]) if long else (z["low"] - price)) / atr
-        if dist < 0 or dist > WATCH_ATR:
+        if lo <= price <= hi:
+            dist = 0.0
+        elif long:
+            dist = (lo - price) / atr if price < lo else (price - hi) / atr
+        else:
+            dist = (price - hi) / atr if price > hi else (lo - price) / atr
+        if dist > WATCH_ATR:
             continue
         if best is None or dist < best[1]:
             best = (z, dist)
@@ -190,7 +197,7 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
         return None
 
     tp1, tp2 = _targets(sup if long else dem, entry, risk, long, cfg.risk.max_tp_r)
-    rr = abs(tp1 - entry) / risk
+    rr = ((tp1 - entry) if long else (entry - tp1)) / risk
 
     inside = zone["low"] <= price <= zone["high"]
     beyond = price > zone["high"] if long else price < zone["low"]
@@ -219,7 +226,7 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
     elif inside:
         status = "DEVELOPING"
     elif beyond:
-        status = "MISSED" if (extended or dist > BEYOND_ATR) else "CONFIRMED"
+        status = "MISSED" if (extended or dist > BEYOND_ATR) else "DEVELOPING"
     else:
         status = "APPROACHING"
 
@@ -260,6 +267,8 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
 
 def evaluate(symbol, src: dict, cfg, already: bool = False):
     """One coin. HTF by structure, then the LTF whose setup scores highest."""
+    if not isinstance(src, dict) or not src:
+        return None
     htf = choose_htf(src, cfg)
     if htf is None:
         return None
@@ -283,7 +292,8 @@ def rank(rows):
             ("ACTIVE_ENTRY", "CONFIRMED", "DEVELOPING", "APPROACHING")]
     dead = [r for r in rows if r["status"] in ("MISSED", "INVALIDATED")]
     live.sort(key=lambda r: (not r.get("future", False),
-                             -r["score"], r["eta_min"] or 9e9))
+                             -RANK.get(r["status"], 0), -r["score"],
+                             r["eta_min"] or 9e9))
     dead.sort(key=lambda r: -r["score"])
     return live, dead
 

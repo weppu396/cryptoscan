@@ -37,8 +37,11 @@ def slice_to(df, ts):
     return df.iloc[:pos + 1]
 
 
-def bias_at(htf, ts, fn, min_bars: int = 60) -> str:
+def bias_at(htf, ts, fn, min_bars: int = 60, bar_duration=None) -> str:
     """fn(slice) -> bias string. Defensive: any failure is 'unclear'."""
+    if bar_duration is not None:
+        # Resampled/CCXT indexes label candle OPEN; use only candles already closed.
+        ts = pd.Timestamp(ts) - pd.Timedelta(bar_duration)
     seg = slice_to(htf, ts)
     if seg is None or len(seg) < min_bars:
         return "unclear"

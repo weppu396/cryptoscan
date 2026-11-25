@@ -3,37 +3,35 @@ import pandas as pd
 from config import CFG
 from core import structure2 as s2
 from core.models import Layer
-from tests.fixtures import down_then_internal_bull, equal_highs, flat
+from tests.fixtures import down_then_internal_bull, equal_highs
+from tests.test_bos_sequence import _df, BULL, BEAR, DENSE
 
 
 def test_internal_bull_does_not_move_external():
-    df = down_then_internal_bull()
-    f = s2.run(df, "X", "1h", CFG)
+    from dataclasses import replace
+    # Short swing is confirmed, but external (5/5) pivot is not confirmed yet.
+    cfg = replace(DENSE, struct=replace(DENSE.struct, ext_left=5, ext_right=5))
+    df = _df(BULL[:10])
+    f = s2.run(df, "X", "5m", cfg)
     t = len(df) - 1
-    assert f.state_at(Layer.EXTERNAL, t) == "down"
+    assert f.state_at(Layer.EXTERNAL, t) == "unclear"
     assert f.state_at(Layer.INTERNAL, t) == "up"
     assert all(e.layer is not Layer.EXTERNAL for e in f.live(t)
                if e.label.value == "CHoCH" and e.direction == "bull")
 
 
 def test_first_break_is_bos_init():
-    df = flat(30)
-    df.loc[df.index[30]:, "close"] = 101.0
-    df.loc[df.index[30]:, "high"] = 101.5
-    f = s2.run(df, "X", "1h", CFG)
+    # A flat series has no confirmed swing to break; use real pivots.
+    f = s2.run(_df(BULL[:10]), "X", "5m", DENSE)
     labels = [e.label.value for e in f.events]
     assert "BOS_INIT" in labels
     assert "CHoCH" not in labels
 
 
 def test_choch_after_established_trend():
-    df = flat(30)
-    for i in range(30, 60):
-        df.iloc[i, [0, 1, 2, 3]] = [101, 101.5, 100.8, 101.4]
-    for i in range(60, 80):
-        df.iloc[i, [0, 1, 2, 3]] = [99, 99.2, 98.2, 98.4]
-    f = s2.run(df, "X", "1h", CFG)
-    assert any(e.label.value == "CHoCH" for e in f.events)
+    f = s2.run(_df(BULL + BEAR), "X", "5m", DENSE)
+    assert any(e.label.value == "BOS_INIT" and e.direction == "bull" for e in f.events)
+    assert any(e.label.value == "CHoCH" and e.direction == "bear" for e in f.events)
 
 
 def test_equal_highs_fire_once():
@@ -55,12 +53,9 @@ def test_no_repaint_before_confirmation():
 
 
 def test_invalidation_uses_real_bar():
-    df = flat(40)
-    df.iloc[30, [1, 3]] = [101.5, 101.4]
-    for i in range(31, 40):
-        df.iloc[i, [0, 1, 2, 3]] = [99, 99.2, 98.8, 98.9]
-    f = s2.run(df, "X", "1h", CFG)
+    f = s2.run(_df(BULL + BEAR), "X", "5m", DENSE)
     inv = [e for e in f.events if e.invalidated_at is not None]
+    assert inv, "fixture should produce a broken level and later invalidation"
     for e in inv:
         assert e.invalidated_at > e.confirm_idx
         assert e not in f.live(e.invalidated_at)
@@ -68,9 +63,6 @@ def test_invalidation_uses_real_bar():
 
 
 def test_consumed_level_does_not_refire():
-    df = flat(30)
-    for i in range(30, 50):
-        df.iloc[i, [0, 1, 2, 3]] = [101, 101.4, 100.6, 101.2]
-    f = s2.run(df, "X", "1h", CFG)
+    f = s2.run(_df(BULL + [109, 108, 107, 108, 109, 110, 111]), "X", "5m", DENSE)
     levels = [(e.layer, round(e.level, 2)) for e in f.events]
     assert len(levels) == len(set(levels))

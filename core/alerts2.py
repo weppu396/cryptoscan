@@ -75,7 +75,8 @@ def _set(key: str, setup_id: str, stage: Stage, gen: int, status: Delivery,
 
 def eligible(setup_id: str, stage: Stage, generation: int = 0,
              now: float | None = None) -> bool:
-    now = now or time.time()
+    if now is None:
+        now = time.time()
     row = _row(f"{setup_id}:{stage.value}:{generation}")
     if row is None:
         return True

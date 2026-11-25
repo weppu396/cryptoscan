@@ -284,8 +284,9 @@ def rank(rows):
     live = [r for r in rows if r["status"] in
             ("ACTIVE_ENTRY", "CONFIRMED", "DEVELOPING", "APPROACHING")]
     dead = [r for r in rows if r["status"] in ("MISSED", "INVALIDATED")]
-    live.sort(key=lambda r: (not r.get("future", False),
-                             -r["score"], r["eta_min"] or 9e9))
+    live.sort(key=lambda r: (not r.get("future", r["status"] in FUTURE_STATUSES),
+                             -RANK[r["status"]], -r["score"],
+                             r["eta_min"] if r["eta_min"] is not None else float("inf")))
     dead.sort(key=lambda r: -r["score"])
     return live, dead
 

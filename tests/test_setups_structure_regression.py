@@ -215,6 +215,10 @@ def test_overlapping_structure_lines_keep_yellow_visible():
     matches = [shape for shape in figure.layout.shapes if shape.y0 == df.high.iloc[3]]
     assert [shape.line.color for shape in matches] == [chart2.HTF_LINE, chart2.LTF_LINE]
     assert matches[0].line.width >= matches[1].line.width + 2
+    badge = next(a for a in figure.layout.annotations if a.name == "htf-structure-endpoint")
+    assert badge.x == matches[0].x1 and badge.y == matches[0].y0
+    assert "HTF 1h BULL BOS" in badge.text
+    assert badge.font.color == chart2.HTF_LINE
 
 
 def test_directional_volume_components_reconcile_to_original_total():

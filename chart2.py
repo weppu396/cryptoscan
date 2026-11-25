@@ -414,6 +414,10 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                   "historical": True})
             marks += [{"e": e, "level": float(_sv(e, "level"))} for e in visible_events
                       if _lab(e) == "CHoCH" and int(_sv(e, "confirm_idx")) == shift]
+            # Prefer the latest BOS for the endpoint label. If a layer only
+            # has a CHoCH to show, the label identifies that event explicitly.
+            endpoint = next((row for row in reversed(marks)
+                             if _lab(row["e"]) in BOS_LABELS), marks[-1] if marks else None)
             labels = []
             tf = htf_label if layer == Layer.EXTERNAL else ltf_label
             layer_name = "HTF" if layer == Layer.EXTERNAL else "LTF"
@@ -445,6 +449,17 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                         wick_time = matching.index[np.flatnonzero(exact)[0]]
                 _struct(fig, wick_time, row["level"], structure_end, col_line, w,
                         dash="dot" if historical else "dash" if _lab(e) == "CHoCH" else "solid")
+                if layer == Layer.EXTERNAL and row is endpoint:
+                    event_type = "BOS init" if _lab(e) == "BOS_INIT" else _lab(e)
+                    history_text = " · historical" if historical else ""
+                    fig.add_annotation(
+                        name="htf-structure-endpoint", x=structure_end, y=row["level"],
+                        xref="x", yref="y", xanchor="right", yanchor="bottom", yshift=7,
+                        text=f"<b>HTF {tf} {break_side.upper()} {event_type}</b>"
+                             f" · {row['level']:,.10g}{history_text}",
+                        showarrow=False, bgcolor=BG, bordercolor=col_line,
+                        borderwidth=1, borderpad=4, font=dict(color=col_line, size=11),
+                    )
                 if wick_time in hist.index and np.isclose(
                         hist.at[wick_time, wick_column], row["level"], rtol=1e-10, atol=0):
                     fig.add_trace(go.Scatter(

@@ -200,39 +200,32 @@ def live_zones(zones: list[dict], df, direction: str, keep: int = 2) -> list[dic
     return out
 
 
-def chart_zones(df, cfg, left, right, keep=1):
-    """Nearest intact supply and demand bands from confirmed swing candles.
-
-    The distal edge is the wick. The proximal edge is the candle body, with
-    a minimum ATR-scaled width for candles with a short wick. A later close
-    through the distal edge invalidates that historical zone.
-    """
+def chart_zones(df, cfg, keep=1):
+    """Full range of the last opposing candle before a directional impulse."""
     if df is None or df.empty or keep <= 0:
         return []
-    pivots = find_swings(df, left, right)
     atr = compute_all(df, cfg)["atr"].to_numpy()
-    close = df["close"].to_numpy()
-    price = close[-1]
+    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     zones = {"supply": [], "demand": []}
-    for pivot in pivots:
-        i = pivot["idx"]
-        if i < len(df) - cfg.structure.zone_lookback:
+    for i in range(max(0, len(df) - cfg.structure.zone_lookback), len(df) - 1):
+        if not np.isfinite(atr[i]) or atr[i] <= 0 or c[i] == o[i] or h[i] <= l[i]:
             continue
-        row = df.iloc[i]
-        edge = pivot["price"]
-        width = atr[i] * cfg.structure.zone_tol_atr if np.isfinite(atr[i]) else 0.0
-        if pivot["type"] == "H":
-            side = "supply"
-            low, high = min(max(row["open"], row["close"]), edge - width), edge
-            invalid = (close[i + 1:] > edge).any()
-        else:
-            side = "demand"
-            low, high = edge, max(min(row["open"], row["close"]), edge + width)
-            invalid = (close[i + 1:] < edge).any()
-        if invalid or low >= high:
-            continue
-        distance = max(low - price, price - high, 0.0)
-        zones[side].append({"side": side, "low": low, "high": high,
-                            "ts": df.index[i], "distance": distance})
+        supply = c[i] > o[i]
+        for end in range(i + 1, min(i + 4, len(df))):
+            opposing = c[end] < o[end] if supply else c[end] > o[end]
+            if not opposing:
+                break
+            displaced = (c[i] - c[end] >= atr[i] and c[end] < l[i]) if supply else (
+                c[end] - c[i] >= atr[i] and c[end] > h[i])
+            if not displaced:
+                continue
+            later = c[end + 1:]
+            invalid = (later > h[i]).any() if supply else (later < l[i]).any()
+            if not invalid:
+                side = "supply" if supply else "demand"
+                distance = max(l[i] - c[-1], c[-1] - h[i], 0.0)
+                zones[side].append(dict(side=side, low=l[i], high=h[i], ts=df.index[i],
+                                        distance=distance))
+            break
     return [zone for candidates in zones.values()
             for zone in sorted(reversed(candidates), key=lambda z: z["distance"])[:keep]]

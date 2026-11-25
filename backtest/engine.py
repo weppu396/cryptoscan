@@ -15,11 +15,31 @@ def run(df, signals, cfg, symbol="X"):
     curve = []
     peak = equity
     last = n - 1
+    orders_placed = orders_filled = 0
+    interval_days = df.index.to_series().diff().median() / pd.Timedelta(days=1) \
+        if isinstance(df.index, pd.DatetimeIndex) and len(df) > 1 else 0.0
 
     for t in range(n):
+        intrabar_entry = False
         if pending is not None and pos is None:
             d = pending
-            fill = o[t] * (1 + slip) if d["dir"] == "long" else o[t] * (1 - slip)
+            limit = d.get("limit")
+            long = d["dir"] == "long"
+            if limit is None:
+                fill = o[t] * (1 + slip if long else 1 - slip)
+            else:
+                # Require a trade-through after the signal candle. A touch
+                # alone does not establish a limit order's place in the queue.
+                crossed = l[t] < limit * (1 - slip) if long else h[t] > limit * (1 + slip)
+                if not crossed:
+                    if t >= d["expires"]:
+                        pending = None
+                    fill = np.nan
+                else:
+                    fill = limit
+                    intrabar_entry = o[t] > limit if long else o[t] < limit
+            if np.isfinite(fill):
+                pending = None
             # Reject wrong-side stops rather than turning invalid trades into
             # apparently positive risk/reward via abs().
             risk = (fill - d["stop"]) if d["dir"] == "long" else (d["stop"] - fill)
@@ -29,12 +49,12 @@ def run(df, signals, cfg, symbol="X"):
                     pos = {"dir": d["dir"], "stop": d["stop"], "tp1": d["tp1"],
                            "tp2": d["tp2"], "entry": fill, "qty": qty, "initial_qty": qty,
                            "realized_pnl": -qty * fill * fee,
-                           "risk": risk, "bars": 0, "tp1_done": False,
+                           "risk": risk, "bars": 0, "tp1_done": False, "signal_ts": d["signal_ts"],
                            "be": False, "entry_bar": t, "mae": 0.0,
                            "score": d.get("score"), "grade": d.get("grade"),
                            "strategy": d.get("strategy", "BOS Retest")}
                     equity -= qty * fill * fee
-            pending = None
+                    orders_filled += 1
 
         if pos is not None:
             pos["bars"] += 1
@@ -44,6 +64,12 @@ def run(df, signals, cfg, symbol="X"):
             exit_price = None
             tag = None
 
+            if getattr(cfg.costs, "use_funding", False) and pos["bars"] > 1 and np.isfinite(interval_days):
+                funding = (1 if d == "long" else -1) * pos["qty"] * c[t] * (
+                    cfg.costs.funding_bps_per_day / 10_000.0) * interval_days
+                equity -= funding
+                pos["realized_pnl"] -= funding
+
             adverse = (entry - l[t]) if d == "long" else (h[t] - entry)
             pos["mae"] = max(pos["mae"], adverse / risk)
 
@@ -52,7 +78,7 @@ def run(df, signals, cfg, symbol="X"):
                     exit_price, tag = o[t] * (1 - slip), "gap_stop"
                 elif l[t] <= pos["stop"]:
                     exit_price, tag = pos["stop"] * (1 - slip), "stop"
-                elif not pos["tp1_done"] and h[t] >= pos["tp1"]:
+                elif not intrabar_entry and not pos["tp1_done"] and h[t] >= pos["tp1"]:
                     half = pos["qty"] * max(0.0, min(1.0, cfg.risk.partial_size))
                     tp1_pnl = (pos["tp1"] - entry) * half - half * pos["tp1"] * fee
                     equity += tp1_pnl
@@ -62,7 +88,7 @@ def run(df, signals, cfg, symbol="X"):
                     if not pos["be"] and (pos["tp1"] - entry) >= cfg.risk.move_stop_to_be_at_r * risk:
                         pos["stop"] = entry + fee * entry
                         pos["be"] = True
-                if exit_price is None and h[t] >= pos["tp2"]:
+                if exit_price is None and not intrabar_entry and h[t] >= pos["tp2"]:
                     exit_price, tag = pos["tp2"] * (1 - slip), "tp2"
                 if exit_price is None and pos["bars"] >= cfg.risk.time_stop_bars:
                     exit_price, tag = c[t] * (1 - slip), "time_stop"
@@ -71,7 +97,7 @@ def run(df, signals, cfg, symbol="X"):
                     exit_price, tag = o[t] * (1 + slip), "gap_stop"
                 elif h[t] >= pos["stop"]:
                     exit_price, tag = pos["stop"] * (1 + slip), "stop"
-                elif not pos["tp1_done"] and l[t] <= pos["tp1"]:
+                elif not intrabar_entry and not pos["tp1_done"] and l[t] <= pos["tp1"]:
                     half = pos["qty"] * max(0.0, min(1.0, cfg.risk.partial_size))
                     tp1_pnl = (entry - pos["tp1"]) * half - half * pos["tp1"] * fee
                     equity += tp1_pnl
@@ -81,7 +107,7 @@ def run(df, signals, cfg, symbol="X"):
                     if not pos["be"] and (entry - pos["tp1"]) >= cfg.risk.move_stop_to_be_at_r * risk:
                         pos["stop"] = entry - fee * entry
                         pos["be"] = True
-                if exit_price is None and l[t] <= pos["tp2"]:
+                if exit_price is None and not intrabar_entry and l[t] <= pos["tp2"]:
                     exit_price, tag = pos["tp2"] * (1 + slip), "tp2"
                 if exit_price is None and pos["bars"] >= cfg.risk.time_stop_bars:
                     exit_price, tag = c[t] * (1 + slip), "time_stop"
@@ -102,15 +128,20 @@ def run(df, signals, cfg, symbol="X"):
                     "net_pnl": pos["realized_pnl"], "tag": tag,
                     "bars": pos["bars"], "mae_r": pos["mae"],
                     "score": pos["score"], "grade": pos["grade"],
-                    "entry_ts": df.index[pos["entry_bar"]], "exit_ts": df.index[t],
+                    "signal_ts": pos["signal_ts"], "entry_ts": df.index[pos["entry_bar"]], "exit_ts": df.index[t],
                 })
                 pos = None
 
         if t in signals and pos is None and pending is None and t < last:
-            pending = dict(signals[t])
+            pending = {**signals[t], "signal_ts": df.index[t]}
+            if pending.get("limit") is not None:
+                pending["expires"] = t + max(1, cfg.structure.max_wait_bars)
+            orders_placed += 1
 
         peak = max(peak, equity)
         curve.append({"ts": df.index[t], "equity": equity,
                       "dd": (equity - peak) / peak if peak else 0.0})
 
-    return pd.DataFrame(curve).set_index("ts"), pd.DataFrame(trades)
+    equity_curve = pd.DataFrame(curve, columns=["ts", "equity", "dd"]).set_index("ts")
+    equity_curve.attrs.update(orders_placed=orders_placed, orders_filled=orders_filled)
+    return equity_curve, pd.DataFrame(trades)

@@ -59,7 +59,7 @@ def gate(s, ind_row, cfg) -> tuple[bool, list[str]]:
     return (len(reasons) == 0), reasons
 
 
-def filter_setups(setups, ind, zones_up, zones_dn, cfg):
+def filter_setups(setups, ind, zones_up, zones_dn, cfg, *, zones_at=None):
     out = []
     for s in setups:
         try:
@@ -78,8 +78,9 @@ def filter_setups(setups, ind, zones_up, zones_dn, cfg):
         g_ok, g_why = gate(s, row, cfg)
         if not g_ok:
             continue
-        zone = (zones_up[0] if zones_up else None) if s.direction == "long" \
-               else (zones_dn[0] if zones_dn else None)
+        up, down = zones_at(ind.index.get_loc(s.ts)) if zones_at else (zones_up, zones_dn)
+        candidates = up if s.direction == "long" else down
+        zone = candidates[0] if candidates else None
         s.score = score_setup(s, row, zone, cfg)
         keep = dict(s.meta or {})
         s.meta = {**keep, **size_position(s.entry, s.stop, cfg.risk.account_equity, cfg)}

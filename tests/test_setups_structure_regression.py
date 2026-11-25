@@ -120,11 +120,9 @@ def test_close_through_protected_higher_low_turns_bullish_layer_bearish():
     ("short", 104, 97, 94),
 ])
 def test_trade_boxes_and_both_zone_sides_render(side, stop, tp1, tp2):
-    import numpy as np
     from core.models import StructureFrame
-    from tests.fixtures import price_series
 
-    df = price_series(100 + 5 * np.sin(np.linspace(0, 20, 240)))
+    df = opposing_candles()
     fig = chart2.build(df, StructureFrame(), side,
                        plan={"entry": 100, "stop": stop, "tp1": tp1, "tp2": tp2},
                        htf_df=df, ltf_df=df, cfg=CFG, layers={"zones", "plan"})
@@ -234,3 +232,59 @@ def test_directional_volume_components_reconcile_to_original_total():
     np.testing.assert_allclose(profile["hist"], profile["up"] + profile["down"])
     assert profile["up"].sum() == pytest.approx(0.375)
     assert profile["down"].sum() == pytest.approx(0.625)
+
+
+def opposing_candles():
+    from tests.fixtures import price_series
+
+    df = price_series([100.0] * 60)
+    df.iloc[35:37, :4] = [[103, 105, 102, 104], [104, 104.5, 99, 100]]
+    df.iloc[45:47, :4] = [[97, 98, 95, 96], [96, 101, 95.5, 100]]
+    return df
+
+
+def test_zones_use_full_range_of_last_opposing_candle():
+    from core.structure_map import chart_zones
+
+    df = opposing_candles()
+    zones = {zone["side"]: zone for zone in chart_zones(df, CFG)}
+    assert (zones["supply"]["low"], zones["supply"]["high"], zones["supply"]["ts"]) == (
+        102, 105, df.index[35])
+    assert (zones["demand"]["low"], zones["demand"]["high"], zones["demand"]["ts"]) == (
+        95, 98, df.index[45])
+    assert not chart_zones(df.iloc[:36], CFG)
+    df.iloc[-1, :4] = [106, 107, 105, 106]
+    assert all(zone["side"] != "supply" for zone in chart_zones(df, CFG))
+
+
+def test_limit_execution_waits_for_trade_through_and_expires():
+    from backtest.engine import run as simulate
+
+    df = opposing_candles().iloc[:5].copy()
+    df.iloc[1:4, :4] = [[101, 105, 100, 101], [101, 105, 99.8, 101], [101, 105, 100, 101]]
+    order = {0: {"dir": "long", "limit": 100, "stop": 97, "tp1": 103, "tp2": 104}}
+    cfg = replace(CFG, structure=replace(CFG.structure, max_wait_bars=1))
+    curve, trades = simulate(df, order, cfg)
+    assert trades.empty and curve.attrs["orders_placed"] == 1
+    cfg = replace(cfg, structure=replace(cfg.structure, max_wait_bars=2))
+    curve, trades = simulate(df, order, cfg)
+    assert curve.attrs["orders_filled"] == 1
+    assert trades.iloc[0]["entry"] == 100
+    assert trades.iloc[0]["entry_ts"] == df.index[2]
+    assert trades.iloc[0]["exit_ts"] == df.index[3]
+
+
+def test_zone_history_is_unchanged_by_future_candles():
+    from core.indicators import compute_all
+    from core.levels import zones_by_bar
+    from core.structure import find_swings
+
+    df = opposing_candles()
+    cfg = replace(CFG.structure, min_zone_touches=1)
+
+    def snapshot(frame):
+        swings = find_swings(frame, CFG.structure.swing_left, CFG.structure.swing_right)
+        return zones_by_bar(frame, swings, compute_all(frame, CFG)["atr"], cfg)(38)
+
+    assert snapshot(df) == snapshot(df.iloc[:39])
+    assert snapshot(df)[0]

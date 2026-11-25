@@ -66,7 +66,7 @@ USER = auth.gate() if AUTH_ON else "local"
 
 from data import CANDIDATES, build_universe, load, probe_exchanges, resolve_exchange
 from core.indicators import compute_all
-from core.levels import build_zones
+from core.levels import zones_by_bar
 from core.mtf import aligned, htf_for, structure_bias
 from core.regime import htf_bias
 from core.structure import build_structure, find_swings
@@ -621,11 +621,10 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             if not (hb == "up").any() and not (hb == "down").any():
                 diag["bias_blank"] += 1
             sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
-            zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
-            zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
-            raw = scan_seven(used_sym, df, hb, ind, stt, zu, zd, cfg, recent=max(3, fresh + 1))
+            zones_at = zones_by_bar(df, sw, ind["atr"], cfg.structure)
+            raw = scan_seven(used_sym, df, hb, ind, stt, [], [], cfg, recent=max(3, fresh + 1), zones_at=zones_at)
             diag["raw"] += len(raw)
-            kept = filter_setups(raw, ind, zu, zd, cfg)
+            kept = filter_setups(raw, ind, [], [], cfg, zones_at=zones_at)
             if long_only:
                 kept = [s for s in kept if s.direction == "long"]
             diag["kept"] += len(kept)
@@ -654,8 +653,9 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     diag["past_skip"] += 1
                 if stt_s not in OK_STATUS:
                     continue
-                zone = (zu[0] if zu else None) if s.direction == "long" \
-                    else (zd[0] if zd else None)
+                up, down = zones_at(df.index.get_loc(s.ts))
+                candidates = up if s.direction == "long" else down
+                zone = candidates[0] if candidates else None
                 s.meta["r"] = _norm(rate(s, ind.loc[s.ts], zone, cfg, stats))
                 diag["graded"] += 1
                 if _rank(s.meta["r"]["grade"]) < _rank(min_grade):
@@ -1392,7 +1392,7 @@ if MODE == "Trade":
 
 if MODE == "Trade":
     with T["Backtest"]:
-        ui.section("Backtest", "Independent strategy backtesting · historical simulation, next-open fills.")
+        ui.section("Backtest", "Independent strategy backtesting · historical simulation, limit retest fills.")
         st.caption("Each strategy is tested separately. These are historical hypotheses, not proof of future profitability.")
         b1, b2 = st.columns(2)
         bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym")
@@ -1414,6 +1414,8 @@ if MODE == "Trade":
                                                     min_rr, max_stop_atr, risk_pct, equity))
                                 comparison.append({"Strategy": strategy_name, "Raw": nr,
                                     "Filtered": nk, "Trades": len(tr),
+                                    "Fill rate (%)": stats.get("fill_rate_pct"),
+                                    "Win rate on fills (%)": stats.get("win_rate_pct"),
                                     "Expectancy (R)": stats.get("expectancy_R"),
                                     "Max drawdown (%)": stats.get("max_dd_pct")})
                         st.dataframe(pd.DataFrame(comparison), hide_index=True,
@@ -1429,9 +1431,13 @@ if MODE == "Trade":
                                f"Pick a venue with deeper short-timeframe "
                                f"history, or lower the bar count.")
                 else:
+                    fills = curve.attrs.get("orders_filled", 0)
+                    orders = curve.attrs.get("orders_placed", 0)
+                    if orders:
+                        st.caption(f"Limit fills {fills}/{orders} ({fills / orders:.1%})")
                     st.caption(f"bars {bars_n} · raw {raw_n} · after filters "
                                f"{kept_n} · trades {len(trades)}")
-                    fig = go.Figure(go.Scatter(x=curve.index, y=curve.values,
+                    fig = go.Figure(go.Scatter(x=curve.index, y=curve["equity"],
                                                line=dict(color="#14b8a6", width=1.6)))
                     fig.update_layout(height=340, template="plotly_dark",
                                       paper_bgcolor="#0f1116",

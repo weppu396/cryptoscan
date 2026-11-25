@@ -1,4 +1,6 @@
 """board.py - the setups board. Ranked cards, charted, with the reasoning shown."""
+from dataclasses import replace
+
 import streamlit as st
 import pandas as pd
 
@@ -14,20 +16,20 @@ DEFAULT_CTF = "30m"
 
 
 def _auto_pair(load_fn, ex, sym, cfg):
-    """(htf, ltf, frames). HTF 30m/1h, LTF 3m/5m, chosen on structure."""
-    key = f"pair:{ex.id}:{sym}:{cfg.scan.ltf}"
+    """Load the same timeframe pair used to generate the setup."""
+    key = f"pair:{ex.id}:{sym}:{cfg.scan.htf}:{cfg.scan.ltf}"
     cached = st.session_state.get(key)
     if cached:
         return cached[0], cached[1], cached[2]
     frames = {}
-    for tf in ("3m", "5m", "15m"):
+    for tf in dict.fromkeys((cfg.scan.htf, cfg.scan.ltf)):
         try:
             d, _u = load_fn(ex, sym, tf, 1200, 200)
         except Exception:
             d = None
         if d is not None and len(d) > 2:
             frames[tf] = d.iloc[:-1]
-    htf, ltf, _q = reversal.choose_pair(frames, cfg)
+    htf, ltf = cfg.scan.htf, cfg.scan.ltf
     st.session_state[key] = (htf, ltf, frames)
     return htf, ltf, frames
 
@@ -43,7 +45,11 @@ def _card(card_key, s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             cfg = cfg_fn(exch, top, min_vol, ltf, min_rr, max_stop_atr,
                          risk_pct, equity)
             ex, _ = resolve_fn(cfg, exch, proxy)
-            htf, trig, frames = _auto_pair(load_fn, ex, s.symbol, cfg)
+            scan_htf = s.meta.get("htf")
+            htf = scan_htf if scan_htf in ("30m", "1h") else cfg.scan.htf
+            trigger = scan_tf if scan_tf in ("3m", "5m") else cfg.scan.ltf
+            chart_cfg = replace(cfg, scan=replace(cfg.scan, htf=htf, ltf=trigger))
+            htf, trig, frames = _auto_pair(load_fn, ex, s.symbol, chart_cfg)
             pair = (htf, trig)
             st.caption(f"Chart structure **{htf} HTF / {trig} LTF**")
             ctf = st.selectbox("Chart timeframe", CHART_TFS,
@@ -58,7 +64,8 @@ def _card(card_key, s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 ltf_df = frames.get(trig)
                 cdf = ltf_df if ltf_df is not None else df.iloc[:-1]
                 plan = {"entry": s.entry, "sl": s.stop, "tp1": s.tp1,
-                        "tp2": s.tp2}
+                        "tp2": s.tp2, "bos_level": s.meta.get("bos_level"),
+                        "bos_time": s.meta.get("bos_time")}
                 st.plotly_chart(chart.build(df, cfg, s.direction, plan,
                                             chart_tf=ctf, analysis_df=cdf,
                                             htf_df=htf_df, ltf_df=ltf_df,

@@ -6,7 +6,7 @@ from config import CFG
 from data import get_exchange, load
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
-from core.levels import build_zones
+from core.levels import zones_by_bar
 from core.regime import htf_bias
 from strategy.setups import scan_bos_retest
 from strategy.multistrategy import scan_seven, STRATEGIES
@@ -21,25 +21,25 @@ def build_trades(df, cfg, symbol, strategy="BOS Retest"):
     st = build_structure(df, cfg.structure)
     hb = htf_bias(df, cfg)
     sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
-    zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
-    zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
+    zones_at = zones_by_bar(df, sw, ind["atr"], cfg.structure)
+    zu, zd = [], []
 
     if strategy not in STRATEGIES:
         raise ValueError(f"Unknown strategy: {strategy}")
     # Each backtest evaluates exactly one strategy, avoiding mixed-signal
     # performance claims. Historical candles must be complete before calling.
     if strategy == "BOS Retest":
-        raw = scan_bos_retest(symbol, df, hb, ind, st, zu, zd, cfg)
+        raw = scan_bos_retest(symbol, df, hb, ind, st, zu, zd, cfg, zones_at=zones_at)
     else:
-        candidates = scan_seven(symbol, df, hb, ind, st, zu, zd, cfg, recent=len(df))
+        candidates = scan_seven(symbol, df, hb, ind, st, zu, zd, cfg, recent=len(df), zones_at=zones_at)
         raw = [x for x in candidates if x.meta.get("strategy") == strategy]
-    setups = filter_setups(raw, ind, zu, zd, cfg)
+    setups = filter_setups(raw, ind, zu, zd, cfg, zones_at=zones_at)
 
     signals = {}
     for s in setups:
         loc = df.index.get_loc(s.ts)
         if loc not in signals:
-            signals[loc] = {"dir": s.direction, "stop": s.stop,
+            signals[loc] = {"dir": s.direction, "stop": s.stop, "limit": s.entry,
                             "tp1": s.tp1, "tp2": s.tp2, "score": s.score,
                             "strategy": strategy}
 
@@ -60,7 +60,7 @@ def main():
     a = ap.parse_args()
 
     cfg = replace(CFG, scan=replace(CFG.scan, ltf=a.tf))
-    ex = get_exchange(cfg)
+    ex = get_exchange(cfg.scan.exchange)
     df = load(ex, a.symbol, a.tf, limit=a.limit, use_cache=not a.no_cache)
     print(f"{len(df)} bars of {a.symbol} {a.tf}")
 

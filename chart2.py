@@ -38,9 +38,9 @@ LTF_LINE = "#58a6ff"
 SL_DARK = "#a61b1b"
 TP_DARK = "#1a7f37"
 ENTRY_DARK = "#1d4ed8"
-SUPPLY_FILL = "rgba(234,57,67,0.23)"
+SUPPLY_FILL = "rgba(234,57,67,0.12)"
 SUPPLY_EDGE = "rgba(214,116,128,0.85)"
-DEMAND_FILL = "rgba(22,199,132,0.23)"
+DEMAND_FILL = "rgba(22,199,132,0.12)"
 DEMAND_EDGE = "rgba(88,206,150,0.85)"
 BG = "#0f1116"
 MODES = ("structure", "analysis", "execution")
@@ -486,6 +486,17 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 legend_rows.append(f'<span style="color:{col_line}">{layer_name} {tf} {trend}</span>'
                                    + (f' · {" &nbsp; | &nbsp; ".join(labels)}' if labels else ""))
 
+    if has_plan and "breaks" in on and plan.get("bos_level") is not None and plan.get("bos_time") is not None:
+        signal_level = float(plan["bos_level"])
+        signal_time = pd.to_datetime(plan["bos_time"], utc=True)
+        if start <= signal_time <= structure_end and np.isfinite(signal_level):
+            already_drawn = any(shape.xref == "x" and shape.y0 == signal_level
+                                and shape.line.color == LTF_LINE for shape in fig.layout.shapes)
+            if not already_drawn:
+                _struct(fig, signal_time, signal_level, structure_end, LTF_LINE, 1.8, "solid")
+            legend_rows.append(f'<span style="color:{LTF_LINE}">Setup {ltf_label} BOS</span>'
+                               f" · {signal_level:,.10g}")
+
     profiles = {}
     if "vp" in on:
         for source, window, side in (
@@ -504,12 +515,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         from config import CFG
 
         zone_cfg = cfg if cfg is not None else CFG
-        for source, tf, label, left, right_bars in (
-            (htf_df, htf_label, "HTF", zone_cfg.struct.ext_left, zone_cfg.struct.ext_right),
-            (ltf_df, ltf_label, "LTF", zone_cfg.struct.int_left, zone_cfg.struct.int_right),
+        for source, tf, label in (
+            (htf_df, htf_label, "HTF"),
+            (ltf_df, ltf_label, "LTF"),
         ):
             try:
-                zones = chart_zones(source, zone_cfg, left, right_bars, keep=zone_keep)
+                zones = chart_zones(source, zone_cfg, keep=zone_keep)
             except Exception:
                 continue
             labels = []

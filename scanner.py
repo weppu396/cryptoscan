@@ -8,7 +8,7 @@ from config import CFG
 from data import get_exchange, build_universe, load
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
-from core.levels import build_zones
+from core.levels import zones_by_bar
 from core.regime import htf_bias
 from strategy.multistrategy import scan_seven
 from strategy.risk import filter_setups
@@ -76,11 +76,11 @@ def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
             st = build_structure(ltf, cfg.structure)
             hb = htf_bias(ltf, cfg)
             sw = find_swings(ltf, cfg.structure.swing_left, cfg.structure.swing_right)
-            zu = build_zones(ltf, sw, ind["atr"], cfg.structure, "res")
-            zd = build_zones(ltf, sw, ind["atr"], cfg.structure, "sup")
+            zones_at = zones_by_bar(ltf, sw, ind["atr"], cfg.structure)
 
-            raw = scan_seven(sym, ltf, hb, ind, st, zu, zd, cfg, recent=max(3, (max_age_bars or 2) + 1))
-            kept = filter_setups(raw, ind, zu, zd, cfg)
+            raw = scan_seven(sym, ltf, hb, ind, st, [], [], cfg,
+                             recent=max(3, (max_age_bars or 2) + 1), zones_at=zones_at)
+            kept = filter_setups(raw, ind, [], [], cfg, zones_at=zones_at)
 
             if max_age_bars is not None and kept:
                 cut = ltf.index[max(0, len(ltf) - 1 - max_age_bars)]
@@ -93,8 +93,9 @@ def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
                 if s.meta["status"] not in ("ACTIONABLE", "BETTER_PRICE"):
                     continue
                 row = ind.loc[s.ts]
-                zone = (zu[0] if zu else None) if s.direction == "long" \
-                    else (zd[0] if zd else None)
+                up, down = zones_at(ltf.index.get_loc(s.ts))
+                candidates = up if s.direction == "long" else down
+                zone = candidates[0] if candidates else None
                 rt = rate(s, row, zone, cfg, stats)
                 s.meta["rating"] = rt
                 s.meta["grade"] = rt.grade

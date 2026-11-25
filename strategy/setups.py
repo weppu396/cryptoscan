@@ -59,11 +59,13 @@ def _against(bias: str, direction: str) -> bool:
            (direction == "short" and bias == "up")
 
 
-def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
+def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg, *, zones_at=None):
     htf_b = np.asarray(htf_b)
     setups = []
     n = len(ltf)
     pends = []
+    high_indices = st.get("active_high_idx")
+    low_indices = st.get("active_low_idx")
     o, h, l, c = (ltf[x].values for x in ("open", "high", "low", "close"))
     tol_mult = cfg.structure.zone_tol_atr
     cap = cfg.risk.max_tp_r
@@ -76,12 +78,14 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
             lvl = st["active_high"].iat[t]
             if not np.isnan(lvl):
                 pends.append({"dir": "long", "level": float(lvl),
-                              "expiry": t + wait, "created": t, "used": False})
+                              "expiry": t + wait, "created": t, "used": False,
+                              "pivot": int(high_indices.iat[t]) if high_indices is not None else t})
         elif st["bos_dn"].iat[t] and bias != "up":
             lvl = st["active_low"].iat[t]
             if not np.isnan(lvl):
                 pends.append({"dir": "short", "level": float(lvl),
-                              "expiry": t + wait, "created": t, "used": False})
+                              "expiry": t + wait, "created": t, "used": False,
+                              "pivot": int(low_indices.iat[t]) if low_indices is not None else t})
 
         pends = [p for p in pends if t <= p["expiry"] and not p["used"]][-MAX_PENDING:]
         if not pends:
@@ -114,7 +118,8 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                     pend["used"] = True
                     continue
                 tp1 = entry + 1.5 * risk
-                nxt = [z for z in zones_up if z["mid"] > entry + 0.5 * risk]
+                known_up = zones_at(t)[0] if zones_at else zones_up
+                nxt = [z for z in known_up if z["mid"] > entry + 0.5 * risk]
                 raw_tp2 = max(entry + 3.0 * risk,
                               min(nxt, key=lambda z: z["mid"])["mid"] if nxt else 0.0)
                 tp2 = min(raw_tp2, entry + cap * risk)
@@ -124,7 +129,8 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                     ["HTF not against", f"bullish BOS above {lvl:,.6g}",
                      f"retest held with {cname or 'rejection'} ({cq})",
                      f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
-                    {"candle": cname, "candle_q": cq, "htf": str(bias)}))
+                    {"candle": cname, "candle_q": cq, "htf": str(bias),
+                     "bos_level": lvl, "bos_time": ltf.index[pend["pivot"]] if pend["pivot"] >= 0 else None}))
                 pend["used"] = True
             else:
                 touched = h[t] >= lvl - tol and l[t] <= lvl + tol
@@ -141,7 +147,8 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                     pend["used"] = True
                     continue
                 tp1 = entry - 1.5 * risk
-                nxt = [z for z in zones_dn if z["mid"] < entry - 0.5 * risk]
+                known_down = zones_at(t)[1] if zones_at else zones_dn
+                nxt = [z for z in known_down if z["mid"] < entry - 0.5 * risk]
                 raw_tp2 = min(entry - 3.0 * risk,
                               max(nxt, key=lambda z: z["mid"])["mid"] if nxt else 1e18)
                 tp2 = max(raw_tp2, entry - cap * risk)
@@ -151,7 +158,8 @@ def scan_bos_retest(sym, ltf, htf_b, ind, st, zones_up, zones_dn, cfg):
                     ["HTF not against", f"bearish BOS below {lvl:,.6g}",
                      f"retest rejected with {cname or 'rejection'} ({cq})",
                      f"stop beyond swing + {cfg.risk.stop_buffer_atr} ATR"],
-                    {"candle": cname, "candle_q": cq, "htf": str(bias)}))
+                    {"candle": cname, "candle_q": cq, "htf": str(bias),
+                     "bos_level": lvl, "bos_time": ltf.index[pend["pivot"]] if pend["pivot"] >= 0 else None}))
                 pend["used"] = True
 
     return setups

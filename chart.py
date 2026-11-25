@@ -29,7 +29,8 @@ def legend_md() -> str:
 - `BOS` continues that layer's trend. A dashed `CHoCH` marks a close through its protected swing. BOS lines are solid, including levels labeled historical. Open circles mark matching swing wicks. Diamonds mark confirmation. On a finer chart they sit at the source candle’s close time.
 - Recent swing labels use `HH`, `HL`, `LH`, and `LL`. Use the LTF display to see
   its swing labels.
-- Red chart zones are supply and green chart zones are demand. Each shows its
+- Supply uses the last green candle before a downward impulse. Demand uses
+  the last red candle before an upward impulse. Each zone shows its
   timeframe and price band below the plot. Contains POC means that layer’s
   volume profile POC is inside the zone. Red beside the entry is stop risk, and green
   beside the entry is the target area.
@@ -81,7 +82,8 @@ def build(df, cfg, direction, plan=None, chart_tf=None, analysis_df=None,
     if plan:
         p = {"entry": plan.get("entry"),
              "stop": plan.get("stop", plan.get("sl")),
-             "tp1": plan.get("tp1"), "tp2": plan.get("tp2")}
+             "tp1": plan.get("tp1"), "tp2": plan.get("tp2"),
+             "bos_level": plan.get("bos_level"), "bos_time": plan.get("bos_time")}
     return chart2.build(df, frame, direction, p, mode="analysis", bars=bars,
                         chart_tf=chart_tf, analysis_df=adf, htf_df=htf_df,
                         ltf_df=ltf_df, pair=pair, cfg=cfg, frames=frames, symbol=symbol)

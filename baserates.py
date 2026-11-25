@@ -10,7 +10,7 @@ from strategy.setups import scan_bos_retest
 from strategy.risk import filter_setups
 from core.indicators import compute_all
 from core.structure import build_structure, find_swings
-from core.levels import build_zones
+from core.levels import zones_by_bar
 from core.regime import htf_bias
 from backtest.engine import run as engine_run
 
@@ -38,18 +38,16 @@ def build(df, cfg, symbol, grader):
     st = build_structure(df, cfg.structure)
     hb = htf_bias(df, cfg)
     sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
-    zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
-    zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
-
-    raw = scan_bos_retest(symbol, df, hb, ind, st, zu, zd, cfg)
-    setups = filter_setups(raw, ind, zu, zd, cfg)
+    zones_at = zones_by_bar(df, sw, ind["atr"], cfg.structure)
+    raw = scan_bos_retest(symbol, df, hb, ind, st, [], [], cfg, zones_at=zones_at)
+    setups = filter_setups(raw, ind, [], [], cfg, zones_at=zones_at)
 
     sig_of, signals = {}, {}
     for s in setups:
         loc = df.index.get_loc(s.ts)
         g = grader(s) or "C"
         sig_of[loc] = signature(s.direction, g, s.stop_atr)
-        signals.setdefault(loc, {"dir": s.direction, "stop": s.stop,
+        signals.setdefault(loc, {"dir": s.direction, "stop": s.stop, "limit": s.entry,
                                  "tp1": s.tp1, "tp2": s.tp2,
                                  "score": s.score, "grade": g})
 
@@ -59,7 +57,7 @@ def build(df, cfg, symbol, grader):
         return table
 
     trades = trades.copy()
-    trades["sig"] = [sig_of.get(df.index.get_loc(t), "?") for t in trades["entry_ts"]]
+    trades["sig"] = [sig_of.get(df.index.get_loc(t), "?") for t in trades["signal_ts"]]
     for sig, g in trades.groupby("sig"):
         n, wins = len(g), int((g["r"] > 0).sum())
         p, lo, hi = wilson(wins, n)

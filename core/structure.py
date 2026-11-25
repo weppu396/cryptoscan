@@ -40,6 +40,7 @@ def build_structure(df: pd.DataFrame, cfg) -> pd.DataFrame:
     bos_up = np.zeros(n, bool); bos_dn = np.zeros(n, bool)
     ch_up  = np.zeros(n, bool); ch_dn  = np.zeros(n, bool)
     act_h  = np.full(n, np.nan); act_l = np.full(n, np.nan)
+    idx_h = np.full(n, -1, int); idx_l = np.full(n, -1, int)
     sw_low = np.full(n, np.nan); sw_high = np.full(n, np.nan)
 
     highs: list[dict] = []
@@ -64,8 +65,10 @@ def build_structure(df: pd.DataFrame, cfg) -> pd.DataFrame:
 
         if highs:
             act_h[t] = highs[-1]["price"]
+            idx_h[t] = highs[-1]["idx"]
         if lows:
             act_l[t] = lows[-1]["price"]
+            idx_l[t] = lows[-1]["idx"]
         if len(lows) >= 2:
             sw_low[t] = lows[-2]["price"]
         if len(highs) >= 2:
@@ -82,5 +85,6 @@ def build_structure(df: pd.DataFrame, cfg) -> pd.DataFrame:
         "trend": trend, "bos_up": bos_up, "bos_dn": bos_dn,
         "choch_up": ch_up, "choch_dn": ch_dn,
         "active_high": act_h, "active_low": act_l,
+        "active_high_idx": idx_h, "active_low_idx": idx_l,
         "prev_swing_low": sw_low, "prev_swing_high": sw_high,
     }, index=df.index)

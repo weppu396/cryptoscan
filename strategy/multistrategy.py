@@ -34,7 +34,7 @@ def _candidate(sym, df, ind, cfg, i, direction, pattern, reason, *, stop=None, q
                  {'candle_q': quality, 'strategy': pattern, 'confirmation': reason})
 
 
-def scan_seven(sym, df, hb, ind, st, zu, zd, cfg, recent=3):
+def scan_seven(sym, df, hb, ind, st, zu, zd, cfg, recent=3, *, zones_at=None):
     """Return deduplicated candidates for the latest `recent` closed bars."""
     if df is None or len(df) < 220:
         return []
@@ -53,7 +53,7 @@ def scan_seven(sym, df, hb, ind, st, zu, zd, cfg, recent=3):
     squeeze = width.rolling(80).quantile(0.20).shift(1)
     hb = pd.Series(list(hb), index=df.index).fillna('unclear')
     out = []
-    for s in scan_bos_retest(sym, df, hb.to_numpy(), ind, st, zu, zd, cfg):
+    for s in scan_bos_retest(sym, df, hb.to_numpy(), ind, st, zu, zd, cfg, zones_at=zones_at):
         if s.ts >= df.index[max(0, len(df)-recent)]:
             s.meta['strategy'] = 'BOS Retest'
             out.append(s)

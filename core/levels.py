@@ -38,3 +38,17 @@ def build_zones(df, swings, atr_s, cfg, kind):
             "last_touch_idx": max(p["idx"] for p in z), "score": round(score, 2),
         })
     return sorted(out, key=lambda z: -z["score"])
+
+
+def zones_by_bar(df, swings, atr, cfg):
+    """Reuse only pivots and volatility visible at the decision candle."""
+    from functools import lru_cache
+
+    @lru_cache(maxsize=256)
+    def at(t):
+        prefix = df.iloc[:t + 1]
+        known = [s for s in swings if s["confirmed_at"] <= t]
+        return tuple(build_zones(prefix, known, atr.iloc[:t + 1], cfg, kind)
+                     for kind in ("res", "sup"))
+
+    return at

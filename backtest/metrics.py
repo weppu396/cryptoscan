@@ -3,8 +3,12 @@ import pandas as pd
 
 
 def report(trades, curve, cfg, bars_per_year=2190):
+    orders = curve.attrs.get("orders_placed", 0)
+    fills = curve.attrs.get("orders_filled", 0)
+    execution = {"orders_placed": orders, "orders_filled": fills,
+                 "fill_rate_pct": round(100 * fills / orders, 1) if orders else None}
     if trades is None or trades.empty:
-        return {"trades": 0, "note": "no trades passed the filters"}
+        return {"trades": 0, **execution, "note": "no simulated fills"}
 
     r = trades["r"].values.astype(float)
     wins = r[r > 0]
@@ -19,6 +23,7 @@ def report(trades, curve, cfg, bars_per_year=2190):
     sd = float(rets.std())
 
     return {
+        **execution,
         "trades": int(len(r)),
         "win_rate_pct": round(len(wins) / len(r) * 100, 1),
         "expectancy_R": round(float(r.mean()), 3),

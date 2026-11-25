@@ -30,7 +30,8 @@ def legend_md() -> str:
 - Recent swing labels use `HH`, `HL`, `LH`, and `LL`. Use the LTF display to see
   its swing labels.
 - Supply uses the last green candle before a downward impulse. Demand uses
-  the last red candle before an upward impulse. Each zone shows its
+  the last red candle before an upward impulse. Each timeframe shows one zone
+  in its trend direction, ranked by estimated volume inside the zone. It shows its
   timeframe and price band below the plot. Contains POC means that layer’s
   volume profile POC is inside the zone. Red beside the entry is stop risk, and green
   beside the entry is the target area.

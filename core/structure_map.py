@@ -200,18 +200,26 @@ def live_zones(zones: list[dict], df, direction: str, keep: int = 2) -> list[dic
     return out
 
 
-def chart_zones(df, cfg, keep=1):
-    """Full range of the last opposing candle before a directional impulse."""
-    if df is None or df.empty or keep <= 0:
+def chart_zones(df, cfg, *, trend, profile=None, right_edge=None):
+    """Return the highest-volume intact impulse-origin zone for this trend."""
+    side = {"down": "supply", "up": "demand"}.get(trend)
+    if side is None or df is None or df.empty:
         return []
     atr = compute_all(df, cfg)["atr"].to_numpy()
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
-    zones = {"supply": [], "demand": []}
+    volume = df["volume"].fillna(0).to_numpy()
+    supply = side == "supply"
+    centers = np.asarray(profile.get("centers", [])) if profile else np.array([])
+    width = float(centers[1] - centers[0]) if len(centers) > 1 else 0.0
+    strongest = None
+    best = None
     for i in range(max(0, len(df) - cfg.structure.zone_lookback), len(df) - 1):
-        if not np.isfinite(atr[i]) or atr[i] <= 0 or c[i] == o[i] or h[i] <= l[i]:
+        origin = c[i] > o[i] if supply else c[i] < o[i]
+        if not origin or not np.isfinite(atr[i]) or atr[i] <= 0 or h[i] <= l[i]:
             continue
-        supply = c[i] > o[i]
         for end in range(i + 1, min(i + 4, len(df))):
+            if right_edge is not None and df.index[end] >= right_edge:
+                break
             opposing = c[end] < o[end] if supply else c[end] > o[end]
             if not opposing:
                 break
@@ -222,10 +230,16 @@ def chart_zones(df, cfg, keep=1):
             later = c[end + 1:]
             invalid = (later > h[i]).any() if supply else (later < l[i]).any()
             if not invalid:
-                side = "supply" if supply else "demand"
-                distance = max(l[i] - c[-1], c[-1] - h[i], 0.0)
-                zones[side].append(dict(side=side, low=l[i], high=h[i], ts=df.index[i],
-                                        distance=distance))
+                share = None
+                if width > 0:
+                    overlap = np.maximum(0, np.minimum(h[i], centers + width / 2)
+                                         - np.maximum(l[i], centers - width / 2))
+                    share = float(np.dot(overlap / width, profile["hist"]))
+                impulse_volume = float(volume[i + 1:end + 1].mean())
+                rank = (share or 0.0, impulse_volume, i)
+                if best is None or rank > best:
+                    best = rank
+                    strongest = dict(side=side, low=l[i], high=h[i], ts=df.index[i],
+                                     profile_share=share, impulse_volume=impulse_volume)
             break
-    return [zone for candidates in zones.values()
-            for zone in sorted(reversed(candidates), key=lambda z: z["distance"])[:keep]]
+    return [strongest] if strongest is not None else []

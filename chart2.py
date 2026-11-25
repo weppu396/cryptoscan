@@ -286,11 +286,9 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         return fig
 
     keep = MAX_MARKS
-    zone_keep = 1
     eq_tol = 0.0
     if cfg is not None:
         keep = max(1, int(getattr(cfg.structure, "line_keep", MAX_MARKS)))
-        zone_keep = max(1, int(getattr(cfg.structure, "zone_keep", 1)))
 
     if pair:
         htf_label, ltf_label = cap_htf(pair[0]), cap_ltf(pair[1])
@@ -515,28 +513,36 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         from config import CFG
 
         zone_cfg = cfg if cfg is not None else CFG
-        for source, tf, label in (
-            (htf_df, htf_label, "HTF"),
-            (ltf_df, ltf_label, "LTF"),
+        for layer, profile_source, tf, label, window in (
+            (Layer.EXTERNAL, htf_df, htf_label, "HTF", bars * 2),
+            (Layer.INTERNAL, ltf_df, ltf_label, "LTF", bars),
         ):
+            source = src.get(layer)
+            if source is None or source.empty or not hasattr(frame, "state_at"):
+                continue
+            trend = frame.state_at(layer, len(source) - 1)
+            if trend not in ("up", "down"):
+                continue
+            profile = (profiles.get(label.lower()) if profile_source is not None
+                       and source.index.equals(profile_source.index) else None)
             try:
-                zones = chart_zones(source, zone_cfg, keep=zone_keep)
+                if not profile:
+                    profile = profile_histogram(source, lookback=max(window, 140))
+                zones = chart_zones(source, zone_cfg, trend=trend, profile=profile,
+                                    right_edge=structure_end)
             except Exception:
                 continue
-            labels = []
-            poc = profiles.get(label.lower(), {}).get("poc")
+            poc = profile.get("poc")
             for zone in zones:
-                if zone["ts"] >= structure_end:
-                    continue
                 text = _zone(fig, zone, max(zone["ts"], start), structure_end, label, tf)
+                share = zone.get("profile_share")
+                if share is not None:
+                    text += f" · {share:.1%} of profile volume"
                 if poc is not None and zone["low"] <= poc <= zone["high"]:
                     text += " (contains POC)"
-                labels.append(text)
-                zone_levels.extend((zone["low"], zone["high"]))
-            if labels:
                 poc_label = f" · POC {poc:,.6g}" if poc is not None else ""
-                legend_rows.append(f'{label} {tf} · {" &nbsp; | &nbsp; ".join(labels)}'
-                                   f'{poc_label}')
+                legend_rows.append(f"{label} {tf} · {text}{poc_label}")
+                zone_levels.extend((zone["low"], zone["high"]))
 
     if "fvg" in on:
         for g in [g for g in smc.fair_value_gaps(adf)

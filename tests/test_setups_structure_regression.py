@@ -119,17 +119,20 @@ def test_close_through_protected_higher_low_turns_bullish_layer_bearish():
     ("long", 96, 103, 106),
     ("short", 104, 97, 94),
 ])
-def test_trade_boxes_and_both_zone_sides_render(side, stop, tp1, tp2):
+def test_trade_boxes_and_trend_aligned_zones_render(side, stop, tp1, tp2):
     from core.models import StructureFrame
 
     df = opposing_candles()
-    fig = chart2.build(df, StructureFrame(), side,
+    structure = StructureFrame(state={Layer.EXTERNAL.value: ["down"] * len(df),
+                                      Layer.INTERNAL.value: ["up"] * len(df)})
+    fig = chart2.build(df, structure, side,
                        plan={"entry": 100, "stop": stop, "tp1": tp1, "tp2": tp2},
                        htf_df=df, ltf_df=df, cfg=CFG, layers={"zones", "plan"})
     boxes = {s.name: s for s in fig.layout.shapes if s.type == "rect"}
-    for tag in ("HTF 30m", "LTF 3m"):
-        assert boxes[f"{tag} supply"].fillcolor == chart2.SUPPLY_FILL
-        assert boxes[f"{tag} demand"].fillcolor == chart2.DEMAND_FILL
+    assert boxes["HTF 30m supply"].fillcolor == chart2.SUPPLY_FILL
+    assert boxes["LTF 3m demand"].fillcolor == chart2.DEMAND_FILL
+    assert "HTF 30m demand" not in boxes
+    assert "LTF 3m supply" not in boxes
     risk, reward = boxes["Stop-loss risk"], boxes["Take-profit reward"]
     assert [risk.y0, risk.y1] == sorted((100, stop))
     assert [reward.y0, reward.y1] == sorted((100, tp2))
@@ -143,7 +146,7 @@ def test_trade_boxes_and_both_zone_sides_render(side, stop, tp1, tp2):
     assert risk.x1 == reward.x1 < fig.layout.xaxis.range[1]
     assert all(s.x1 < risk.x0 for name, s in boxes.items()
                if name.endswith(("supply", "demand")))
-    assert len([a for a in fig.layout.annotations if "Supply " in a.text]) == 2
+    assert len([a for a in fig.layout.annotations if "Supply " in a.text]) == 1
     history = fig.layout.updatemenus[0].buttons[-1]
     assert history.label == "Fit history"
 
@@ -192,7 +195,8 @@ def test_zone_poc_tag_uses_the_matching_timeframe(monkeypatch):
     zone = {"side": "supply", "low": 105, "high": 107, "ts": df.index[5].tz_localize("UTC")}
     monkeypatch.setattr(chart2, "chart_zones", lambda *a, **k: [zone])
     monkeypatch.setattr(chart2, "_profile", lambda *a: {"poc": 106 if a[-1] == "htf" else 102})
-    figure = chart2.build(df, StructureFrame(), "short", htf_df=df, ltf_df=df,
+    structure = StructureFrame(state={layer.value: ["down"] * len(df) for layer in Layer})
+    figure = chart2.build(df, structure, "short", htf_df=df, ltf_df=df,
                           layers={"vp", "zones"})
     htf, ltf = (annotation.text for annotation in figure.layout.annotations
                 if "Supply " in annotation.text)
@@ -247,14 +251,15 @@ def test_zones_use_full_range_of_last_opposing_candle():
     from core.structure_map import chart_zones
 
     df = opposing_candles()
-    zones = {zone["side"]: zone for zone in chart_zones(df, CFG)}
+    zones = {zone["side"]: zone for trend in ("up", "down")
+             for zone in chart_zones(df, CFG, trend=trend)}
     assert (zones["supply"]["low"], zones["supply"]["high"], zones["supply"]["ts"]) == (
         102, 105, df.index[35])
     assert (zones["demand"]["low"], zones["demand"]["high"], zones["demand"]["ts"]) == (
         95, 98, df.index[45])
-    assert not chart_zones(df.iloc[:36], CFG)
+    assert not chart_zones(df.iloc[:36], CFG, trend="down")
     df.iloc[-1, :4] = [106, 107, 105, 106]
-    assert all(zone["side"] != "supply" for zone in chart_zones(df, CFG))
+    assert not chart_zones(df, CFG, trend="down")
 
 
 def test_limit_execution_waits_for_trade_through_and_expires():
@@ -288,3 +293,20 @@ def test_zone_history_is_unchanged_by_future_candles():
 
     assert snapshot(df) == snapshot(df.iloc[:39])
     assert snapshot(df)[0]
+
+
+def test_zone_ranks_volume_over_recency_on_same_timeframe():
+    import numpy as np
+    from core.structure_map import chart_zones
+
+    df = opposing_candles()
+    df.iloc[30:33, :4] = [[108, 110, 107, 109], [112, 115, 111, 114], [114, 114.5, 99, 100]]
+    centers = np.arange(95.0, 117.0)
+    hist = np.zeros(len(centers))
+    hist[centers == 113] = 0.8
+    hist[centers == 104] = 0.2
+    zones = chart_zones(df, CFG, trend="down", profile={"centers": centers, "hist": hist})
+    assert len(zones) == 1
+    assert zones[0]["ts"] == df.index[31]  # last green candle, immediately before the impulse
+    assert zones[0]["profile_share"] == pytest.approx(0.8)
+    assert not chart_zones(df, CFG, trend="unclear")

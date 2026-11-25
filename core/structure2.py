@@ -17,6 +17,9 @@ Break rules, non-repainting:
 * The armed level ratchets: highs only replace when higher, lows only when
   lower. A bullish BOS therefore originates from the confirmed HH and a bearish
   BOS from the confirmed LL. Continuation levels must extend the prior break.
+* A break protects the latest confirmed pullback on the opposite side. A
+  close through that swing changes character without requiring a break of
+  the entire previous trend's extreme.
 * A break requires a CLOSE beyond the level (cfg.struct.close_based).
 
 Events confirm at the break bar's close, invalidation is stamped at the bar it
@@ -107,12 +110,12 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
             if s.kind == "H":
                 last_h = (last_h + [s])[-2:]
                 eligible = s.idx > last_break and (state != "up" or s.price > last_level)
-                if eligible and (bull is None or s.price > bull[0]):
+                if eligible and (bull is None or (state != "down" and s.price > bull[0])):
                     bull = (s.price, t, s)
             else:
                 last_l = (last_l + [s])[-2:]
                 eligible = s.idx > last_break and (state != "down" or s.price < last_level)
-                if eligible and (bear is None or s.price < bear[0]):
+                if eligible and (bear is None or (state != "up" and s.price < bear[0])):
                     bear = (s.price, t, s)
 
         if len(last_h) == 2 and len(last_l) == 2:
@@ -126,6 +129,9 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
             last_break = t
             last_level = level
             label, state = TRANSITION[(state, "bull")]
+            if last_l:
+                protected = last_l[-1]
+                bear = (protected.price, t, protected)
             events.append(StructureEvent(new_id(), sym, tf, layer, label, "bull",
                                          level, s.idx, t, t, None, state))
         elif bear is not None and t > bear[1] and dn_probe[t] < bear[0]:
@@ -134,6 +140,9 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
             last_break = t
             last_level = level
             label, state = TRANSITION[(state, "bear")]
+            if last_h:
+                protected = last_h[-1]
+                bull = (protected.price, t, protected)
             events.append(StructureEvent(new_id(), sym, tf, layer, label, "bear",
                                          level, s.idx, t, t, None, state))
 

@@ -85,3 +85,55 @@ def test_break_candle_and_wick_anchor_are_separate(side, sign):
     assert {pd.Timestamp(line.x0) for line in lines} == {index[4], index[11]}
     wicks = df.high if side == "bull" else df.low
     assert {line.y0 for line in lines} == {wicks.iloc[4], wicks.iloc[11]}
+
+
+def test_close_through_protected_higher_low_turns_bullish_layer_bearish():
+    from tests.fixtures import price_series
+
+    df = price_series([100, 97, 103, 100, 105, 102, 108, 105, 110, 104])
+    cfg = replace(CFG, struct=replace(CFG.struct, int_left=1, int_right=1,
+                                      invalidate_bars=0))
+    f = run(df, "TEST", "5m", cfg)
+    internal = [event for event in f.events if event.layer == Layer.INTERNAL]
+    assert [event.label for event in internal] == [Label.BOS_INIT, Label.BOS, Label.CHoCH]
+    shift = internal[-1]
+    assert shift.swing_idx == 7
+    assert shift.confirm_idx == 9
+    assert shift.direction == "bear"
+    assert shift.level == df.low.iloc[7]
+    assert df.close.iloc[9] > df.low.iloc[3]
+
+    fig = chart2.build(df, f, "short", layers={"breaks"}, cfg=cfg,
+                       frames={Layer.INTERNAL: df})
+    lines = [s for s in fig.layout.shapes if s.line.color == chart2.LTF_LINE]
+    assert len(lines) == 1
+    assert lines[0].line.dash == "dash"
+    assert lines[0].x0 == df.index[7].tz_localize('UTC')
+    assert any(trace.x[0] == df.index[9].tz_localize('UTC')
+               for trace in fig.data if trace.type == 'scatter')
+    assert any("BEAR CHoCH" in a.text for a in fig.layout.annotations)
+
+
+@pytest.mark.parametrize("side,stop,tp1,tp2", [
+    ("long", 96, 103, 106),
+    ("short", 104, 97, 94),
+])
+def test_trade_boxes_and_both_zone_sides_render(side, stop, tp1, tp2):
+    import numpy as np
+    from core.models import StructureFrame
+    from tests.fixtures import price_series
+
+    df = price_series(100 + 5 * np.sin(np.linspace(0, 20, 240)))
+    fig = chart2.build(df, StructureFrame(), side,
+                       plan={"entry": 100, "stop": stop, "tp1": tp1, "tp2": tp2},
+                       htf_df=df, ltf_df=df, cfg=CFG, layers={"zones", "plan"})
+    boxes = {s.name: s for s in fig.layout.shapes if s.type == "rect"}
+    for tag in ("HTF 30m", "LTF 3m"):
+        assert boxes[f"{tag} supply"].fillcolor == chart2.SUPPLY_FILL
+        assert boxes[f"{tag} demand"].fillcolor == chart2.DEMAND_FILL
+    risk, reward = boxes["Stop-loss risk"], boxes["Take-profit reward"]
+    assert [risk.y0, risk.y1] == sorted((100, stop))
+    assert [reward.y0, reward.y1] == sorted((100, tp2))
+    assert risk.line.color == chart2.DN
+    assert reward.line.color == chart2.UP
+    assert any(a.text.strip().startswith("TP1 ") for a in fig.layout.annotations)

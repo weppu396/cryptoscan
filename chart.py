@@ -26,10 +26,11 @@ def legend_md() -> str:
 
 - Yellow lines: higher-timeframe structure, from the pivot wick to the right edge.
 - Cyan lines: lower-timeframe structure, same anchoring. The two run independently.
-- `BOS` continues that layer's trend. `CHoCH` is the first break against it.
+- `BOS` continues that layer's trend. A dashed `CHoCH` marks a close through its protected swing. Diamonds show the confirmation candle.
 - `HH` / `HL` / `LH` / `LL` label each confirmed pivot; `EQH` / `EQL` mark equals.
-- Rose zones are supply, mint zones are demand, labelled with timeframe,
-  multiple, price band and traded volume.
+- Red chart zones are supply and green chart zones are demand. Each shows its
+  timeframe and price band. Red beside the entry is stop risk, and green
+  beside the entry is the target area.
 - Blue profile is HTF context, orange is LTF trigger. Both live in the right
   gutter and never overlap the candles.
 - Drag to pan, scroll or drag a box to zoom, double-click to reset. X and Y zoom

@@ -94,7 +94,7 @@ def test_zone_failure_does_not_block_the_other_side(monkeypatch):
         calls.append(1)
         raise RuntimeError("htf down")
 
-    monkeypatch.setattr(chart2, "volume_zones", boom)
+    monkeypatch.setattr(chart2, "chart_zones", boom)
     fig = chart2.build(df, StructureFrame(), "long", mode="analysis")
     assert len(calls) == 2
     assert fig is not None

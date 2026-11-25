@@ -50,12 +50,14 @@ def test_candles_own_most_of_the_width():
 
 
 def test_gutter_is_fenced_and_split():
-    fig = chart.build(frame(), CFG, "short", PLAN, pair=("15m", "3m"))
+    ltf = frame()
+    htf = frame(freq="30min")
+    fig = chart.build(ltf, CFG, "short", PLAN, htf_df=htf, ltf_df=ltf)
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert prof
+    assert len(prof) == 2
     for t in prof:
         assert t.xaxis == "x2"
-    bases = sorted(float(t.base[0] if isinstance(t.base, (list, tuple)) else t.base) for t in prof)
+    bases = sorted(float(t.base) for t in prof)
     assert bases[0] < 0.5 and bases[-1] >= 0.5
     assert tuple(fig.layout.xaxis2.domain) == (0.785, 1.0)
 
@@ -81,13 +83,20 @@ def test_pivot_lines_reach_the_right_edge():
 def test_profile_bars_are_thick():
     fig = chart.build(frame(), CFG, "short", PLAN)
     prof = [t for t in fig.data if getattr(t, "orientation", None) == "h"]
-    assert all(float(t.width[0] if isinstance(t.width, (list, tuple)) else t.width) > 0 for t in prof)
+    assert prof
+    for trace in prof:
+        centers = np.asarray(trace.y, dtype=float)
+        assert trace.width > np.min(np.diff(centers))
 
 
-def test_full_history_in_trace_with_recent_initial_window():
-    fig = chart.build(frame(), CFG, "short", PLAN)
-    assert len([t for t in fig.data if t.type == "candlestick"][0].x) == 400
-    assert pd.Timestamp(fig.layout.xaxis.range[0]) >= frame().index[0]
+def test_initial_window_keeps_full_pan_history():
+    df = frame(freq="30min")
+    fig = chart.build(df, CFG, "short", PLAN, chart_tf="30m", bars=110)
+    candles = next(trace for trace in fig.data if trace.type == "candlestick")
+    assert list(candles.x) == list(df.index)
+    left, right = fig.layout.xaxis.range
+    assert df.index[-110] == left
+    assert df.index[-1] < right
 
 
 def test_ohlc_is_complete_and_ordered():

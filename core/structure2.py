@@ -16,7 +16,7 @@ Break rules, non-repainting:
   nothing fires on the confirmation bar itself.
 * The armed level ratchets: highs only replace when higher, lows only when
   lower. A bullish BOS therefore originates from the confirmed HH and a bearish
-  BOS from the confirmed LL, not from whatever pivot happened to print last.
+  BOS from the confirmed LL. Continuation levels must extend the prior break.
 * A break requires a CLOSE beyond the level (cfg.struct.close_based).
 
 Events confirm at the break bar's close, invalidation is stamped at the bar it
@@ -94,6 +94,7 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
     bull = None          # (level, armed_at, swing) — highest confirmed high
     bear = None          # (level, armed_at, swing) — lowest confirmed low
     last_break = -1
+    last_level = None
     last_h, last_l = [], []
     events = []
 
@@ -103,27 +104,16 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
 
     for t in range(n):
         for s in by_conf.get(t, []):
-            tol = tol_at(t)
             if s.kind == "H":
                 last_h = (last_h + [s])[-2:]
-                if s.idx > last_break:
-                    if bull is None:
-                        bull = (s.price, t, s)
-                    elif abs(s.price - bull[0]) <= tol:
-                        if s.price > bull[0]:
-                            bull = (s.price, t, s)
-                    elif s.price > bull[0]:
-                        bull = (s.price, t, s)
+                eligible = s.idx > last_break and (state != "up" or s.price > last_level)
+                if eligible and (bull is None or s.price > bull[0]):
+                    bull = (s.price, t, s)
             else:
                 last_l = (last_l + [s])[-2:]
-                if s.idx > last_break:
-                    if bear is None:
-                        bear = (s.price, t, s)
-                    elif abs(s.price - bear[0]) <= tol:
-                        if s.price < bear[0]:
-                            bear = (s.price, t, s)
-                    elif s.price < bear[0]:
-                        bear = (s.price, t, s)
+                eligible = s.idx > last_break and (state != "down" or s.price < last_level)
+                if eligible and (bear is None or s.price < bear[0]):
+                    bear = (s.price, t, s)
 
         if len(last_h) == 2 and len(last_l) == 2:
             et = tol_at(t)
@@ -134,16 +124,18 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
             level, _at, s = bull
             bull = None
             last_break = t
+            last_level = level
             label, state = TRANSITION[(state, "bull")]
             events.append(StructureEvent(new_id(), sym, tf, layer, label, "bull",
-                                         level, s.idx, s.idx, t, None, state))
+                                         level, s.idx, t, t, None, state))
         elif bear is not None and t > bear[1] and dn_probe[t] < bear[0]:
             level, _at, s = bear
             bear = None
             last_break = t
+            last_level = level
             label, state = TRANSITION[(state, "bear")]
             events.append(StructureEvent(new_id(), sym, tf, layer, label, "bear",
-                                         level, s.idx, s.idx, t, None, state))
+                                         level, s.idx, t, t, None, state))
 
         state_arr[t] = state
 

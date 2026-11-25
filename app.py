@@ -31,6 +31,7 @@ import sop
 import ui
 from config import AUTH_ENABLED, CFG
 from core import reversal_alerts
+from core.models import Layer
 from core.tfs import CHART_TFS, cap_htf, cap_ltf, chart_minutes, data_tf
 from strategy import reversal
 
@@ -1120,8 +1121,8 @@ if MODE == "Bot":
 with T["SMC"]:
     ui.section("Smart money map",
                "Structure, zones, volume, the trade and its invalidation.")
-    st.caption("Two pivots per timeframe — yellow HTF, cyan LTF — each from the "
-               "wick to the right edge, exact price and BOS/CHoCH tag. HTF is "
+    st.caption("Up to two confirmed BOS levels per timeframe. Yellow is HTF, "
+               "cyan is LTF. Each line starts at the pivot wick. HTF is "
                "30m or 1h, LTF is 3m or 5m. Internal pivots 3+3, external 5+5, "
                "confirmed only. Drag to pan, scroll to zoom.")
     s1, s2, s3 = st.columns([2, 1, 1])
@@ -1152,10 +1153,13 @@ with T["SMC"]:
                         frames[tf] = _closed(d)
                 htf_tf, ltf_tf, _q = reversal.choose_pair(frames, cfg)
                 hdf_c = reversal._frame(frames, htf_tf)
-                ldf_c = frames.get(ltf_tf, cdf)
-                hb = structure_bias(hdf_c, cfg) if hdf_c is not None else "range"
-                stt_tab = build_structure(df, cfg.structure)
-                lb = str(stt_tab["trend"].iloc[-1])
+                ldf_c = frames.get(ltf_tf)
+                structure = chart.merge_frames(hdf_c, ldf_c, cfg, htf_tf, ltf_tf)
+                hb = (structure.state_at(Layer.EXTERNAL, len(hdf_c) - 1)
+                      if hdf_c is not None else "unclear")
+                lb = (structure.state_at(Layer.INTERNAL, len(ldf_c) - 1)
+                      if ldf_c is not None else "unclear")
+                stt_tab = build_structure(cdf, cfg.structure)
                 ok_mtf, why = aligned(hb, lb, side)
                 plan = smc.playbook(cdf, side, equity, risk_pct)
                 anchor = _anchor(stt_tab, side)
@@ -1182,14 +1186,14 @@ with T["SMC"]:
                            f"candles only · both auto-picked and capped")
 
                 disp = df
-                if chart_minutes(chart_tf) < chart_minutes(smc_tf):
-                    d2, _v = _load(ex, used, data_tf(chart_tf), CHART_BARS)
-                    if d2 is not None:
+                display_tf = data_tf(chart_tf)
+                if display_tf != smc_tf or len(df) < CHART_BARS:
+                    d2, _v = _load(ex, used, display_tf, CHART_BARS)
+                    if d2 is not None and (display_tf != smc_tf or len(d2) > len(df)):
                         disp = d2
-                elif len(disp) < CHART_BARS:
-                    d2, _v = _load(ex, used, data_tf(chart_tf), CHART_BARS)
-                    if d2 is not None and len(d2) > len(disp):
-                        disp = d2
+                    elif d2 is None and display_tf != smc_tf:
+                        st.caption(f"{chart_tf} candles unavailable. Showing {smc_tf}.")
+                        chart_tf = smc_tf
                 st.plotly_chart(chart.build(disp, cfg, side, plan,
                                             chart_tf=chart_tf, analysis_df=cdf,
                                             htf_df=hdf_c, ltf_df=ldf_c,

@@ -76,6 +76,7 @@ def can_resample_to(src: str, dst: str) -> bool:
 
 def resample(df, tf: str):
     """Aggregate upwards only. Left closed, left labelled: no future data."""
+    tf = {"1h": "1H", "4h": "4H"}.get(tf, tf)
     if df is None or not len(df) or tf not in _RULE:
         return df
     agg = {k: v for k, v in _AGG.items() if k in df.columns}

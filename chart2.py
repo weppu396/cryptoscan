@@ -224,6 +224,7 @@ def _profile(fig, df, bars, color, axis, side):
         fig.add_shape(type="line", xref=axis, yref="y", x0=b0, x1=b0 + span * 0.3,
                       y0=lvl, y1=lvl,
                       line=dict(color="rgba(180,180,190,0.26)", width=1))
+    return vp
 
 
 def _struct(fig, ts, price, x1, color, width, dash):
@@ -418,15 +419,23 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                     text += f" {tag}"
                 labels.append(text)
                 wick_time = f.index[swing_idx]
+                wick_column = "high" if break_side == "bull" else "low"
                 if aligned_bars:
                     first, end = hist.index.searchsorted([wick_time, wick_time + source_period])
-                    wick_column = "high" if break_side == "bull" else "low"
                     matching = hist.iloc[first:end]
                     exact = np.isclose(matching[wick_column], row["level"], rtol=1e-10, atol=0)
                     if exact.any():
                         wick_time = matching.index[np.flatnonzero(exact)[0]]
                 _struct(fig, wick_time, row["level"], structure_end, col_line, w,
                         dash="dash" if _lab(e) == "CHoCH" else "solid")
+                if wick_time in hist.index and np.isclose(
+                        hist.at[wick_time, wick_column], row["level"], rtol=1e-10, atol=0):
+                    fig.add_trace(go.Scatter(
+                        x=[wick_time], y=[row["level"]], mode="markers",
+                        marker=dict(symbol="circle-open", size=7, color=col_line),
+                        hovertemplate=(f"{layer_name} {tf} swing wick: "
+                                       f"{row['level']:,.6g}<extra></extra>"),
+                        showlegend=False), row=1, col=1)
                 confirmed = int(_sv(e, "confirm_idx"))
                 source_start = f.index[confirmed]
                 close_time = source_start + source_period
@@ -435,6 +444,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                     y=[row["level"]], mode="markers",
                     marker=dict(symbol="diamond", size=6, color=col_line),
                     hovertemplate=(f"{layer_name} {tf} · {text}<br>"
+                                   f"Broken swing wick: {row['level']:,.6g}<br>"
                                    f"{close_time.tz_convert('UTC'):%d %b %H:%M:%S} UTC close: "
                                    f"{f['close'].iat[confirmed]:,.6g}<extra></extra>"),
                     showlegend=False), row=1, col=1)
@@ -443,6 +453,19 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             if labels or state in ("up", "down"):
                 legend_rows.append(f'<span style="color:{col_line}">{layer_name} {tf} {trend}</span>'
                                    + (f' · {" &nbsp; | &nbsp; ".join(labels)}' if labels else ""))
+
+    profiles = {}
+    if "vp" in on:
+        for source, window, color, side in (
+            (htf_df, bars * 2, VP_HTF, "htf"),
+            (ltf_df, bars, VP_LTF, "ltf"),
+        ):
+            if source is None or (side == "htf" and len(source) < 30):
+                continue
+            try:
+                profiles[side] = _profile(fig, source, window, color, gutter_ref, side) or {}
+            except Exception:
+                continue
 
     zone_levels = []
     if "zones" in on:
@@ -458,13 +481,19 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             except Exception:
                 continue
             labels = []
+            poc = profiles.get(label.lower(), {}).get("poc")
             for zone in zones:
                 if zone["ts"] >= structure_end:
                     continue
-                labels.append(_zone(fig, zone, max(zone["ts"], start), structure_end, label, tf))
+                text = _zone(fig, zone, max(zone["ts"], start), structure_end, label, tf)
+                if poc is not None and zone["low"] <= poc <= zone["high"]:
+                    text += " (contains POC)"
+                labels.append(text)
                 zone_levels.extend((zone["low"], zone["high"]))
             if labels:
-                legend_rows.append(f'{label} {tf} · {" &nbsp; | &nbsp; ".join(labels)}')
+                poc_label = f" · POC {poc:,.6g}" if poc is not None else ""
+                legend_rows.append(f'{label} {tf} · {" &nbsp; | &nbsp; ".join(labels)}'
+                                   f'{poc_label}')
 
     if "fvg" in on:
         for g in [g for g in smc.fair_value_gaps(adf)
@@ -500,17 +529,6 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 fig.add_trace(go.Scatter(x=line.index, y=line, name="AVWAP",
                                          line=dict(color=TEAL, width=1.2, dash="dash"),
                                          opacity=.75), row=1, col=1)
-        except Exception:
-            pass
-
-    if "vp" in on:
-        try:
-            if htf_df is not None and len(htf_df) >= 30:
-                _profile(fig, htf_df, bars * 2, VP_HTF, gutter_ref, "htf")
-        except Exception:
-            pass
-        try:
-            _profile(fig, ltf_df, bars, VP_LTF, gutter_ref, "ltf")
         except Exception:
             pass
 

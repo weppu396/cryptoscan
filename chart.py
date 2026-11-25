@@ -26,11 +26,12 @@ def legend_md() -> str:
 
 - Yellow lines: higher-timeframe structure, anchored at the source pivot wick.
 - Cyan lines: lower-timeframe structure, same anchoring. The two run independently.
-- `BOS` continues that layer's trend. A dashed `CHoCH` marks a close through its protected swing. Diamonds mark confirmation. On a finer chart they sit at the source candle’s close time.
+- `BOS` continues that layer's trend. A dashed `CHoCH` marks a close through its protected swing. Open circles mark matching swing wicks. Diamonds mark confirmation. On a finer chart they sit at the source candle’s close time.
 - Recent swing labels use `HH`, `HL`, `LH`, and `LL`. Use the LTF display to see
   its swing labels.
 - Red chart zones are supply and green chart zones are demand. Each shows its
-  timeframe and price band below the plot. Red beside the entry is stop risk, and green
+  timeframe and price band below the plot. Contains POC means that layer’s
+  volume profile POC is inside the zone. Red beside the entry is stop risk, and green
   beside the entry is the target area.
 - Blue profile is HTF context, orange is LTF trigger. Both live in the right
   gutter and never overlap the candles.

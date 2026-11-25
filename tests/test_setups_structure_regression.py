@@ -183,3 +183,20 @@ def test_finer_chart_marks_source_close_and_matching_wick():
     assert any(t.x[0] == source.index[5] + pd.Timedelta(minutes=30)
                for t in fig.data if t.type == "scatter" and "BULL BOS " in t.hovertemplate)
     assert any("HTF 30m bullish" in a.text for a in fig.layout.annotations)
+
+
+def test_zone_poc_tag_uses_the_matching_timeframe(monkeypatch):
+    from core.models import StructureFrame
+    from tests.fixtures import price_series
+
+    df = price_series([100] * 40)
+    zone = {"side": "supply", "low": 105, "high": 107, "ts": df.index[5].tz_localize("UTC")}
+    monkeypatch.setattr(chart2, "chart_zones", lambda *a, **k: [zone])
+    monkeypatch.setattr(chart2, "_profile", lambda *a: {"poc": 106 if a[-1] == "htf" else 102})
+    figure = chart2.build(df, StructureFrame(), "short", htf_df=df, ltf_df=df,
+                          layers={"vp", "zones"})
+    htf, ltf = (annotation.text for annotation in figure.layout.annotations
+                if "Supply " in annotation.text)
+    assert "contains POC" in htf and "POC 106" in htf
+    assert "contains POC" not in ltf and "POC 102" in ltf
+    assert len([s for s in figure.layout.shapes if s.name and s.name.endswith("supply")]) == 2

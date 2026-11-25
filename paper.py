@@ -1,11 +1,13 @@
 """paper.py - forward test. Same tickets, no money."""
 import json
+import os
+import tempfile
 import pathlib
 import uuid
 
 import pandas as pd
 
-BOOK = pathlib.Path("./state/paper.json")
+BOOK = pathlib.Path(os.environ.get("CRYPTOSCAN_STATE_DIR", "./state")) / "paper.json"
 
 
 def _load() -> list:
@@ -14,7 +16,16 @@ def _load() -> list:
 
 def _save(rows: list) -> None:
     BOOK.parent.mkdir(exist_ok=True)
-    BOOK.write_text(json.dumps(rows, indent=2))
+    fd, tmp = tempfile.mkstemp(prefix="paper-", suffix=".tmp", dir=BOOK.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, BOOK)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def open_trade(symbol, direction, entry, stop, tp1, tp2, qty, equity, reason=""):

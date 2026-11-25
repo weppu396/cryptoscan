@@ -6,8 +6,10 @@ they run in the colo nearest the CALLER. So we test direct routes instead.
 """
 from dataclasses import replace
 import time
+import math
 import pathlib
-import ccxt
+import os
+import tempfile
 import pandas as pd
 
 CACHE = pathlib.Path("./data_cache")
@@ -70,6 +72,7 @@ def _set_api_base(ex, base):
 
 
 def get_exchange(name, proxy=None):
+    import ccxt  # Optional until an exchange connection is actually requested.
     real, base = ROUTES.get(name, (name, None))
     klass = getattr(ccxt, real)
     ex = klass({
@@ -209,10 +212,15 @@ def build_universe(ex, cfg) -> tuple:
 
     def qv_of(sym):
         t = tickers.get(sym) or {}
-        q = float(t.get("quoteVolume") or 0.0)
-        if q == 0.0 and t.get("baseVolume") and t.get("last"):
-            q = float(t["baseVolume"]) * float(t["last"])
-        return q
+        try:
+            quote = float(t.get("quoteVolume") or 0.0)
+            if not math.isfinite(quote) or quote <= 0:
+                base = float(t.get("baseVolume") or 0.0)
+                last = float(t.get("last") or 0.0)
+                quote = base * last
+            return quote if math.isfinite(quote) and quote > 0 else 0.0
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
 
     cands = []
     for sym, m in ex.markets.items():
@@ -227,22 +235,16 @@ def build_universe(ex, cfg) -> tuple:
     if not cands:
         return [], "no USDT markets found"
 
+    limit = min(100, max(1, int(cfg.scan.top_n_symbols or 100)))
     if all(q == 0 for _, q in cands):
-        syms = sorted(s for s, m in ex.markets.items()
-                      if m.get("base") in FALLBACK_MAJORS
-                      and m.get("quote") == cfg.scan.quote and m.get("active"))
-        return syms[:cfg.scan.top_n_symbols], "tickers unavailable, using majors"
+        return [], "24h volume unavailable; cannot verify liquidity"
 
-    note = f"volume filter ${cfg.scan.min_quote_vol_24h/1e6:.0f}M"
-    for thr in (cfg.scan.min_quote_vol_24h, 20e6, 10e6, 5e6, 1e6, 0.0):
-        keep = [c for c in cands if c[1] >= thr]
-        if len(keep) >= 15 or thr == 0.0:
-            if thr != cfg.scan.min_quote_vol_24h:
-                note = f"volume filter relaxed to ${thr/1e6:.0f}M"
-            break
-
-    keep.sort(key=lambda x: -x[1])
-    return [s for s, _ in keep][:cfg.scan.top_n_symbols], note
+    keep = [c for c in cands if c[1] >= cfg.scan.min_quote_vol_24h]
+    keep.sort(key=lambda x: (-x[1], x[0]))
+    return [s for s, _ in keep[:limit]], (
+        f"24h quote volume >= ${cfg.scan.min_quote_vol_24h/1e6:g}M; "
+        f"top {limit} max"
+    )
 
 
 def list_symbols(ex, quote="USDT", limit=800):
@@ -253,7 +255,7 @@ def list_symbols(ex, quote="USDT", limit=800):
     return syms[:limit]
 
 
-def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
+def load(ex, symbol, timeframe, limit=1500, use_cache=True, max_cache_age_bars=2) -> pd.DataFrame:
     symbol = resolve_symbol(ex, symbol)
 
     safe = symbol.replace("/", "_").replace(":", "_")
@@ -262,8 +264,13 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
     if use_cache and key.exists():
         try:
             cached = pd.read_parquet(key)
-            if len(cached) >= limit:
-                return cached
+            if len(cached) >= limit and not cached.empty:
+                latest = pd.Timestamp(cached.index[-1])
+                if latest.tzinfo is None:
+                    latest = latest.tz_localize("UTC")
+                age = pd.Timestamp.now(tz="UTC") - latest
+                if pd.Timedelta(0) <= age <= pd.Timedelta(milliseconds=TF_MS[timeframe] * max_cache_age_bars):
+                    return cached.tail(limit)
         except Exception:
             pass
 
@@ -271,38 +278,60 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
     batch_limit = int(ex.options.get("fetchOHLCVLimit") or 1000)
     batch_limit = max(50, min(batch_limit, 1000))
 
+    # CCXT `since` is a FORWARD pagination cursor. Walking it backwards
+    # can repeatedly fetch the same candles and silently truncate history.
+    now_ms = int(time.time() * 1000)
+    since = now_ms - (limit + 3) * step
     rows = []
-    since = None
     guard = 0
-
-    while len(rows) < limit and guard < 60:
+    last_ts = None
+    while len(rows) < limit + 3 and guard < 60:
         guard += 1
+        remaining = limit + 3 - len(rows)
         try:
             batch = ex.fetch_ohlcv(symbol, timeframe, since=since,
-                                   limit=batch_limit)
+                                   limit=min(batch_limit, remaining))
         except Exception:
-            break
+            # Never silently accept a partial history after a pagination failure.
+            # Indicators and structure would otherwise be calculated on truncated data.
+            raise
         if not batch:
             break
-
-        prev_earliest = rows[0][0] if rows else None
-        rows = batch + rows
-        rows = list({r[0]: r for r in rows}.values())
-        rows.sort(key=lambda r: r[0])
-
-        if len(rows) >= limit:
+        batch = sorted(batch, key=lambda r: r[0])
+        fresh = [r for r in batch if r[0] >= since and
+                 (last_ts is None or r[0] > last_ts)]
+        if not fresh:
+            break  # Exchange ignored the cursor or returned duplicate data.
+        rows.extend(fresh)
+        last_ts = fresh[-1][0]
+        since = last_ts + step
+        if since > now_ms:
             break
-        if prev_earliest is not None and rows[0][0] >= prev_earliest:
-            break
+        time.sleep(max(0, getattr(ex, "rateLimit", 0)) / 1000)
 
-        since = rows[0][0] - step * batch_limit
-        time.sleep(ex.rateLimit / 1000)
-
+    # Never silently treat a short or discontinuous response as a complete
+    # requested history: missing candles can invalidate pivots and indicators.
+    if len(rows) < limit:
+        raise RuntimeError(
+            f"Incomplete OHLCV history for {symbol} {timeframe}: "
+            f"received {len(rows)} of {limit} requested bars"
+        )
     rows = rows[-limit:]
+    if any(rows[i][0] - rows[i - 1][0] != step for i in range(1, len(rows))):
+        raise RuntimeError(f"Gapped OHLCV history for {symbol} {timeframe}")
 
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.drop_duplicates("ts").set_index("ts").sort_index().astype(float)
     if not df.empty:
-        df.to_parquet(key)
+        # Parquet cache writes must be atomic: concurrent cloud sessions can
+        # otherwise read a partially-written cache file.
+        fd, temp_path = tempfile.mkstemp(prefix="candles-", suffix=".parquet", dir=CACHE)
+        os.close(fd)
+        try:
+            df.to_parquet(temp_path)
+            os.replace(temp_path, key)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
     return df

@@ -38,7 +38,8 @@ if __name__ == "__main__":
     for x in sorted(leaked)[:10]:
         print("  LEAK:", x)
 
-    if len(leaked) <= 3:
+    if len(leaked) == 0:
         print("\nPASS - clean.")
     else:
-        print("\nWARNING - investigate.")
+        print("\nFAIL - future-dependent signals detected.")
+        raise SystemExit(1)

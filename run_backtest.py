@@ -9,13 +9,14 @@ from core.structure import build_structure, find_swings
 from core.levels import build_zones
 from core.regime import htf_bias
 from strategy.setups import scan_bos_retest
+from strategy.multistrategy import scan_seven, STRATEGIES
 from strategy.risk import filter_setups
 from backtest.engine import run as engine_run
 from backtest.metrics import report, bucket_stats
 from backtest.validate import permutation_test, monte_carlo_drawdown, walk_forward
 
 
-def build_trades(df, cfg, symbol):
+def build_trades(df, cfg, symbol, strategy="BOS Retest"):
     ind = compute_all(df, cfg)
     st = build_structure(df, cfg.structure)
     hb = htf_bias(df, cfg)
@@ -23,7 +24,15 @@ def build_trades(df, cfg, symbol):
     zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
     zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
 
-    raw = scan_bos_retest(symbol, df, hb, ind, st, zu, zd, cfg)
+    if strategy not in STRATEGIES:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    # Each backtest evaluates exactly one strategy, avoiding mixed-signal
+    # performance claims. Historical candles must be complete before calling.
+    if strategy == "BOS Retest":
+        raw = scan_bos_retest(symbol, df, hb, ind, st, zu, zd, cfg)
+    else:
+        candidates = scan_seven(symbol, df, hb, ind, st, zu, zd, cfg, recent=len(df))
+        raw = [x for x in candidates if x.meta.get("strategy") == strategy]
     setups = filter_setups(raw, ind, zu, zd, cfg)
 
     signals = {}
@@ -31,7 +40,8 @@ def build_trades(df, cfg, symbol):
         loc = df.index.get_loc(s.ts)
         if loc not in signals:
             signals[loc] = {"dir": s.direction, "stop": s.stop,
-                            "tp1": s.tp1, "tp2": s.tp2, "score": s.score}
+                            "tp1": s.tp1, "tp2": s.tp2, "score": s.score,
+                            "strategy": strategy}
 
     curve, trades = engine_run(df, signals, cfg, symbol)
     return curve, trades, len(raw), len(setups)
@@ -44,6 +54,9 @@ def main():
     ap.add_argument("--limit", type=int, default=6000)
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--walk-forward", action="store_true")
+    ap.add_argument("--strategy", choices=STRATEGIES, default="BOS Retest")
+    ap.add_argument("--compare-strategies", action="store_true",
+                    help="Backtest each strategy independently on the same historical data")
     a = ap.parse_args()
 
     cfg = replace(CFG, scan=replace(CFG.scan, ltf=a.tf))
@@ -51,7 +64,18 @@ def main():
     df = load(ex, a.symbol, a.tf, limit=a.limit, use_cache=not a.no_cache)
     print(f"{len(df)} bars of {a.symbol} {a.tf}")
 
-    curve, trades, n_raw, n_kept = build_trades(df, cfg, a.symbol)
+    if a.compare_strategies:
+        print("\nIndependent strategy comparison (historical, not a profit forecast):")
+        for name in STRATEGIES:
+            cr, tr, nr, nk = build_trades(df, cfg, a.symbol, strategy=name)
+            stats = report(tr, cr, cfg)
+            print(f"{name:22} raw={nr:4} kept={nk:4} "
+                  f"trades={stats.get('trades', 0):4} "
+                  f"expectancy_R={stats.get('expectancy_R', 'N/A')} "
+                  f"max_dd_pct={stats.get('max_dd_pct', 'N/A')}")
+        return
+
+    curve, trades, n_raw, n_kept = build_trades(df, cfg, a.symbol, strategy=a.strategy)
     print(f"{n_raw} raw signals -> {n_kept} after filters")
 
     stats = report(trades, curve, cfg)
@@ -75,7 +99,7 @@ def main():
         print("  trade list -> trades.csv")
 
     if a.walk_forward:
-        res = walk_forward(lambda d, c: build_trades(d, c, a.symbol)[:2], df, cfg)
+        res = walk_forward(lambda d, c: build_trades(d, c, a.symbol, strategy=a.strategy)[:2], df, cfg)
         print(res.to_string(index=False))
 
 

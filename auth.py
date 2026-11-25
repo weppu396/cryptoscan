@@ -8,6 +8,7 @@ locks you out.
 import hashlib
 import json
 import os
+import tempfile
 import pathlib
 import secrets as pysecrets
 import time
@@ -15,7 +16,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
-STATE = pathlib.Path("./state")
+STATE = pathlib.Path(os.environ.get("CRYPTOSCAN_STATE_DIR", "./state"))
 USERS = STATE / "users.json"
 ITERATIONS = 200_000
 MAX_FAILS = 5
@@ -24,18 +25,28 @@ LOCK_SECONDS = 60
 
 # ---------------------------------------------------------------- storage
 def _load() -> dict:
-    STATE.mkdir(exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
     if not USERS.exists():
         return {}
     try:
         return json.loads(USERS.read_text())
-    except Exception:
-        return {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Cannot read user database; refusing to reset accounts") from exc
 
 
 def _save(db: dict) -> None:
-    STATE.mkdir(exist_ok=True)
-    USERS.write_text(json.dumps(db, indent=2))
+    STATE.mkdir(parents=True, exist_ok=True)
+    # Atomic replace prevents a cloud process interruption from corrupting users.json.
+    fd, tmp = tempfile.mkstemp(prefix="users-", suffix=".tmp", dir=STATE)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(db, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, USERS)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _hash(password: str, salt: str) -> str:
@@ -59,7 +70,9 @@ def _seed() -> None:
     if db:
         return
     user = _secret("ADMIN_USER") or "admin"
-    pw = _secret("ADMIN_PASS") or "changeme123"
+    pw = _secret("ADMIN_PASS")
+    if not pw:
+        raise RuntimeError("Set ADMIN_PASS in Streamlit secrets or environment before first login")
     salt = pysecrets.token_hex(16)
     db[user] = {
         "salt": salt,
@@ -196,7 +209,6 @@ def gate() -> str:
                             st.session_state["user"] = nu.strip().lower()
                             st.rerun()
 
-        st.caption("First boot creates `admin` with password `changeme123` "
-                   "unless you set ADMIN_USER / ADMIN_PASS in secrets.")
+        st.caption("First boot requires ADMIN_PASS in secrets or environment.")
 
     st.stop()

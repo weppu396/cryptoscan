@@ -1,6 +1,8 @@
 """Runs every symbol through the pipeline and returns ranked, rated setups."""
 import json
 import pathlib
+import pandas as pd
+from data import TF_MS
 
 from config import CFG
 from data import get_exchange, build_universe, load
@@ -8,9 +10,10 @@ from core.indicators import compute_all
 from core.structure import build_structure, find_swings
 from core.levels import build_zones
 from core.regime import htf_bias
-from strategy.setups import scan_bos_retest
+from strategy.multistrategy import scan_seven
 from strategy.risk import filter_setups
 from strategy.rating import rate
+from core.opportunities import assess, current_only
 
 
 def load_stats():
@@ -44,8 +47,9 @@ def setup_status(s, ltf) -> str:
 
 def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
          min_grade=None) -> list:
-    ex = get_exchange(cfg)
-    universe = build_universe(ex, cfg)
+    ex = get_exchange(cfg.scan.exchange)
+    universe, universe_note = build_universe(ex, cfg)
+    universe = universe[:100]
     stats = load_stats()
     if verbose:
         print(f"Scanning {len(universe)} symbols on {cfg.scan.ltf} "
@@ -61,6 +65,9 @@ def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
             print(f"  [{i}/{len(universe)}] {sym}", end="\r")
         try:
             ltf = load(ex, sym, cfg.scan.ltf)
+            # Last exchange bar may still be forming. Only closed candles can signal.
+            if len(ltf) and (pd.Timestamp.now(tz="UTC") - ltf.index[-1]).total_seconds() < TF_MS[cfg.scan.ltf] / 1000:
+                ltf = ltf.iloc[:-1]
             if len(ltf) < 500:
                 skipped += 1
                 continue
@@ -72,7 +79,7 @@ def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
             zu = build_zones(ltf, sw, ind["atr"], cfg.structure, "res")
             zd = build_zones(ltf, sw, ind["atr"], cfg.structure, "sup")
 
-            raw = scan_bos_retest(sym, ltf, hb, ind, st, zu, zd, cfg)
+            raw = scan_seven(sym, ltf, hb, ind, st, zu, zd, cfg, recent=max(3, (max_age_bars or 2) + 1))
             kept = filter_setups(raw, ind, zu, zd, cfg)
 
             if max_age_bars is not None and kept:
@@ -80,7 +87,11 @@ def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
                 kept = [s for s in kept if s.ts >= cut]
 
             for s in kept:
-                s.meta["status"] = setup_status(s, ltf)
+                s.meta["status"], s.meta["status_reason"] = assess(
+                    s, ltf, max_age_bars=max_age_bars,
+                    timeframe_seconds=TF_MS[cfg.scan.ltf] / 1000)
+                if s.meta["status"] not in ("ACTIONABLE", "BETTER_PRICE"):
+                    continue
                 row = ind.loc[s.ts]
                 zone = (zu[0] if zu else None) if s.direction == "long" \
                     else (zd[0] if zd else None)
@@ -99,5 +110,4 @@ def scan(cfg=CFG, verbose=True, progress_cb=None, max_age_bars=2,
     if verbose and not progress_cb:
         print(f"\n\nDone. {len(found)} fresh setups, {skipped} symbols skipped.\n")
 
-    found.sort(key=lambda s: (-s.meta.get("rating").confidence, -s.score))
-    return found
+    return current_only(found)

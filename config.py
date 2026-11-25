@@ -95,7 +95,7 @@ class Scan:
     htf: str = "1h"
     ltf: str = "5m"
     min_quote_vol_24h: float = 30_000_000
-    top_n_symbols: int = 150
+    top_n_symbols: int = 100
     exclude_suffixes: tuple = ("USDC", "BUSD", "DAI", "TUSD", "FDUSD")
     htf_bars: int = 250         # HTF context budget
     ltf_bars: int = 400         # LTF trigger budget

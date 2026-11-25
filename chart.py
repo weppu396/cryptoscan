@@ -4,7 +4,6 @@ The HTF frame feeds EXTERNAL only and the LTF frame feeds INTERNAL only, so an
 opposing higher and lower timeframe can coexist on one chart. `cfg` is the
 second positional argument; `plan` may use "sl" or "stop".
 """
-import streamlit as st
 
 import chart2
 import core.structure2 as s2
@@ -16,6 +15,7 @@ DEFAULT = "30m"
 
 def st_selectbox(key: str, index: int = 0, default: str = DEFAULT) -> str:
     idx = index if 0 <= index < len(CHART_TFS) else CHART_TFS.index(DEFAULT)
+    import streamlit as st
     return st.selectbox("Chart timeframe", CHART_TFS, index=idx, key=key,
                         help="Display only. Structure uses the auto pair.")
 
@@ -65,7 +65,7 @@ def merge_frames(ext_df, int_df, cfg, htf_tf: str, ltf_tf: str) -> StructureFram
 
 
 def build(df, cfg, direction, plan=None, chart_tf=None, analysis_df=None,
-          htf_df=None, ltf_df=None, pair=None, bars=chart2.DEFAULT_BARS):
+          htf_df=None, ltf_df=None, pair=None, bars=chart2.DEFAULT_BARS, symbol=None):
     adf = analysis_df if analysis_df is not None else df
     htf_tf, ltf_tf = pair if pair else ("30m", "3m")
     frame = merge_frames(htf_df, ltf_df, cfg, htf_tf, ltf_tf)
@@ -81,4 +81,4 @@ def build(df, cfg, direction, plan=None, chart_tf=None, analysis_df=None,
              "tp1": plan.get("tp1"), "tp2": plan.get("tp2")}
     return chart2.build(df, frame, direction, p, mode="analysis", bars=bars,
                         chart_tf=chart_tf, analysis_df=adf, htf_df=htf_df,
-                        ltf_df=ltf_df, pair=pair, cfg=cfg, frames=frames)
+                        ltf_df=ltf_df, pair=pair, cfg=cfg, frames=frames, symbol=symbol)

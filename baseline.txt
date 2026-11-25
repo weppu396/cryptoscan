@@ -1,0 +1,193 @@
+F..........FFF.......................................F......s.....FFF..F [ 98%]
+F                                                                        [100%]
+==================================== ERRORS ====================================
+__________________ ERROR collecting tests/test_chart_axes.py ___________________
+ImportError while importing test module '/mnt/data/fixbuild/tests/test_chart_axes.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_chart_axes.py:6: in <module>
+    import chart
+chart.py:7: in <module>
+    import streamlit as st
+E   ModuleNotFoundError: No module named 'streamlit'
+__________________ ERROR collecting tests/test_future_pair.py __________________
+ImportError while importing test module '/mnt/data/fixbuild/tests/test_future_pair.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_future_pair.py:6: in <module>
+    import chart
+chart.py:7: in <module>
+    import streamlit as st
+E   ModuleNotFoundError: No module named 'streamlit'
+________________ ERROR collecting tests/test_layers_history.py _________________
+ImportError while importing test module '/mnt/data/fixbuild/tests/test_layers_history.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_layers_history.py:8: in <module>
+    import chart
+chart.py:7: in <module>
+    import streamlit as st
+E   ModuleNotFoundError: No module named 'streamlit'
+________________ ERROR collecting tests/test_spot_regression.py ________________
+ImportError while importing test module '/mnt/data/fixbuild/tests/test_spot_regression.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.13/importlib/__init__.py:88: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_spot_regression.py:6: in <module>
+    import sizer
+sizer.py:2: in <module>
+    import streamlit as st
+E   ModuleNotFoundError: No module named 'streamlit'
+=================================== FAILURES ===================================
+________________________ test_failure_does_not_suppress ________________________
+
+    def test_failure_does_not_suppress():
+        calls = []
+    
+        def poster(text):
+            calls.append(text)
+            return (len(calls) > 1), None
+    
+        assert a2.send("s1", Stage.APPROACHING, "x", 0, poster) == "RETRY"
+>       assert a2.send("s1", Stage.APPROACHING, "x", 0, poster) == "SENT"
+E       AssertionError: assert 'skipped' == 'SENT'
+E         
+E         - SENT
+E         + skipped
+
+tests/test_alerts2.py:22: AssertionError
+___________________ test_bullish_bos_from_hh_on_later_close ____________________
+
+    def test_bullish_bos_from_hh_on_later_close():
+        df, ev = _events(BULL, "bull")
+>       assert ev, "no bullish break detected"
+E       AssertionError: no bullish break detected
+E       assert []
+
+tests/test_bos_sequence.py:38: AssertionError
+___________________ test_bearish_bos_from_ll_on_later_close ____________________
+
+    def test_bearish_bos_from_ll_on_later_close():
+        df, ev = _events(BEAR, "bear")
+>       assert ev, "no bearish break detected"
+E       AssertionError: no bearish break detected
+E       assert []
+
+tests/test_bos_sequence.py:48: AssertionError
+_______________ test_level_is_the_extreme_pivot_not_the_last_one _______________
+
+    def test_level_is_the_extreme_pivot_not_the_last_one():
+        """A lower high between two higher highs must not become the BOS level."""
+        df, ev = _events(BULL, "bull")
+>       e = ev[0]
+            ^^^^^
+E       IndexError: list index out of range
+
+tests/test_bos_sequence.py:59: IndexError
+______________________________ test_3m_key_exists ______________________________
+
+    def test_3m_key_exists():
+>       from data import TF_MS
+
+tests/test_reversal.py:23: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    Candles + cache. Multiple Binance routes, tested live.
+    
+    Binance geo-blocks US datacentre IPs. Cloudflare Workers do not help because
+    they run in the colo nearest the CALLER. So we test direct routes instead.
+    """
+    from dataclasses import replace
+    import time
+    import pathlib
+>   import ccxt
+E   ModuleNotFoundError: No module named 'ccxt'
+
+data.py:10: ModuleNotFoundError
+__________________ test_internal_bull_does_not_move_external ___________________
+
+    def test_internal_bull_does_not_move_external():
+        df = down_then_internal_bull()
+        f = s2.run(df, "X", "1h", CFG)
+        t = len(df) - 1
+>       assert f.state_at(Layer.EXTERNAL, t) == "down"
+E       AssertionError: assert 'unclear' == 'down'
+E         
+E         - down
+E         + unclear
+
+tests/test_structure2.py:13: AssertionError
+_________________________ test_first_break_is_bos_init _________________________
+
+    def test_first_break_is_bos_init():
+        df = flat(30)
+>       df.loc[df.index[30]:, "close"] = 101.0
+        ^^^^^^
+E       AttributeError: 'list' object has no attribute 'loc'
+
+tests/test_structure2.py:21: AttributeError
+______________________ test_choch_after_established_trend ______________________
+
+    def test_choch_after_established_trend():
+        df = flat(30)
+        for i in range(30, 60):
+>           df.iloc[i, [0, 1, 2, 3]] = [101, 101.5, 100.8, 101.4]
+            ^^^^^^^
+E           AttributeError: 'list' object has no attribute 'iloc'
+
+tests/test_structure2.py:32: AttributeError
+_______________________ test_invalidation_uses_real_bar ________________________
+
+    def test_invalidation_uses_real_bar():
+        df = flat(40)
+>       df.iloc[30, [1, 3]] = [101.5, 101.4]
+        ^^^^^^^
+E       AttributeError: 'list' object has no attribute 'iloc'
+
+tests/test_structure2.py:59: AttributeError
+_____________________ test_consumed_level_does_not_refire ______________________
+
+    def test_consumed_level_does_not_refire():
+        df = flat(30)
+        for i in range(30, 50):
+>           df.iloc[i, [0, 1, 2, 3]] = [101, 101.4, 100.6, 101.2]
+            ^^^^^^^
+E           AttributeError: 'list' object has no attribute 'iloc'
+
+tests/test_structure2.py:73: AttributeError
+=========================== short test summary info ============================
+FAILED tests/test_alerts2.py::test_failure_does_not_suppress - AssertionError: assert 'skipped' == 'SENT'
+  
+  - SENT
+  + skipped
+FAILED tests/test_bos_sequence.py::test_bullish_bos_from_hh_on_later_close - AssertionError: no bullish break detected
+assert []
+FAILED tests/test_bos_sequence.py::test_bearish_bos_from_ll_on_later_close - AssertionError: no bearish break detected
+assert []
+FAILED tests/test_bos_sequence.py::test_level_is_the_extreme_pivot_not_the_last_one - IndexError: list index out of range
+FAILED tests/test_reversal.py::test_3m_key_exists - ModuleNotFoundError: No module named 'ccxt'
+FAILED tests/test_structure2.py::test_internal_bull_does_not_move_external - AssertionError: assert 'unclear' == 'down'
+  
+  - down
+  + unclear
+FAILED tests/test_structure2.py::test_first_break_is_bos_init - AttributeError: 'list' object has no attribute 'loc'
+FAILED tests/test_structure2.py::test_choch_after_established_trend - AttributeError: 'list' object has no attribute 'iloc'
+FAILED tests/test_structure2.py::test_invalidation_uses_real_bar - AttributeError: 'list' object has no attribute 'iloc'
+FAILED tests/test_structure2.py::test_consumed_level_does_not_refire - AttributeError: 'list' object has no attribute 'iloc'
+ERROR tests/test_chart_axes.py
+ERROR tests/test_future_pair.py
+ERROR tests/test_layers_history.py
+ERROR tests/test_spot_regression.py
+10 failed, 62 passed, 1 skipped, 4 errors in 0.62s

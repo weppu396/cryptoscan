@@ -12,3 +12,13 @@ tickets.json
 baserates.json
 health_history.json
 alerts_sent.json
+
+# Cloud credentials and local environment
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+.venv/
+*.db
+*.sqlite
+*.sqlite3

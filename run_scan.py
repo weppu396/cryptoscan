@@ -9,6 +9,7 @@ from config import CFG
 from scanner import scan
 from alerts import notify
 from strategy.rating import print_rating
+from core.opportunities import current_only
 
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 
@@ -28,6 +29,7 @@ def pretty(setups):
         print("-" * 70)
         print(print_rating(s.symbol, m["rating"]))
         print("-" * 70)
+        print(f" strategy      {s.meta.get('strategy', s.pattern)}")
         print(f" entry         {s.entry:,.4f}")
         print(f" stop-loss     {s.stop:,.4f}   ({s.stop_atr:.2f} ATR)")
         print(f" take-profit 1 {s.tp1:,.4f}   (+{abs(s.tp1 - s.entry) / stop_dist:.1f}R)")
@@ -37,13 +39,14 @@ def pretty(setups):
               f"risk ${m.get('risk_cash', 0):,.2f}")
         print(f" signal bar    {s.ts}")
     print("=" * 70)
-    print("\nGRADE: A+/A = take it. B = take if you have room. C = watch. D = skip.")
+    print("\nGrades are screening heuristics, NOT trade instructions or profit guarantees.")
     print("STATUS: ACTIONABLE/BETTER_PRICE = act now. RUNNING/EXTENDED/INVALID = info only.\n")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--top", type=int, default=60)
+    ap.add_argument("--top", type=int, default=0,
+                    help="0 scans every eligible symbol; exchange rate limits apply")
     ap.add_argument("--min-vol", type=float, default=None)
     ap.add_argument("--exchange", default=None)
     ap.add_argument("--recent", type=int, default=2)
@@ -60,7 +63,7 @@ def main():
         sc = replace(sc, exchange=a.exchange)
     cfg = replace(CFG, scan=replace(sc, top_n_symbols=a.top))
 
-    setups = scan(cfg, max_age_bars=a.recent, min_grade=a.min_grade)
+    setups = current_only(scan(cfg, max_age_bars=a.recent, min_grade=a.min_grade))
     if a.actionable_only:
         setups = [s for s in setups if s.meta.get("status") in OK_STATUS]
     setups = setups[: a.limit]

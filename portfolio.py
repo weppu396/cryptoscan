@@ -1,6 +1,8 @@
 """portfolio.py - holdings, risk buckets, health, export, optional Gist sync."""
 import json
 import pathlib
+import os
+import tempfile
 
 import pandas as pd
 import requests
@@ -10,7 +12,7 @@ from core.indicators import compute_all
 from core.structure import build_structure
 from core.regime import htf_bias
 
-P = pathlib.Path("portfolio.json")
+P = pathlib.Path(os.environ.get("CRYPTOSCAN_STATE_DIR", "./state")) / "portfolio.json"
 MAJORS = {"BTC", "ETH", "SOL"}
 GIST_API = "https://api.github.com/gists"
 BUCKET_COLOR = {"low": "#22c55e", "medium": "#eab308", "high": "#ef4444"}
@@ -26,7 +28,17 @@ def load_pf():
 
 
 def save_pf(pf):
-    P.write_text(json.dumps(pf, indent=2))
+    P.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="portfolio-", suffix=".tmp", dir=P.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(pf, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, P)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def add(symbol, qty, price, stop=None, tp=None, note=""):

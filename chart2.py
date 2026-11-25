@@ -265,7 +265,7 @@ def _zone(fig, z, x0, x1, label, tf):
 def build(df, frame, direction, plan=None, mode="analysis", layers=None,
           bars=DEFAULT_BARS, chart_tf=None, analysis_df=None,
           htf_df=None, ltf_df=None, pair=None, cfg=None,
-          frames=None) -> go.Figure:
+          frames=None, symbol=None) -> go.Figure:
     """frames maps Layer -> the frame that layer's indices belong to."""
     if mode not in MODES:
         raise ValueError(mode)
@@ -312,7 +312,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         return f
 
     on = set(layers) if layers else LAYERS[mode]
-    hist = df.tail(MAX_TRACE)
+    hist = df  # retain every candle the caller loaded; never truncate chart history
     step = _step(hist)
     step_min = step.total_seconds() / 60.0 if step and step > pd.Timedelta(0) else 1.0
     need = max(chart_minutes(htf_label) * HTF_VISIBLE,
@@ -477,7 +477,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                                bgcolor="rgba(15,17,22,0.72)")
 
     try:
-        y_ref = hist.tail(min(len(hist), max(bars * 4, bars)))
+        y_ref = hist  # keep all loaded historical price levels visible when panning
         lo = float(y_ref["low"].min())
         hi = float(y_ref["high"].max())
         pad = (hi - lo) * 0.02 or max(abs(hi), 1.0) * 0.001
@@ -490,9 +490,9 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         right = x_lo + (step or pd.Timedelta(minutes=1)) * 6
 
     fig.update_layout(height=640, template="plotly_dark", paper_bgcolor=BG,
-                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=42, b=22),
+                      plot_bgcolor=BG, margin=dict(l=62, r=10, t=100, b=22),
                       showlegend=False, hovermode="x unified", dragmode="pan",
-                      uirevision=f"cs|{chart_tf or ''}|{htf_label}|{ltf_label}",
+                      uirevision=f"cs|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
                                       f"gutter blue = HTF, orange = LTF",
@@ -518,4 +518,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                      tickformat=",.6g", fixedrange=False, showspikes=True,
                      spikemode="across", spikethickness=1, spikedash="dot",
                      spikecolor=MUT)
+    from chart_axes import add_independent_axis_controls
+    if y_range is not None:
+        add_independent_axis_controls(fig, [x_lo, right], y_range)
     return fig

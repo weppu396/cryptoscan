@@ -1,8 +1,9 @@
 """store.py - SQLite persistence. WAL, synchronous=FULL, unique dedup keys."""
 import pathlib
+import os
 import sqlite3
 
-DB = pathlib.Path("./state/cryptoscan.db")
+DB = pathlib.Path(os.environ.get("CRYPTOSCAN_STATE_DIR", "./state")) / "cryptoscan.db"
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;

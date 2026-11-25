@@ -6,6 +6,7 @@ app.py - CryptoScan. Spot mode and Bot mode.
 """
 import inspect
 import json
+import math
 import os
 import pathlib
 import smtplib
@@ -71,7 +72,9 @@ from core.structure import build_structure, find_swings
 from core.volume import avwap_context, volume_profile
 from strategy.rating import rate
 from strategy.risk import filter_setups, plan_rr
+from core.opportunities import assess as assess_opportunity, current_only
 from strategy.setups import scan_bos_retest
+from strategy.multistrategy import scan_seven, STRATEGIES
 from backtest.engine import run as engine_run
 from backtest.metrics import report
 from backtest.validate import monte_carlo_drawdown, permutation_test
@@ -82,7 +85,7 @@ GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
 OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
 MIN_BARS = 300
 HAS_FRAGMENT = hasattr(st, "fragment")
-CHART_BARS = 1500
+CHART_BARS = 3000
 DEFAULT_TF = "30m"
 
 RATIO = {"3m": 5, "5m": 6, "15m": 4, "1h": 4, "4h": 6, "1d": 1, "1w": 1}
@@ -223,7 +226,23 @@ def _anchor(stt, direction: str):
 
 
 def _closed(df):
-    return df.iloc[:-1] if df is not None and len(df) > 2 else df
+    """Exclude only a candle that is still forming, not a historical closed bar."""
+    if df is None or len(df) <= 2 or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    try:
+        # This helper is also used on historical/HTF frames; infer duration only
+        # when consecutive timestamps are available and consistently spaced.
+        timestamps = df.index
+        duration = timestamps[-1] - timestamps[-2]
+        if duration <= pd.Timedelta(0):
+            return df
+        last = pd.Timestamp(timestamps[-1])
+        last = last.tz_localize("UTC") if last.tzinfo is None else last
+        if pd.Timestamp.now(tz="UTC") < last + duration:
+            return df.iloc[:-1]
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return df
 
 
 def _tidy(df):
@@ -246,21 +265,22 @@ def _tidy(df):
     return d
 
 
-def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
+def _detail_figure(df, tf: str, bars: int = 120, symbol: str = "") -> tuple:
     """Plain candle chart collapsing only real holes. No candle is invented."""
     d = _tidy(df)
-    hist = d.tail(1200)
+    hist = d  # do not discard older candles when zooming or panning
     view = hist.tail(bars)
-    diffs = pd.Series(view.index).diff().dropna()
+    diffs = pd.Series(hist.index).diff().dropna()
     good = diffs[diffs > pd.Timedelta(0)]
     step = good.median() if len(good) else pd.Timedelta(minutes=1)
 
     breaks = []
-    for ts, gap in zip(view.index[1:], diffs):
+    for ts, gap in zip(hist.index[1:], diffs):
         if gap > step * 3 and len(breaks) < 30:
             breaks.append(dict(bounds=[ts - gap, ts]))
 
-    lo, hi = float(view["low"].min()), float(view["high"].max())
+    # Keep historical price levels within the Y range while panning left.
+    lo, hi = float(hist["low"].min()), float(hist["high"].max())
     pad = (hi - lo) * 0.03 or max(abs(hi), 1.0) * 0.001
     m = TF_MIN.get(tf, 60)
     tick = "%H:%M:%S" if m < 1 else "%H:%M" if m < 60 else (
@@ -273,8 +293,8 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
         decreasing_fillcolor="#ea3943", whiskerwidth=0.6))
     fig.update_layout(height=460, template="plotly_dark",
                       paper_bgcolor="#0f1116", plot_bgcolor="#0f1116",
-                      margin=dict(l=58, r=10, t=26, b=22), showlegend=False,
-                      dragmode="pan", uirevision="detail",
+                      margin=dict(l=58, r=10, t=85, b=22), showlegend=False,
+                      dragmode="pan", uirevision=f"detail|{symbol}|{tf}",
                       title=dict(text=f"{tf} · {len(view)} shown of "
                                       f"{len(hist)} loaded · "
                                       f"{len(breaks)} real gap(s) collapsed",
@@ -288,6 +308,9 @@ def _detail_figure(df, tf: str, bars: int = 120) -> tuple:
                       yaxis=dict(range=[lo - pad, hi + pad], autorange=False,
                                  side="left", gridcolor="#1b1f28",
                                  tickformat=",.6g", fixedrange=False))
+    from chart_axes import add_independent_axis_controls
+    add_independent_axis_controls(fig, [view.index[0], view.index[-1]],
+                                  [lo - pad, hi + pad])
     return fig, len(breaks)
 
 
@@ -387,21 +410,27 @@ def _universe(ex, min_vol: int, top: int):
     for sym, m in ex.markets.items():
         if not m.get("active", True) or m.get("quote") != "USDT":
             continue
-        qv = float((tickers.get(sym) or {}).get("quoteVolume") or 0)
+        if not (m.get("swap") or m.get("spot")):
+            continue
+        t = tickers.get(sym) or {}
+        try:
+            qv = float(t.get("quoteVolume") or 0)
+            if not math.isfinite(qv) or qv <= 0:
+                qv = float(t.get("baseVolume") or 0) * float(t.get("last") or 0)
+            if not math.isfinite(qv) or qv <= 0:
+                qv = 0.0
+        except (TypeError, ValueError, OverflowError):
+            qv = 0.0
         rows.append((sym, qv, bool(m.get("swap") or m.get("contract"))))
     perps = [r for r in rows if r[2]]
     pool = perps if len(perps) >= 10 else rows
     floor = min_vol
     filtered = [r for r in pool if r[1] >= floor]
-    if len(filtered) < 15:
-        floor = 0
-        filtered = pool
+    # Do not silently dilute the liquidity floor to fill the quota.
     filtered.sort(key=lambda r: -r[1])
-    syms = [r[0] for r in filtered[:top]]
+    syms = [r[0] for r in filtered[:min(100, max(1, int(top)))]]
     if not syms:
-        base = "BTC/USDT:USDT" if len(perps) >= 10 else "BTC/USDT"
-        syms = [base.replace("BTC", c) for c in MAJORS
-                if base.replace("BTC", c) in ex.markets]
+        return [], floor, len(perps)
     return syms, floor, len(perps)
 
 
@@ -548,7 +577,7 @@ def notify(text: str):
     return False, f"{msg} | {msg2}"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 equity, recent_h, min_grade, preferred, proxy, relax,
                 need_smc, long_only, need_mtf=False, need_vol=False):
@@ -577,6 +606,12 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
         if df is None:
             diag["err"] += 1
             continue
+        # Never score a setup from an in-progress candle: its high, low,
+        # volume and close are not final and can repaint on the next refresh.
+        df = _closed(df)
+        if df is None or len(df) < MIN_BARS:
+            diag["err"] += 1
+            continue
         diag["loaded"] += 1
         try:
             ind = compute_all(df, cfg)
@@ -587,7 +622,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
             zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
             zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
-            raw = scan_bos_retest(used_sym, df, hb, ind, stt, zu, zd, cfg)
+            raw = scan_seven(used_sym, df, hb, ind, stt, zu, zd, cfg, recent=max(3, fresh + 1))
             diag["raw"] += len(raw)
             kept = filter_setups(raw, ind, zu, zd, cfg)
             if long_only:
@@ -600,7 +635,9 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 kept = fresh_kept
             atr_now = _last(ind, "atr", default=0.0)
             for s in kept:
-                s.meta["status"] = setup_status(s, df, atr_now)
+                s.meta["status"], s.meta["status_reason"] = assess_opportunity(
+                    s, df, max_age_bars=fresh,
+                    timeframe_seconds=chart_minutes(cfg.scan.ltf) * 60)
                 s.meta["htf"] = cfg.scan.htf
                 s.meta["ltf"] = cfg.scan.ltf
                 stt_s = s.meta["status"]
@@ -667,37 +704,21 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             diag["err"] += 1
             continue
 
-    found.sort(key=lambda s: -(s.meta["r"]["confidence"]
-                               + s.meta.get("smc", {}).get("score", 0) * 3
-                               + s.meta.get("avwap", {}).get("score", 0) * 0.4
-                               + (15 if s.meta.get("in_value") else 0)
-                               + s.meta.get("candle_q", 0) * 0.2))
+    found = current_only(found)
     return found, diag
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
-                    risk_pct, equity, preferred, proxy):
+                    risk_pct, equity, preferred, proxy, strategy="BOS Retest"):
     cfg = build_cfg(exchange, 40, 30e6, ltf, min_rr, max_stop_atr, risk_pct, equity)
     ex, _ = _resolve(cfg, preferred, proxy)
     df, used = _load(ex, symbol, cfg.scan.ltf, int(limit), 200)
     if df is None:
         return None, None, 0, 0, 0
-    ind = compute_all(df, cfg)
-    stt = build_structure(df, cfg.structure)
-    hb = htf_bias(df, cfg)
-    sw = find_swings(df, cfg.structure.swing_left, cfg.structure.swing_right)
-    zu = build_zones(df, sw, ind["atr"], cfg.structure, "res")
-    zd = build_zones(df, sw, ind["atr"], cfg.structure, "sup")
-    raw = scan_bos_retest(used, df, hb, ind, stt, zu, zd, cfg)
-    setups = filter_setups(raw, ind, zu, zd, cfg)
-    signals = {}
-    for s in setups:
-        signals.setdefault(df.index.get_loc(s.ts),
-                           {"dir": s.direction, "stop": s.stop, "tp1": s.tp1,
-                            "tp2": s.tp2, "score": s.score})
-    curve, trades = engine_run(df, signals, cfg, used)
-    return curve, trades, len(raw), len(setups), len(df)
+    from run_backtest import build_trades
+    curve, trades, raw_n, kept_n = build_trades(_closed(df), cfg, used, strategy)
+    return curve, trades, raw_n, kept_n, len(df)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -803,7 +824,8 @@ with st.sidebar:
                        index=1)
     st.caption(f"scan {cap_ltf(ltf)} · bias {cap_htf(htf_for(ltf))} · "
                f"{_scan_bars(cap_ltf(ltf))} bars · trigger never slower than 5m")
-    top = st.slider("Symbols to scan", 10, 150, 25, step=5)
+    st.caption("Liquidity-ranked universe: maximum 100 coins; no unlimited scan.")
+    top = st.slider("High-liquidity coins to scan", 10, 100, 100, step=10)
     min_vol = st.select_slider("Min 24h volume",
                                [10e6, 30e6, 50e6, 100e6, 250e6], value=30e6,
                                format_func=lambda v: f"${v/1e6:.0f}M")
@@ -812,7 +834,7 @@ with st.sidebar:
                             "listed. Converted to bars of the scanned timeframe, "
                             "so 12h is 144 bars of 5m.")
     min_grade = st.select_slider("Minimum grade", GRADE_ORDER, value="C")
-    only_ok = st.checkbox("Actionable only", value=False)
+    only_ok = st.checkbox("Actionable only", value=True)
     relax = st.checkbox("Relax filters", value=True)
     need_smc = st.checkbox("Require SMC confluence", value=False)
     need_mtf = st.checkbox("Require MTF alignment", value=False,
@@ -961,7 +983,7 @@ with T["Overview"]:
                 ui.stat(m4, "Structure", trend,
                         "up" if trend == "up" else "dn" if trend == "down" else "warn")
                 st.caption(" · ".join(notes) or "no clear swing sequence")
-                fig, gaps = _detail_figure(df, detail_tf)
+                fig, gaps = _detail_figure(df, detail_tf, symbol=used)
                 st.plotly_chart(fig, use_container_width=True,
                                 config={"scrollZoom": True,
                                         "displaylogo": False})
@@ -969,7 +991,9 @@ with T["Overview"]:
                     f"{used} · {detail_tf} · real venue holes collapsed: {gaps}. "
                     "No candle is invented. The whole loaded history is in the "
                     "chart, so zooming out reveals earlier candles. Drag to pan, "
-                    "scroll to zoom, double-click to reset.")
+                    "scroll to zoom, double-click to reset. Drag the time axis "
+                    "to zoom X independently, or the price axis to zoom Y; "
+                    "Time/Price buttons provide separate axis controls.")
                 st.session_state["detail_ctx"] = {"ex": ex, "sym": used}
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
@@ -1034,6 +1058,7 @@ if MODE == "Bot":
                         relax, need_smc, False, need_mtf, need_vol)
                 st.session_state["setups"] = found
                 st.session_state["diag"] = diag
+                st.session_state["last_scan_at"] = pd.Timestamp.now(tz="UTC")
             except Exception as e:
                 st.error(f"{type(e).__name__}: {e}")
                 st.exception(e)
@@ -1049,15 +1074,42 @@ if MODE == "Bot":
                        f"· scan {diag.get('ltf', '5m')} · HTF {diag['htf']} · "
                        f"freshness {diag.get('recent', 12)}h "
                        f"({diag.get('fresh', 0)} bars)")
-        live_rows = [s for s in st.session_state.get("setups", [])
-                     if s.meta.get("status") in OK_STATUS]
+        chosen_strategies = st.multiselect("Strategies", list(STRATEGIES),
+                                           default=list(STRATEGIES), key="bot_strategy_filter")
+        live_rows = current_only([s for s in st.session_state.get("setups", [])
+                     if s.meta.get("strategy", "BOS Retest") in chosen_strategies])
+        scan_at = st.session_state.get("last_scan_at")
+        if scan_at is not None:
+            scan_age = (pd.Timestamp.now(tz="UTC") - scan_at).total_seconds()
+            st.caption(f"Last scan: {scan_at.strftime('%Y-%m-%d %H:%M:%S UTC')} · "
+                       f"{scan_age/60:.1f} minutes ago")
+            if scan_age > 2 * chart_minutes(cap_ltf(ltf)) * 60:
+                live_rows = []
+                st.warning("Scan is too old for a current-entry decision. Run scan again.")
+        best_per_coin = st.checkbox("Show only the best strategy per coin", value=True)
+        if best_per_coin:
+            unique = {}
+            for candidate in live_rows:
+                unique.setdefault(candidate.symbol, candidate)
+            live_rows = list(unique.values())
         if diag and not live_rows:
             st.info("Nothing executable in this window. Raise freshness hours, "
                     "keep Relax on, or lower the minimum grade.")
+        if live_rows:
+            st.caption("Strategy candidates are rule-based, not guaranteed returns. 'Confidence' is a heuristic unless calibrated on sufficient out-of-sample trades.")
+            st.dataframe(pd.DataFrame([{
+                "Coin": s.symbol, "Strategy": s.meta.get("strategy", s.pattern),
+                "Score": _norm(s.meta.get("r")).get("confidence", 0),
+                "Side": s.direction.upper(), "Status": s.meta.get("status"),
+                "Grade": _norm(s.meta.get("r")).get("grade", "—"),
+                "Entry": s.entry, "Stop": s.stop, "TP1": s.tp1, "TP2": s.tp2,
+                "Weighted R:R": round(s.weighted_rr, 2),
+                "Potential gross % to TP2 (not guaranteed)": round(abs(s.tp2/s.entry-1)*100, 2),
+            } for s in live_rows]), hide_index=True, use_container_width=True)
         for s in live_rows[:10]:
             r = _norm(s.meta.get("r"))
             with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
-                             f"{s.meta.get('status')}"):
+                             f"{s.meta.get('strategy', s.pattern)} · {s.meta.get('status')}"):
                 st.write(f"**Pair** {s.meta.get('htf')}/{s.meta.get('ltf')} · "
                          f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
                          f"**TP1** {s.tp1:,.6g} ({s.rr1:.2f}R) · "
@@ -1131,13 +1183,17 @@ with T["SMC"]:
 
                 disp = df
                 if chart_minutes(chart_tf) < chart_minutes(smc_tf):
-                    d2, _v = _load(ex, used, data_tf(chart_tf), 800)
+                    d2, _v = _load(ex, used, data_tf(chart_tf), CHART_BARS)
                     if d2 is not None:
+                        disp = d2
+                elif len(disp) < CHART_BARS:
+                    d2, _v = _load(ex, used, data_tf(chart_tf), CHART_BARS)
+                    if d2 is not None and len(d2) > len(disp):
                         disp = d2
                 st.plotly_chart(chart.build(disp, cfg, side, plan,
                                             chart_tf=chart_tf, analysis_df=cdf,
                                             htf_df=hdf_c, ltf_df=ldf_c,
-                                            pair=(htf_tf, ltf_tf)),
+                                            pair=(htf_tf, ltf_tf), symbol=used),
                                 use_container_width=True,
                                 config={"scrollZoom": True, "displaylogo": False})
                 st.caption("Gutter: blue = HTF profile (left half), orange = "
@@ -1331,17 +1387,37 @@ if MODE == "Bot":
 
 if MODE == "Bot":
     with T["Backtest"]:
-        ui.section("Backtest", "Same filters, next-open fills.")
+        ui.section("Backtest", "Independent strategy backtesting · historical simulation, next-open fills.")
+        st.caption("Each strategy is tested separately. These are historical hypotheses, not proof of future profitability.")
         b1, b2 = st.columns(2)
         bt_sym = b1.text_input("Symbol", "BTC/USDT:USDT", key="bt_sym")
         bt_bars = b2.number_input("Bars", 500, 20000, 6000, step=500)
+        bt_strategy = st.selectbox("Strategy", list(STRATEGIES) + ["Compare all seven"],
+                                   key="bt_strategy")
         st.caption(f"runs on {cap_ltf(ltf)} — the same timeframe the scan uses.")
         if st.button("Run backtest", type="primary"):
             try:
                 with st.spinner("Running..."):
+                    if bt_strategy == "Compare all seven":
+                        comparison = []
+                        for strategy_name in STRATEGIES:
+                            cr, tr, nr, nk, nb = cached_backtest(
+                                exch, bt_sym, ltf, int(bt_bars), min_rr, max_stop_atr,
+                                risk_pct, equity, exch, proxy.strip() or None, strategy_name)
+                            if cr is not None:
+                                stats = report(tr, cr, build_cfg(exch, 40, 30e6, ltf,
+                                                    min_rr, max_stop_atr, risk_pct, equity))
+                                comparison.append({"Strategy": strategy_name, "Raw": nr,
+                                    "Filtered": nk, "Trades": len(tr),
+                                    "Expectancy (R)": stats.get("expectancy_R"),
+                                    "Max drawdown (%)": stats.get("max_dd_pct")})
+                        st.dataframe(pd.DataFrame(comparison), hide_index=True,
+                                     use_container_width=True)
+                        st.caption("In-sample comparison only; do not rank future profits from this table.")
+                        st.stop()
                     curve, trades, raw_n, kept_n, bars_n = cached_backtest(
                         exch, bt_sym, ltf, int(bt_bars), min_rr, max_stop_atr,
-                        risk_pct, equity, exch, proxy.strip() or None)
+                        risk_pct, equity, exch, proxy.strip() or None, bt_strategy)
                 if curve is None:
                     st.warning(f"Not enough history for {bt_sym}: the venue "
                                f"returned fewer than 200 bars of {cap_ltf(ltf)}. "

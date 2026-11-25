@@ -66,13 +66,13 @@ def test_lookahead_free_structure():
 
 
 def test_evaluate_returns_none_without_data():
-    assert reversal.evaluate("X", None, None, CFG) is None
+    assert reversal.evaluate("X", {}, CFG) is None
 
 
 def test_active_entry_requires_rr_and_new():
     hdf = frame(400, "30min", seed=11)
     ldf = frame(400, "3min", seed=12)
-    row = reversal.evaluate("X", hdf, ldf, CFG)
+    row = reversal.evaluate("X", {"30m": hdf, "3m": ldf}, CFG)
     if row is None:
         pytest.skip("synthetic series produced no candidate zone")
     assert row["status"] in reversal.STATUSES

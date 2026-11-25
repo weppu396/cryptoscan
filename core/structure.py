@@ -45,6 +45,7 @@ def build_structure(df: pd.DataFrame, cfg) -> pd.DataFrame:
     highs: list[dict] = []
     lows:  list[dict] = []
     state = "unclear"
+    broken_high = broken_low = -1
     close = df["close"].values
 
     for t in range(n):
@@ -70,12 +71,12 @@ def build_structure(df: pd.DataFrame, cfg) -> pd.DataFrame:
         if len(highs) >= 2:
             sw_high[t] = highs[-2]["price"]
 
-        if highs and close[t] > highs[-1]["price"]:
+        if highs and highs[-1]["idx"] > broken_high and close[t] > act_h[t]:
             (bos_up if state == "up" else ch_up)[t] = True
-            highs.pop()                     # level consumed
-        if lows and close[t] < lows[-1]["price"]:
+            broken_high = highs[-1]["idx"]
+        if lows and lows[-1]["idx"] > broken_low and close[t] < act_l[t]:
             (bos_dn if state == "down" else ch_dn)[t] = True
-            lows.pop()
+            broken_low = lows[-1]["idx"]
 
     return pd.DataFrame({
         "trend": trend, "bos_up": bos_up, "bos_dn": bos_dn,

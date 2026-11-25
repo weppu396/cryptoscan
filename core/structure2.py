@@ -10,7 +10,7 @@ only honest anchor for a structure line.
 
 Break rules, non-repainting:
 
-* A level is armed only by a pivot whose bar formed AFTER the previous break, so
+* A level is armed only by a pivot whose bar formed on or after the previous break, so
   a stale pivot can never be re-used.
 * A level can only break on a bar strictly AFTER the bar that confirmed it, so
   nothing fires on the confirmation bar itself.
@@ -109,12 +109,12 @@ def _layer(df, sym, tf, layer, left, right, eq_tol, inv_bars, close_based):
         for s in by_conf.get(t, []):
             if s.kind == "H":
                 last_h = (last_h + [s])[-2:]
-                eligible = s.idx > last_break and (state != "up" or s.price > last_level)
+                eligible = s.idx >= last_break and (state != "up" or s.price > last_level)
                 if eligible and (bull is None or (state != "down" and s.price > bull[0])):
                     bull = (s.price, t, s)
             else:
                 last_l = (last_l + [s])[-2:]
-                eligible = s.idx > last_break and (state != "down" or s.price < last_level)
+                eligible = s.idx >= last_break and (state != "down" or s.price < last_level)
                 if eligible and (bear is None or (state != "up" and s.price < bear[0])):
                     bear = (s.price, t, s)
 

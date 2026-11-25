@@ -402,6 +402,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             labels = []
             tf = htf_label if layer == Layer.EXTERNAL else ltf_label
             layer_name = "HTF" if layer == Layer.EXTERNAL else "LTF"
+            source_minutes = chart_minutes(tf)
+            source_period = pd.Timedelta(minutes=source_minutes)
+            finer_display = chart_tf is not None and step_min < source_minutes
+            bars_per_source = source_minutes / step_min
+            aligned_bars = finer_display and np.isclose(bars_per_source, round(bars_per_source))
             for row in marks:
                 e = row["e"]
                 break_side = _sv(e, "direction", "")
@@ -412,19 +417,32 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 if tag:
                     text += f" {tag}"
                 labels.append(text)
-                _struct(fig, f.index[swing_idx], row["level"], structure_end, col_line, w,
+                wick_time = f.index[swing_idx]
+                if aligned_bars:
+                    first, end = hist.index.searchsorted([wick_time, wick_time + source_period])
+                    wick_column = "high" if break_side == "bull" else "low"
+                    matching = hist.iloc[first:end]
+                    exact = np.isclose(matching[wick_column], row["level"], rtol=1e-10, atol=0)
+                    if exact.any():
+                        wick_time = matching.index[np.flatnonzero(exact)[0]]
+                _struct(fig, wick_time, row["level"], structure_end, col_line, w,
                         dash="dash" if _lab(e) == "CHoCH" else "solid")
                 confirmed = int(_sv(e, "confirm_idx"))
+                source_start = f.index[confirmed]
+                close_time = source_start + source_period
                 fig.add_trace(go.Scatter(
-                    x=[f.index[confirmed]], y=[row["level"]], mode="markers",
+                    x=[close_time if finer_display else source_start],
+                    y=[row["level"]], mode="markers",
                     marker=dict(symbol="diamond", size=6, color=col_line),
                     hovertemplate=(f"{layer_name} {tf} · {text}<br>"
-                                   f"Confirmation %{{x}} · close {f['close'].iat[confirmed]:,.6g}"
-                                   "<extra></extra>"),
+                                   f"{close_time.tz_convert('UTC'):%d %b %H:%M:%S} UTC close: "
+                                   f"{f['close'].iat[confirmed]:,.6g}<extra></extra>"),
                     showlegend=False), row=1, col=1)
-            if labels:
-                legend_rows.append(f'<span style="color:{col_line}">{layer_name} {tf}</span>'
-                                   f' · {" &nbsp; | &nbsp; ".join(labels)}')
+            state = frame.state_at(layer, t_l) if hasattr(frame, "state_at") else "unclear"
+            trend = {"up": "bullish", "down": "bearish"}.get(state, "unconfirmed")
+            if labels or state in ("up", "down"):
+                legend_rows.append(f'<span style="color:{col_line}">{layer_name} {tf} {trend}</span>'
+                                   + (f' · {" &nbsp; | &nbsp; ".join(labels)}' if labels else ""))
 
     zone_levels = []
     if "zones" in on:

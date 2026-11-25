@@ -95,7 +95,7 @@ def test_close_through_protected_higher_low_turns_bullish_layer_bearish():
                                       invalidate_bars=0))
     f = run(df, "TEST", "5m", cfg)
     internal = [event for event in f.events if event.layer == Layer.INTERNAL]
-    assert [event.label for event in internal] == [Label.BOS_INIT, Label.BOS, Label.CHoCH]
+    assert [event.label for event in internal] == [Label.BOS_INIT, Label.BOS, Label.BOS, Label.CHoCH]
     shift = internal[-1]
     assert shift.swing_idx == 7
     assert shift.confirm_idx == 9
@@ -147,3 +147,39 @@ def test_trade_boxes_and_both_zone_sides_render(side, stop, tp1, tp2):
     assert len([a for a in fig.layout.annotations if "Supply " in a.text]) == 2
     history = fig.layout.updatemenus[0].buttons[-1]
     assert history.label == "Fit history"
+
+
+@pytest.mark.parametrize("sign,side", [(1, "bull"), (-1, "bear")])
+def test_breakout_candle_can_be_the_next_confirmed_swing(sign, side):
+    from tests.fixtures import price_series
+
+    df = price_series([100 + sign * offset for offset in (0, 5, 2, 6, 4, 8)])
+    cfg = replace(CFG, struct=replace(CFG.struct, int_left=1, int_right=1,
+                                      invalidate_bars=0))
+    events = [event for event in run(df, "TEST", "5m", cfg).events
+              if event.layer == Layer.INTERNAL and event.direction == side]
+    assert [(e.label, e.swing_idx, e.confirm_idx) for e in events] == [
+        (Label.BOS_INIT, 1, 3), (Label.BOS, 3, 5),
+    ]
+
+
+def test_finer_chart_marks_source_close_and_matching_wick():
+    from tests.fixtures import price_series
+
+    source = price_series([100, 105, 102, 106, 104, 108])
+    source.index = pd.date_range("2026-01-01", periods=len(source), freq="30min", tz="UTC")
+    display = price_series([100] * 60)
+    display.index = pd.date_range(source.index[0], periods=60, freq="3min", tz="UTC")
+    fine_wick = source.index[3] + pd.Timedelta(minutes=12)
+    display.loc[fine_wick, "high"] = source.high.iloc[3]
+    cfg = replace(CFG, struct=replace(CFG.struct, ext_left=1, ext_right=1,
+                                      invalidate_bars=0))
+    frame = run(source, "TEST", "30m", cfg)
+    fig = chart2.build(display, frame, "long", layers={"breaks"}, cfg=cfg,
+                       frames={Layer.EXTERNAL: source}, chart_tf="3m")
+    bos_line = next(s for s in fig.layout.shapes if s.line.color == chart2.HTF_LINE
+                    and s.y0 == source.high.iloc[3])
+    assert bos_line.x0 == fine_wick
+    assert any(t.x[0] == source.index[5] + pd.Timedelta(minutes=30)
+               for t in fig.data if t.type == "scatter" and "BULL BOS " in t.hovertemplate)
+    assert any("HTF 30m bullish" in a.text for a in fig.layout.annotations)

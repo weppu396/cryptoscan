@@ -104,8 +104,9 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         bias = (pit.bias_at(htf, df.index[-1], lambda f: _bias(f, cfg))
                 if htf is not None else "unclear")
 
-        frame = s2.run(df, used, setup_tf, cfg)
-        t = len(df) - 1
+        closed = df.iloc[:-1]
+        frame = s2.run(closed, used, setup_tf, cfg)
+        t = len(closed) - 1
         ext = frame.state_at(Layer.EXTERNAL, t)
         inn = frame.state_at(Layer.INTERNAL, t)
         ranging = bool(frame.ranging[t]) if frame.ranging else False
@@ -187,14 +188,12 @@ def render(exch, top, min_vol, min_rr, max_stop_atr, risk_pct, equity, proxy,
         _panel(nav)
 
         try:
-            frames = {}
-            if htf is not None and len(htf):
-                frames[Layer.EXTERNAL] = htf
-            frames[Layer.INTERNAL] = df
+            frames = {Layer.EXTERNAL: closed, Layer.INTERNAL: closed}
             st.plotly_chart(
                 chart2.build(df, frame, side,
                              {"entry": entry, "stop": inval, "tp1": tp1, "tp2": tp2},
-                             mode=mode, cfg=cfg, frames=frames),
+                             mode=mode, cfg=cfg, frames=frames, htf_df=htf,
+                             ltf_df=df, chart_tf=setup_tf),
                 use_container_width=True, config={"scrollZoom": True})
         except Exception as e:
             st.warning(f"chart unavailable: {type(e).__name__}: {e}")

@@ -115,8 +115,9 @@ def structure_lines(df, cfg, tf_label: str, grade: str,
 def marks(adf, cfg, htf_df, gap: float,
           max_major: int = 2, max_minor: int = 3):
     """(majors, minors) event marks. Kept for callers that want events."""
+    max_major, max_minor = max(0, max_major), max(0, max_minor)
     majors, minors = [], []
-    if htf_df is not None and len(htf_df) > 30:
+    if max_major and htf_df is not None and len(htf_df) > 30:
         h = _closed(htf_df)
         try:
             majors = collect(build_structure(h, cfg.structure), h, max_major)
@@ -124,13 +125,14 @@ def marks(adf, cfg, htf_df, gap: float,
             majors = []
     m = _closed(adf)
     try:
-        minors = collect(build_structure(m, cfg.structure), m, max_minor)
+        if max_minor:
+            minors = collect(build_structure(m, cfg.structure), m, max_minor)
     except Exception:
         minors = []
-    majors = thin(majors, gap)
+    majors = thin(majors, gap)[-max_major:]
     minors = [x for x in thin(minors, gap)
               if all(abs(x["level"] - k["level"]) > gap for k in majors)]
-    return majors, minors
+    return majors, minors[-max_minor:]
 
 
 def volume_zones(df, cfg, tf_label: str, grade: str, direction: str,

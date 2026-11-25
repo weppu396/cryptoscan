@@ -4,8 +4,8 @@ Each layer is placed on its own source frame: external events are indexed in the
 HTF frame, internal events in the LTF frame. Feeding both layers from one frame
 is what made an opposing LTF impossible to draw.
 
-Structure lines are BOS only. A BOS line sits on the pivot that broke — HH/HL in
-an uptrend, LH/LL in a downtrend — and the pivot tag is printed in the label.
+Structure lines are BOS only. A BOS line sits on the pivot wick that broke — a higher high in
+an uptrend or a lower low in a downtrend — and the pivot tag is printed in the label.
 CHoCH is not given a horizontal line; the pivot labels carry that information.
 
 Window: the visible span is derived from the structure timeframes, not from a
@@ -46,7 +46,7 @@ BG = "#0f1116"
 MODES = ("structure", "analysis", "execution")
 LAYERS = {
     "structure": {"candles", "ext_swing", "int_swing", "breaks", "tags", "plan"},
-    "analysis": {"candles", "ext_swing", "breaks", "zones", "fvg", "sweeps",
+    "analysis": {"candles", "ext_swing", "int_swing", "breaks", "zones", "fvg", "sweeps",
                  "vp", "avwap", "plan"},
     "execution": {"candles", "zone", "plan"},
 }
@@ -289,8 +289,11 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         keep = max(1, int(getattr(cfg.structure, "line_keep", MAX_MARKS)))
         zone_keep = max(1, int(getattr(cfg.structure, "zone_keep", 1)))
 
-    htf_label, ltf_label = (pair if pair else ("30m", "3m"))
-    htf_label, ltf_label = cap_htf(htf_label), cap_ltf(ltf_label)
+    if pair:
+        htf_label, ltf_label = cap_htf(pair[0]), cap_ltf(pair[1])
+    else:
+        source_tf = getattr(frame, "timeframe", "")
+        htf_label, ltf_label = (source_tf, source_tf) if source_tf else ("30m", "3m")
     if htf_df is None:
         try:
             htf_df = resample(adf, htf_label) if len(adf) > 60 else None
@@ -336,17 +339,18 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
         whiskerwidth=0.6, showlegend=False), row=1, col=1)
 
     swings = _swings(frame)
-    atr_ref = float((hist["high"] - hist["low"]).tail(50).median() or 0.0)
-    eq_tol = EQ_TOL_ATR * atr_ref
-
     pts_by_layer = {}
     tags_by_layer = {}
     idx_by_layer = {}
     for layer in (Layer.EXTERNAL, Layer.INTERNAL):
         pts = [s for s in swings if _lay(s) == layer.value]
         pts_by_layer[layer] = pts
-        tags_by_layer[layer] = _classify(pts, atr_ref, eq_tol)
-        idx_by_layer[layer] = {int(_sv(s, "idx", -1)): s for s in pts}
+        source = layer_frame(layer)
+        atr_ref = float((source["high"] - source["low"]).tail(50).median())
+        eq_ratio = cfg.struct.eq_tol_atr if cfg is not None else EQ_TOL_ATR
+        tags_by_layer[layer] = _classify(pts, atr_ref, eq_ratio * atr_ref)
+        idx_by_layer[layer] = {(int(_sv(s, "idx", -1)), _sv(s, "kind")): s
+                               for s in pts}
 
     for layer in (Layer.EXTERNAL, Layer.INTERNAL):
         key = "ext_swing" if layer == Layer.EXTERNAL else "int_swing"
@@ -381,6 +385,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             t_l = len(f) - 1
             bos = [e for e in _live(frame, t_l) if _lay(e) == layer.value
                    and _lab(e) in BOS_LABELS
+                   and 0 <= int(_sv(e, "swing_idx", -1)) < len(f)
                    and int(_sv(e, "break_idx", 0)) < len(f)
                    and f.index[int(_sv(e, "break_idx", 0))] >= start
                    and int(_sv(e, "confirm_idx", 0)) <= t_l]
@@ -392,10 +397,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
             by_idx = idx_by_layer[layer]
             for row in bos[-keep:]:
                 e = row["e"]
-                pivot = by_idx.get(int(_sv(e, "swing_idx", -1)))
+                break_side = _sv(e, "direction", "")
+                swing_idx = int(_sv(e, "swing_idx"))
+                pivot = by_idx.get((swing_idx, "H" if break_side == "bull" else "L"))
                 tag = tags.get(id(pivot), "") if pivot is not None else ""
-                _struct(fig, row["ts"], row["level"], right, col_line, w,
-                        f"{_sv(e, 'direction', '').upper()} BOS", tag)
+                _struct(fig, f.index[swing_idx], row["level"], right, col_line, w,
+                        f"{break_side.upper()} {_lab(e)}", tag)
 
     if "zones" in on:
         try:

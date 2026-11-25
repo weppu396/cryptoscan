@@ -25,8 +25,10 @@ def test_sizer_rejects_bad_stop():
 
 
 def test_liquidation_flag():
-    r = sizer.size(10_000, 0.5, 100.0, 99.0, "long", 2)
-    assert r["liq_safe"] is False
+    safe = sizer.size(10_000, 0.5, 100.0, 99.0, "long", 2)
+    unsafe = sizer.size(10_000, 0.5, 100.0, 99.0, "long", 100)
+    assert safe["liq"] < 99.0 and safe["liq_safe"] is True
+    assert unsafe["liq"] > 99.0 and unsafe["liq_safe"] is False
 
 
 def test_config_defaults_unchanged():
@@ -34,7 +36,7 @@ def test_config_defaults_unchanged():
     assert c.risk.risk_per_trade_pct == 0.5
     assert c.risk.min_rr == 2.0
     assert c.structure.swing_left == 3
-    assert c.scan.ltf == "4h"
+    assert c.scan.ltf == "5m"
 
 
 def test_playbook_shape():
@@ -47,10 +49,10 @@ def test_playbook_shape():
 
 def test_candle_quality_thresholds():
     df = flat(10)
-    df.iloc[8, [0, 1, 2, 3]] = [100, 100.2, 98.6, 100.1]
+    df.iloc[8, [0, 1, 2, 3]] = [100.3, 100.4, 99.9, 100.0]
     df.iloc[9, [0, 1, 2, 3]] = [99.9, 100.6, 99.8, 100.5]
-    name, score = quality(df, 9, 1.0, "long")
-    assert score >= 60
+    assert quality(df, 9, 1.0, "long") == ("bullish engulfing", 100)
+    assert quality(df, 9, 4.0, "long") == (None, 0)
 
 
 def test_radar_majors_constant():

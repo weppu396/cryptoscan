@@ -14,7 +14,7 @@ from core.candles import quality as candle_quality
 from core.indicators import compute_all
 from core.levels import build_zones
 from core.structure import build_structure, find_swings
-from core.tfs import MINUTES, cap_htf, cap_ltf, resample
+from core.tfs import MINUTES, chart_minutes, cap_htf, cap_ltf, resample
 
 APPROACH_ATR = 1.5
 WATCH_ATR = 6.0
@@ -66,7 +66,11 @@ def _frame(src: dict, name: str):
         if base is None or not len(base):
             return None
         try:
-            return resample(base, name)
+            grouped = resample(base, name)
+            step = f"{int(chart_minutes(name))}min"
+            expected = int(chart_minutes(name) / chart_minutes(BASE))
+            counts = base["close"].resample(step).count()
+            return grouped.loc[counts.reindex(grouped.index).eq(expected)]
         except Exception:
             return None
     return None
@@ -96,22 +100,19 @@ def quality(hdf, ldf, cfg) -> float:
 
 
 def choose_htf(src: dict, cfg) -> str | None:
-    """Highest-scoring HTF from 30m / 1h. Never slower than 1h."""
-    best, best_q = None, -1.0
-    for htf in HTF_CHOICES:
-        htf = cap_htf(htf)
-        q = quality(_frame(src, htf), _frame(src, LTF_CHOICES[0]), cfg)
-        if q > best_q:
-            best, best_q = htf, q
-    return best if best_q >= 0 else None
+    """Choose a usable HTF, preferring 30m unless 1h is clearly cleaner."""
+    htf, _ltf, q = choose_pair(src, cfg)
+    return htf if q >= 0 else None
 
 
 def choose_pair(src: dict, cfg) -> tuple:
     """(htf, ltf, quality). Prefer 30m unless 1h is clearly cleaner."""
     best = None
+    preferred = cfg.scan.ltf
+    ltf_choices = LTF_CHOICES[::-1] if preferred == "5m" else LTF_CHOICES
     for htf in HTF_CHOICES:
         hdf = _frame(src, cap_htf(htf))
-        for ltf in LTF_CHOICES:
+        for ltf in ltf_choices:
             q = quality(hdf, _frame(src, ltf), cfg)
             if q < 0:
                 continue
@@ -119,7 +120,9 @@ def choose_pair(src: dict, cfg) -> tuple:
             if best is None or score > best[3]:
                 best = (cap_htf(htf), ltf, q, score)
     if best is None:
-        return (HTF_CHOICES[0], LTF_CHOICES[0], -1.0)
+        available = next((tf for tf in ltf_choices if _frame(src, tf) is not None),
+                         ltf_choices[0])
+        return (HTF_CHOICES[0], available, -1.0)
     return best[0], best[1], best[2]
 
 
@@ -260,13 +263,12 @@ def _assess(symbol, hdf, ldf, htf, ltf, cfg, already: bool, q: float):
 
 def evaluate(symbol, src: dict, cfg, already: bool = False):
     """One coin. HTF by structure, then the LTF whose setup scores highest."""
-    htf = choose_htf(src, cfg)
-    if htf is None:
+    htf, _ltf, q = choose_pair(src, cfg)
+    if q < 0:
         return None
     hdf = _frame(src, htf)
     if hdf is None or len(hdf) < MIN_HTF_BARS:
         return None
-    q = quality(hdf, _frame(src, LTF_CHOICES[0]), cfg)
     best = None
     for ltf in LTF_CHOICES:
         r = _assess(symbol, hdf, _frame(src, ltf), htf, ltf, cfg, already, q)
@@ -282,8 +284,9 @@ def rank(rows):
     live = [r for r in rows if r["status"] in
             ("ACTIVE_ENTRY", "CONFIRMED", "DEVELOPING", "APPROACHING")]
     dead = [r for r in rows if r["status"] in ("MISSED", "INVALIDATED")]
-    live.sort(key=lambda r: (not r.get("future", False),
-                             -r["score"], r["eta_min"] or 9e9))
+    live.sort(key=lambda r: (not r.get("future", r["status"] in FUTURE_STATUSES),
+                             -RANK[r["status"]], -r["score"],
+                             r["eta_min"] if r["eta_min"] is not None else float("inf")))
     dead.sort(key=lambda r: -r["score"])
     return live, dead
 

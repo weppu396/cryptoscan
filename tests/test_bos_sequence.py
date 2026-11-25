@@ -14,7 +14,7 @@ DENSE = replace(CFG, struct=replace(CFG.struct, ext_left=2, ext_right=2,
 def _df(seq):
     idx = pd.date_range("2024-01-01", periods=len(seq), freq="5min", tz="UTC")
     c = np.array(seq, float)
-    o = np.concatenate([[c[0]], c[:-1]])
+    o = c.copy()
     return pd.DataFrame({"open": o, "high": np.maximum(o, c) + 0.05,
                          "low": np.minimum(o, c) - 0.05, "close": c,
                          "volume": 1.0}, index=idx)

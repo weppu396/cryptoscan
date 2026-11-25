@@ -1,4 +1,4 @@
-"""Hand-built OHLC. Each fixture asserts an exact expected event list."""
+"""Deterministic OHLCV with known pivot and breakout candles."""
 import pandas as pd
 
 
@@ -8,29 +8,20 @@ def frame(rows):
     return df
 
 
+def price_series(prices):
+    return frame([[p, p + 0.5, p - 0.5, p, 1000] for p in prices])
+
+
 def flat(n=40, p=100.0):
-    return [[p, p + 0.5, p - 0.5, p, 1000] for _ in range(n)]
+    return price_series([p] * n)
 
 
 def down_then_internal_bull():
-    """E1: external down, internal bull break. External must not flip."""
-    rows = []
-    for i in range(20):
-        rows.append([100 - i, 101 - i, 99.5 - i, 99.8 - i, 1000])
-    for i in range(20):
-        rows.append([80 - i * 0.2, 80.5 - i * 0.2, 79.6 - i * 0.2, 79.9 - i * 0.2, 1000])
-    rows += [[79.9, 80.2, 79.7, 79.8, 1000],
-             [79.8, 80.6, 79.75, 80.5, 1000],
-             [80.5, 81.6, 80.4, 81.5, 1000]]
-    return frame(rows)
+    """Both layers break down at 13. Only the internal pivot at 20 is confirmed by 24."""
+    return price_series([100] * 6 + [95] + [99] * 6 + [94] + [93] * 6
+                        + [96] + [93] * 3 + [97])
 
 
 def equal_highs():
-    """Two confirmed highs within tolerance, then one break."""
-    rows = flat(30)
-    rows += [[100, 100.6, 99.9, 100.2, 1000],
-             [100, 100.4, 99.8, 100.0, 1000],
-             [100, 100.9, 99.9, 100.4, 1000],
-             [100, 100.3, 99.9, 100.0, 1000],
-             [100, 101.2, 99.9, 101.0, 1000]]
-    return frame(rows)
+    """Two identical high pivots at 6 and 14, then a close above both at 21."""
+    return price_series([100] * 6 + [101] + [100] * 7 + [101] + [100] * 6 + [102])

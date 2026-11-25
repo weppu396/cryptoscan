@@ -1,5 +1,5 @@
 """
-app.py - CryptoScan. Spot mode and Bot mode.
+app.py - CryptoScan. Spot mode and Trade mode.
 
     pip install -r requirements.txt
     streamlit run app.py
@@ -794,7 +794,7 @@ with st.sidebar:
     if AUTH_ON and st.button("Sign out", use_container_width=True):
         auth.logout()
 
-    MODE = st.radio("Desk", ["Spot", "Bot"], horizontal=True, index=0)
+    MODE = st.radio("Desk", ["Spot", "Trade"], horizontal=True, index=0)
 
     exch = st.selectbox("Exchange", ["auto"] + CANDIDATES, index=0,
                         help="auto walks a cloud-friendly list. Pick one "
@@ -855,7 +855,7 @@ with st.sidebar:
 
 st.markdown(
     f"""<div class="hero">
-    <h1>{'Spot accumulation desk' if MODE == 'Spot' else 'Bot swing desk'}</h1>
+    <h1>{'Spot accumulation desk' if MODE == 'Spot' else 'Trade desk'}</h1>
     <p>{'Long-only, daily structure, laddered entries into demand.' if MODE == 'Spot'
         else 'Long and short break-of-structure scanner with full playbook.'}
     {f'Signed in as <b>{USER}</b>.' if AUTH_ON else 'Local mode.'}</p>
@@ -1046,7 +1046,7 @@ if MODE == "Spot":
                 st.caption(f"{r['symbol']}: {type(e).__name__}: {e}")
 
 
-if MODE == "Bot":
+if MODE == "Trade":
     with T["Scan"]:
         ui.section("Live scan", f"Grade {min_grade}+ · last {recent}h · "
                                 f"scanning {cap_ltf(ltf)}")
@@ -1350,7 +1350,7 @@ with T["Portfolio"]:
         st.warning(f"Portfolio unavailable: {type(e).__name__}: {e}")
 
 
-if MODE == "Bot":
+if MODE == "Trade":
     with T["Paper"]:
         ui.section("Paper book", "Forward test. Promote to live only on the gate.")
         cleared, why = paper.gate()
@@ -1389,7 +1389,7 @@ if MODE == "Bot":
                                file_name="paper.json")
 
 
-if MODE == "Bot":
+if MODE == "Trade":
     with T["Backtest"]:
         ui.section("Backtest", "Independent strategy backtesting · historical simulation, next-open fills.")
         st.caption("Each strategy is tested separately. These are historical hypotheses, not proof of future profitability.")
@@ -1443,7 +1443,7 @@ if MODE == "Bot":
                 st.error(f"{type(e).__name__}: {e}")
 
 
-if MODE == "Bot":
+if MODE == "Trade":
     with T["Macro"]:
         ui.section("Macro", "Sentiment, dominance and dry powder.")
         label, ltone, notes = market.stance(fng, ov["btc_dom"], stab)
@@ -1454,7 +1454,7 @@ if MODE == "Bot":
             st.write(f"- {n}")
 
 
-if MODE == "Bot":
+if MODE == "Trade":
     with T["Alerts"]:
         ui.section("Alerts", "Telegram and email.")
         tg1, tg2 = st.columns([2, 1])
@@ -1506,7 +1506,7 @@ if MODE == "Bot":
             st.caption(st.session_state["rev_sent"])
 
 
-if MODE == "Bot":
+if MODE == "Trade":
     with T["Journal"]:
         ui.section("Journal", "Log every trade, including the ones you skipped.")
         with st.form("journal", clear_on_submit=True):
@@ -1535,7 +1535,7 @@ with T["SOP"]:
 
 with T["Analysis"]:
     if not ANALYSIS_OK:
-        st.error("Analysis module failed to load. Spot and Bot are unaffected.")
+        st.error("Analysis module failed to load. Spot and Trade are unaffected.")
         st.code(ANALYSIS_ERR, language="text")
         st.caption("Run `python check_install.py` locally to find the broken module.")
     else:

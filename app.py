@@ -710,7 +710,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def cached_shortlist(exchange, top, min_vol, min_net_rr, max_stop_atr,
+def cached_shortlist(exchange, top, min_vol, max_stop_atr,
                      risk_pct, equity, proxy):
     from strategy.shortlist import PAIRS, scan_pair, shortlist
 
@@ -730,7 +730,7 @@ def cached_shortlist(exchange, top, min_vol, min_net_rr, max_stop_atr,
             if high is None or low is None or high_symbol != low_symbol:
                 continue
             complete += 1
-            results = scan_pair(low_symbol, high, low, cfg, htf, ltf, min_net_rr, now)
+            results = scan_pair(low_symbol, high, low, cfg, htf, ltf, now)
             if results:
                 candidates.extend(results)
                 step = pd.Timedelta(minutes=chart_minutes(ltf))
@@ -927,7 +927,7 @@ if MODE == "Spot":
     NAMES = ["Overview", "Accumulate", "Setups", "SMC", "Sizer", "Radar",
              "Portfolio", "SOP", "Analysis", "Learn", "Guide"]
 else:
-    NAMES = ["Overview", "Setups", "Scan", "SMC", "Sizer", "Radar", "Portfolio",
+    NAMES = ["Overview", "Setups", "SMC", "Sizer", "Radar", "Portfolio",
              "Paper", "Backtest", "Macro", "Alerts", "Journal", "SOP", "Analysis",
              "Learn", "Guide"]
 T = dict(zip(NAMES, st.tabs(NAMES)))
@@ -982,11 +982,12 @@ def order_card(plan: dict, symbol: str, side: str, tf: str = "") -> None:
         language="text")
 
 
-with T["Setups"]:
-    board.render(cached_scan, build_cfg, _resolve, _load, _norm, order_card,
-                 notify, exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                 equity, recent, proxy.strip() or None, relax, need_smc,
-                 need_mtf, need_vol)
+if MODE == "Spot":
+    with T["Setups"]:
+        board.render(cached_scan, build_cfg, _resolve, _load, _norm, order_card,
+                     notify, exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
+                     equity, recent, proxy.strip() or None, relax, need_smc,
+                     need_mtf, need_vol)
 
 
 with T["Overview"]:
@@ -1081,10 +1082,8 @@ if MODE == "Spot":
 
 
 if MODE == "Trade":
-    with T["Scan"]:
-        ui.section("Research shortlist", "Up to four intraday and two swing plans. Manual review and demo execution.")
-        min_net_rr = st.selectbox("Minimum estimated net R to TP2", [5.0, 8.0, 16.0],
-                                  format_func=lambda value: f"{value:g}R")
+    with T["Setups"]:
+        ui.section("Research shortlist", "Up to three valid plans. Swing first, then intraday.")
         st.caption("Pairs 30m/3m, 1h/5m and 4h/30m. Net R models fees and slippage. "
                    "Funding, live spread, and fills can change the result.")
         if st.button("Run scan", type="primary"):
@@ -1092,7 +1091,7 @@ if MODE == "Trade":
             try:
                 with st.spinner("Checking closed candles and structural targets…"):
                     st.session_state["research_shortlist"] = cached_shortlist(
-                        exch, top, min_vol, min_net_rr, max_stop_atr, risk_pct, equity,
+                        exch, top, min_vol, max_stop_atr, risk_pct, equity,
                         proxy.strip() or None)
             except Exception as e:
                 st.error(f"Shortlist unavailable: {e}")
@@ -1100,20 +1099,20 @@ if MODE == "Trade":
             venue, coins, complete, scan_time, rows = st.session_state["research_shortlist"]
             now = pd.Timestamp.now(tz="UTC")
             rows = [(s, candles) for s, candles in rows
-                    if s.meta["net_tp2"] >= min_net_rr
-                    and now - s.meta["confirmed_at"] < pd.Timedelta(minutes=chart_minutes(s.meta["ltf"]))]
+                    if now - s.meta["confirmed_at"] < pd.Timedelta(minutes=chart_minutes(s.meta["ltf"]))]
             st.caption(f"{venue} · {coins} symbols · {complete} timeframe pairs loaded · "
                        f"scan ended {scan_time:%H:%M:%S} UTC")
             if not rows:
-                st.info("No fresh setup met the selected reward-to-risk and confirmation rules.")
-            focus_seen = set()
+                st.info("No fresh setup passed the confirmation and risk checks.")
+            last_bucket = None
             for s, candles in rows:
                 m = s.meta
                 bucket = "Swing" if m["htf"] == "4h" else "Intraday"
-                focus = " · first to review" if bucket not in focus_seen else ""
-                focus_seen.add(bucket)
+                if bucket != last_bucket:
+                    st.markdown(f"### {bucket} setups")
+                    last_bucket = bucket
                 with st.expander(f"{bucket} · {s.symbol} · {s.direction.upper()} · "
-                                 f"{m['strategy']} · {m['net_tp2']:.2f}R net to TP2{focus}"):
+                                 f"{m['strategy']} · {m['net_tp2']:.2f}R net to TP2"):
                     st.write(f"**Timeframes** {m['htf']} / {m['ltf']} · **Status** {m['status']} · {m['status_reason']}")
                     st.write(f"**Entry** {s.entry:,.9g} · **Stop** {s.stop:,.9g} · "
                              f"**TP1** {s.tp1:,.9g} ({m['net_tp1']:.2f}R net) · "
@@ -1135,75 +1134,12 @@ if MODE == "Trade":
                     st.plotly_chart(figure, use_container_width=True,
                                     key=f"shortlist-{s.symbol}-{m['htf']}-{m['ltf']}")
         st.divider()
-        ui.section("Live scan", f"Grade {min_grade}+ · last {recent}h · "
-                                f"scanning {cap_ltf(ltf)}")
-        if st.button("Run seven-strategy comparison scan"):
-            try:
-                with st.spinner("Scanning..."):
-                    found, diag = cached_scan(
-                        exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
-                        equity, recent, min_grade, exch, proxy.strip() or None,
-                        relax, need_smc, False, need_mtf, need_vol)
-                st.session_state["setups"] = found
-                st.session_state["diag"] = diag
-                st.session_state["last_scan_at"] = pd.Timestamp.now(tz="UTC")
-            except Exception as e:
-                st.error(f"{type(e).__name__}: {e}")
-                st.exception(e)
-        diag = st.session_state.get("diag")
-        if diag:
-            st.caption(f"venue {diag['venue']} · universe {diag['universe']} · "
-                       f"loaded {diag['loaded']} · failed {diag['err']} · raw "
-                       f"{diag['raw']} · kept {diag['kept']} · live "
-                       f"{diag.get('actionable', 0) + diag.get('better', 0)} · "
-                       f"played {diag.get('extended', 0)} · invalid "
-                       f"{diag.get('invalid', 0)} · below grade "
-                       f"{diag['below_grade']} · blank bias {diag['bias_blank']} "
-                       f"· scan {diag.get('ltf', '5m')} · HTF {diag['htf']} · "
-                       f"freshness {diag.get('recent', 12)}h "
-                       f"({diag.get('fresh', 0)} bars)")
-        chosen_strategies = st.multiselect("Strategies", list(STRATEGIES),
-                                           default=list(STRATEGIES), key="bot_strategy_filter")
-        live_rows = current_only([s for s in st.session_state.get("setups", [])
-                     if s.meta.get("strategy", "BOS Retest") in chosen_strategies])
-        scan_at = st.session_state.get("last_scan_at")
-        if scan_at is not None:
-            scan_age = (pd.Timestamp.now(tz="UTC") - scan_at).total_seconds()
-            st.caption(f"Last scan: {scan_at.strftime('%Y-%m-%d %H:%M:%S UTC')} · "
-                       f"{scan_age/60:.1f} minutes ago")
-            if scan_age > 2 * chart_minutes(cap_ltf(ltf)) * 60:
-                live_rows = []
-                st.warning("Scan is too old for a current-entry decision. Run scan again.")
-        best_per_coin = st.checkbox("Show only the best strategy per coin", value=True)
-        if best_per_coin:
-            unique = {}
-            for candidate in live_rows:
-                unique.setdefault(candidate.symbol, candidate)
-            live_rows = list(unique.values())
-        live_rows = live_rows[:6]
-        if diag and not live_rows:
-            st.info("Nothing executable in this window. Raise freshness hours, "
-                    "keep Relax on, or lower the minimum grade.")
-        if live_rows:
-            st.caption("Strategy candidates are rule-based, not guaranteed returns. 'Confidence' is a heuristic unless calibrated on sufficient out-of-sample trades.")
-            st.dataframe(pd.DataFrame([{
-                "Coin": s.symbol, "Strategy": s.meta.get("strategy", s.pattern),
-                "Score": _norm(s.meta.get("r")).get("confidence", 0),
-                "Side": s.direction.upper(), "Status": s.meta.get("status"),
-                "Grade": _norm(s.meta.get("r")).get("grade", "—"),
-                "Entry": s.entry, "Stop": s.stop, "TP1": s.tp1, "TP2": s.tp2,
-                "Weighted R:R": round(s.weighted_rr, 2),
-                "Potential gross % to TP2 (not guaranteed)": round(abs(s.tp2/s.entry-1)*100, 2),
-            } for s in live_rows]), hide_index=True, use_container_width=True)
-        for s in live_rows[:10]:
-            r = _norm(s.meta.get("r"))
-            with st.expander(f"{r['grade']} · {s.symbol} · {s.direction.upper()} · "
-                             f"{s.meta.get('strategy', s.pattern)} · {s.meta.get('status')}"):
-                st.write(f"**Pair** {s.meta.get('htf')}/{s.meta.get('ltf')} · "
-                         f"**Entry** {s.entry:,.6g} · **Stop** {s.stop:,.6g} · "
-                         f"**TP1** {s.tp1:,.6g} ({s.rr1:.2f}R) · "
-                         f"**TP2** {s.tp2:,.6g} ({s.rr2:.2f}R) · "
-                         f"weighted {s.weighted_rr:.2f}R")
+        if st.toggle("Show full seven-strategy board", key="trade_full_board"):
+            st.caption("Browse the broader strategy list with alerts and paper trade controls.")
+            board.render(cached_scan, build_cfg, _resolve, _load, _norm, order_card,
+                         notify, exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
+                         equity, recent, proxy.strip() or None, relax, need_smc,
+                         need_mtf, need_vol)
 
 
 with T["SMC"]:

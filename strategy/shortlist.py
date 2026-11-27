@@ -52,7 +52,7 @@ def _net_rr(setup, cfg, target):
     return (abs(target - setup.entry) - (setup.entry + target) * friction) / loss
 
 
-def scan_pair(symbol, high, low, cfg, htf, ltf, min_net_rr, now):
+def scan_pair(symbol, high, low, cfg, htf, ltf, now):
     if high is None or low is None or len(high) < 60 or len(low) < 60:
         return []
     h_step = pd.Timedelta(minutes=chart_minutes(htf))
@@ -140,7 +140,7 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, min_net_rr, now):
         status, reason = assess(setup, low, max_age_bars=0,
                                 now=now, timeframe_seconds=l_step.total_seconds())
         net1, net2 = (_net_rr(setup, cfg, target) for target in (setup.tp1, setup.tp2))
-        if status not in ACTIVE or net1 < 1.0 or net2 < min_net_rr:
+        if status not in ACTIVE or net1 < 1.0:
             continue
         setup.meta.update(htf=htf, ltf=ltf, status=status, status_reason=reason,
                           net_tp1=net1, net_tp2=net2, net_weighted=(net1 + net2) / 2,
@@ -151,11 +151,12 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, min_net_rr, now):
 
 
 def shortlist(candidates):
-    """Reserve up to two swing plans and four intraday plans, one per coin."""
-    best = sorted(candidates, key=lambda s: (-s.meta["candle_score"],
-                                            -s.meta["net_weighted"], s.symbol))
+    """Return up to three plans, with at most two swing plans and one per coin."""
+    best = sorted(candidates, key=lambda s: (-s.meta["net_tp2"], -s.meta["net_weighted"],
+                                            -s.meta["candle_score"], s.symbol))
     chosen, used = [], set()
-    for swing, limit in ((True, 2), (False, 4)):
+    for swing in (True, False):
+        limit = 2 if swing else 3 - len(chosen)
         count = 0
         for setup in best:
             coin = setup.symbol.split("/")[0]

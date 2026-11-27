@@ -9,17 +9,17 @@ from core.models import Layer
 from strategy import shortlist as research
 
 
-def test_shortlist_caps_each_bucket_and_deduplicates_coin():
+def test_shortlist_prioritizes_swing_and_ranks_by_net_reward_to_risk():
     def row(symbol, htf, score):
         return SimpleNamespace(symbol=symbol, meta={"htf": htf, "candle_score": score,
-                                                    "net_weighted": 4.0})
+                                                    "net_weighted": 4.0, "net_tp2": score / 25})
     rows = [row(f"S{i}/USDT", "4h", 100 - i) for i in range(4)]
     rows += [row(f"D{i}/USDT", "30m", 95 - i) for i in range(8)]
     rows.append(row("S0/USDT", "1h", 100))
     selected = research.shortlist(rows)
-    assert len(selected) == 6
+    assert len(selected) == 3
     assert sum(s.meta["htf"] == "4h" for s in selected) == 2
-    assert len({s.symbol for s in selected}) == 6
+    assert [s.symbol for s in selected] == ["S0/USDT", "S1/USDT", "D0/USDT"]
 
 
 def test_channel_uses_structural_boundaries_and_rejects_a_broken_channel():
@@ -37,7 +37,7 @@ def test_channel_uses_structural_boundaries_and_rejects_a_broken_channel():
     assert research._channel(frame, swings, "long", 2.0, index[-1]) is None
 
 
-def test_high_rr_gate_keeps_structural_targets_and_skips_impossible_threshold(monkeypatch):
+def test_shortlist_keeps_valid_structural_targets_below_five_r(monkeypatch):
     close_ts = pd.Timestamp("2026-01-01 12:00", tz="UTC")
     high_ix = pd.date_range(end=close_ts - pd.Timedelta(hours=4), periods=80, freq="4h")
     low_ix = pd.date_range(end=close_ts - pd.Timedelta(minutes=30), periods=80, freq="30min")
@@ -55,11 +55,11 @@ def test_high_rr_gate_keeps_structural_targets_and_skips_impossible_threshold(mo
                                                    index=df.index))
     monkeypatch.setattr(research, "find_swings", lambda *a: [])
     monkeypatch.setattr(research, "_channel",
-                        lambda *a: (100, 110, high_ix[1], high_ix[2], 85, 86))
-    rows = research.scan_pair("TEST/USDT", high, low, CFG, "4h", "30m", 5, close_ts)
+                        lambda *a: (100, 104, high_ix[1], high_ix[2], 85, 86))
+    rows = research.scan_pair("TEST/USDT", high, low, CFG, "4h", "30m", close_ts)
     assert len(rows) == 1
     setup = rows[0]
-    assert (setup.entry, setup.stop, setup.tp1, setup.tp2) == (100.5, 99.55, 105, 110)
+    assert (setup.entry, setup.stop, setup.tp1, setup.tp2) == (100.5, 99.55, 102, 104)
     assert setup.meta["net_tp2"] < setup.rr2
     assert setup.meta["net_weighted"] == pytest.approx((setup.meta["net_tp1"] + setup.meta["net_tp2"]) / 2)
-    assert not research.scan_pair("TEST/USDT", high, low, CFG, "4h", "30m", 16, close_ts)
+    assert 1 < setup.meta["net_tp2"] < 5

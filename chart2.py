@@ -338,6 +338,12 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     structure_end = plan_start - plot_step * 0.10 if has_plan else right
     start = hist.index[0]
     legend_rows = []
+    focus_times = []
+    focus_prices = []
+    setup_level = float(plan["bos_level"]) if has_plan and plan.get("bos_level") is not None else None
+    setup_time = pd.to_datetime(plan.get("bos_time"), utc=True) if setup_level is not None else None
+    has_setup_bos = (setup_time is not None and not pd.isna(setup_time)
+                     and np.isfinite(setup_level) and start <= setup_time <= structure_end)
 
     fig = make_subplots(rows=1, cols=1)
     gutter_ref, gutter_prop = _gutter(fig)
@@ -414,8 +420,9 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                       if _lab(e) == "CHoCH" and int(_sv(e, "confirm_idx")) == shift]
             # Prefer the latest BOS for the endpoint label. If a layer only
             # has a CHoCH to show, the label identifies that event explicitly.
-            endpoint = next((row for row in reversed(marks)
-                             if _lab(row["e"]) in BOS_LABELS), marks[-1] if marks else None)
+            endpoint = next((row for row in reversed(marks) if _lab(row["e"]) == "BOS"),
+                            next((row for row in reversed(marks) if _lab(row["e"]) == "BOS_INIT"),
+                                 marks[-1] if marks else None))
             labels = []
             tf = htf_label if layer == Layer.EXTERNAL else ltf_label
             layer_name = "HTF" if layer == Layer.EXTERNAL else "LTF"
@@ -447,13 +454,17 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                         wick_time = matching.index[np.flatnonzero(exact)[0]]
                 _struct(fig, wick_time, row["level"], structure_end, col_line, w,
                         dash="dash" if _lab(e) == "CHoCH" else "solid")
-                if layer == Layer.EXTERNAL and row is endpoint:
+                if row is endpoint and (layer == Layer.EXTERNAL or not has_setup_bos):
+                    focus_times.extend((wick_time, f.index[int(_sv(e, "confirm_idx"))]))
+                    focus_prices.append(row["level"])
                     event_type = "BOS init" if _lab(e) == "BOS_INIT" else _lab(e)
                     history_text = " · historical" if historical else ""
                     fig.add_annotation(
-                        name="htf-structure-endpoint", x=structure_end, y=row["level"],
-                        xref="x", yref="y", xanchor="right", yanchor="bottom", yshift=7,
-                        text=f"<b>HTF {tf} {break_side.upper()} {event_type}</b>"
+                        name=f"{layer_name.lower()}-structure-endpoint", x=structure_end, y=row["level"],
+                        xref="x", yref="y", xanchor="right",
+                        yanchor="bottom" if layer == Layer.EXTERNAL else "top",
+                        yshift=7 if layer == Layer.EXTERNAL else -7,
+                        text=f"<b>{layer_name} {tf} {break_side.upper()} {event_type}</b>"
                              f" · {row['level']:,.10g}{history_text}",
                         showarrow=False, bgcolor=BG, bordercolor=col_line,
                         borderwidth=1, borderpad=4, font=dict(color=col_line, size=11),
@@ -484,16 +495,23 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
                 legend_rows.append(f'<span style="color:{col_line}">{layer_name} {tf} {trend}</span>'
                                    + (f' · {" &nbsp; | &nbsp; ".join(labels)}' if labels else ""))
 
-    if has_plan and "breaks" in on and plan.get("bos_level") is not None and plan.get("bos_time") is not None:
-        signal_level = float(plan["bos_level"])
-        signal_time = pd.to_datetime(plan["bos_time"], utc=True)
-        if start <= signal_time <= structure_end and np.isfinite(signal_level):
-            already_drawn = any(shape.xref == "x" and shape.y0 == signal_level
-                                and shape.line.color == LTF_LINE for shape in fig.layout.shapes)
-            if not already_drawn:
-                _struct(fig, signal_time, signal_level, structure_end, LTF_LINE, 1.8, "solid")
-            legend_rows.append(f'<span style="color:{LTF_LINE}">Setup {ltf_label} BOS</span>'
-                               f" · {signal_level:,.10g}")
+    if "breaks" in on and has_setup_bos:
+        already_drawn = any(shape.xref == "x" and shape.y0 == setup_level
+                            and shape.line.color == LTF_LINE and shape.line.dash == "solid"
+                            for shape in fig.layout.shapes)
+        if not already_drawn:
+            _struct(fig, setup_time, setup_level, structure_end, LTF_LINE, 1.8, "solid")
+        focus_times.append(setup_time)
+        focus_prices.append(setup_level)
+        fig.add_annotation(
+            name="ltf-structure-endpoint", x=structure_end, y=setup_level,
+            xref="x", yref="y", xanchor="right", yanchor="top", yshift=-7,
+            text=f"<b>LTF {ltf_label} setup BOS</b> · {setup_level:,.10g}",
+            showarrow=False, bgcolor=BG, bordercolor=LTF_LINE, borderwidth=1,
+            borderpad=4, font=dict(color=LTF_LINE, size=11),
+        )
+        legend_rows.append(f'<span style="color:{LTF_LINE}">Setup {ltf_label} BOS</span>'
+                           f" · {setup_level:,.10g}")
 
     profiles = {}
     if "vp" in on:
@@ -624,13 +642,16 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     # Keep the history in the trace. Start planned trades at a readable price
     # scale and offer a one-click fit for older candles.
     y_ref = view if has_plan else hist
-    lo = min([float(y_ref["low"].min()), *zone_levels, *plan_levels])
-    hi = max([float(y_ref["high"].max()), *zone_levels, *plan_levels])
+    lo = min([float(y_ref["low"].min()), *zone_levels, *plan_levels, *focus_prices])
+    hi = max([float(y_ref["high"].max()), *zone_levels, *plan_levels, *focus_prices])
     pad = (hi - lo) * 0.055 or max(abs(hi), 1.0) * 0.001
     y_range = [lo - pad, hi + pad]
     history_y = [min(y_range[0], float(hist["low"].min()) - pad),
                  max(y_range[1], float(hist["high"].max()) + pad)]
     x_lo = view.index[0]
+    if focus_times:
+        left_idx = max(0, hist.index.searchsorted(min(focus_times)) - 3)
+        x_lo = min(x_lo, hist.index[left_idx])
 
     for index, text in enumerate(legend_rows):
         _legend_row(fig, text, index)
@@ -638,7 +659,7 @@ def build(df, frame, direction, plan=None, mode="analysis", layers=None,
     fig.update_layout(height=640 + 17 * len(legend_rows), template="plotly_dark", paper_bgcolor=BG,
                       plot_bgcolor=BG, margin=dict(l=62, r=10, t=100, b=45 + 17 * len(legend_rows)),
                       showlegend=False, hovermode="x unified", dragmode="pan", barmode="overlay",
-                      uirevision=f"layout-4|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
+                      uirevision=f"layout-5|{symbol or 'unknown'}|{chart_tf or ''}|{htf_label}|{ltf_label}",
                       title=dict(text=f"chart {chart_tf or ''} · structure "
                                       f"{htf_label} (HTF) / {ltf_label} (LTF) · "
                                       f"volume estimate · green up / red down",

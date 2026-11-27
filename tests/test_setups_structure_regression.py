@@ -310,3 +310,25 @@ def test_zone_ranks_volume_over_recency_on_same_timeframe():
     assert zones[0]["ts"] == df.index[31]  # last green candle, immediately before the impulse
     assert zones[0]["profile_share"] == pytest.approx(0.8)
     assert not chart_zones(df, CFG, trend="unclear")
+
+
+def test_initial_chart_fits_both_bos_levels_and_old_source_wicks():
+    from core.models import StructureEvent, StructureFrame
+    from tests.fixtures import price_series
+
+    df = price_series([100.0] * 240)
+    df.index = pd.date_range("2026-01-01", periods=len(df), freq="1h", tz="UTC")
+    events = [
+        StructureEvent("htf", "TEST", "1h", Layer.EXTERNAL, Label.BOS, "bear",
+                       130, 30, 40, 40, None, "down"),
+        StructureEvent("ltf", "TEST", "5m", Layer.INTERNAL, Label.BOS, "bull",
+                       98, 220, 222, 222, None, "up"),
+    ]
+    frame = StructureFrame(events=events)
+    fig = chart2.build(df, frame, "long", cfg=CFG, pair=("1h", "5m"),
+                       chart_tf="1H", layers={"breaks"}, frames={layer: df for layer in Layer})
+    badges = {a.name: a for a in fig.layout.annotations if a.name}
+    assert badges["htf-structure-endpoint"].y == 130
+    assert badges["ltf-structure-endpoint"].y == 98
+    assert fig.layout.xaxis.range[0] < df.index[30]
+    assert fig.layout.yaxis.range[0] < 98 < 130 < fig.layout.yaxis.range[1]

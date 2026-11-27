@@ -709,6 +709,39 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
     return found, diag
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_shortlist(exchange, top, min_vol, min_net_rr, max_stop_atr,
+                     risk_pct, equity, proxy):
+    from strategy.shortlist import PAIRS, scan_pair, shortlist
+
+    cfg = build_cfg(exchange, top, min_vol, "5m", 2.0, max_stop_atr, risk_pct, equity)
+    ex, venue = _resolve(cfg, exchange, proxy)
+    symbols, _, _ = _universe(ex, int(min_vol), top)
+    candidates = []
+    charts = {}
+    complete = 0
+    timeframes = tuple(dict.fromkeys(tf for pair in PAIRS for tf in pair))
+    for symbol in symbols:
+        frames = {tf: _load(ex, symbol, tf, 300, 60) for tf in timeframes}
+        now = pd.Timestamp.now(tz="UTC")
+        for htf, ltf in PAIRS:
+            high, high_symbol = frames[htf]
+            low, low_symbol = frames[ltf]
+            if high is None or low is None or high_symbol != low_symbol:
+                continue
+            complete += 1
+            results = scan_pair(low_symbol, high, low, cfg, htf, ltf, min_net_rr, now)
+            if results:
+                candidates.extend(results)
+                step = pd.Timedelta(minutes=chart_minutes(ltf))
+                charts[(low_symbol, htf, ltf)] = low.loc[low.index + step <= now].tail(120)
+    selected = shortlist(candidates)
+    return venue, len(symbols), complete, pd.Timestamp.now(tz="UTC"), [
+        (setup, charts[(setup.symbol, setup.meta["htf"], setup.meta["ltf"])])
+        for setup in selected
+    ]
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_backtest(exchange, symbol, ltf, limit, min_rr, max_stop_atr,
                     risk_pct, equity, preferred, proxy, strategy="BOS Retest"):
@@ -1049,9 +1082,62 @@ if MODE == "Spot":
 
 if MODE == "Trade":
     with T["Scan"]:
+        ui.section("Research shortlist", "Up to four intraday and two swing plans. Manual review and demo execution.")
+        min_net_rr = st.selectbox("Minimum estimated net R to TP2", [5.0, 8.0, 16.0],
+                                  format_func=lambda value: f"{value:g}R")
+        st.caption("Pairs 30m/3m, 1h/5m and 4h/30m. Net R models fees and slippage. "
+                   "Funding, live spread, and fills can change the result.")
+        if st.button("Run scan", type="primary"):
+            st.session_state.pop("research_shortlist", None)
+            try:
+                with st.spinner("Checking closed candles and structural targets…"):
+                    st.session_state["research_shortlist"] = cached_shortlist(
+                        exch, top, min_vol, min_net_rr, max_stop_atr, risk_pct, equity,
+                        proxy.strip() or None)
+            except Exception as e:
+                st.error(f"Shortlist unavailable: {e}")
+        if "research_shortlist" in st.session_state:
+            venue, coins, complete, scan_time, rows = st.session_state["research_shortlist"]
+            now = pd.Timestamp.now(tz="UTC")
+            rows = [(s, candles) for s, candles in rows
+                    if s.meta["net_tp2"] >= min_net_rr
+                    and now - s.meta["confirmed_at"] < pd.Timedelta(minutes=chart_minutes(s.meta["ltf"]))]
+            st.caption(f"{venue} · {coins} symbols · {complete} timeframe pairs loaded · "
+                       f"scan ended {scan_time:%H:%M:%S} UTC")
+            if not rows:
+                st.info("No fresh setup met the selected reward-to-risk and confirmation rules.")
+            focus_seen = set()
+            for s, candles in rows:
+                m = s.meta
+                bucket = "Swing" if m["htf"] == "4h" else "Intraday"
+                focus = " · first to review" if bucket not in focus_seen else ""
+                focus_seen.add(bucket)
+                with st.expander(f"{bucket} · {s.symbol} · {s.direction.upper()} · "
+                                 f"{m['strategy']} · {m['net_tp2']:.2f}R net to TP2{focus}"):
+                    st.write(f"**Timeframes** {m['htf']} / {m['ltf']} · **Status** {m['status']} · {m['status_reason']}")
+                    st.write(f"**Entry** {s.entry:,.9g} · **Stop** {s.stop:,.9g} · "
+                             f"**TP1** {s.tp1:,.9g} ({m['net_tp1']:.2f}R net) · "
+                             f"**TP2** {s.tp2:,.9g} ({m['net_tp2']:.2f}R net) · "
+                             f"**50/50 exits** {m['net_weighted']:.2f}R estimated net")
+                    for reason in s.reasons:
+                        st.write(f"- {reason}")
+                    figure, _ = _detail_figure(candles, m["ltf"], bars=100, symbol=s.symbol)
+                    for level, color in ((s.entry, "#58a6ff"), (s.stop, "#ef6b73"),
+                                         (s.tp1, "#45c895"), (s.tp2, "#45c895")):
+                        figure.add_hline(y=level, line_color=color, opacity=0.65)
+                    lo, hi = figure.layout.yaxis.range
+                    levels = (s.entry, s.stop, s.tp1, s.tp2)
+                    pad = 0.03 * (max(hi, *levels) - min(lo, *levels))
+                    price_range = (min(lo, *levels) - pad, max(hi, *levels) + pad)
+                    figure.update_yaxes(range=price_range)
+                    from chart_axes import add_independent_axis_controls
+                    add_independent_axis_controls(figure, figure.layout.xaxis.range, price_range)
+                    st.plotly_chart(figure, use_container_width=True,
+                                    key=f"shortlist-{s.symbol}-{m['htf']}-{m['ltf']}")
+        st.divider()
         ui.section("Live scan", f"Grade {min_grade}+ · last {recent}h · "
                                 f"scanning {cap_ltf(ltf)}")
-        if st.button("Run scan", type="primary"):
+        if st.button("Run seven-strategy comparison scan"):
             try:
                 with st.spinner("Scanning..."):
                     found, diag = cached_scan(
@@ -1094,6 +1180,7 @@ if MODE == "Trade":
             for candidate in live_rows:
                 unique.setdefault(candidate.symbol, candidate)
             live_rows = list(unique.values())
+        live_rows = live_rows[:6]
         if diag and not live_rows:
             st.info("Nothing executable in this window. Raise freshness hours, "
                     "keep Relax on, or lower the minimum grade.")

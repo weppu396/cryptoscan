@@ -63,3 +63,19 @@ def test_shortlist_keeps_valid_structural_targets_below_five_r(monkeypatch):
     assert setup.meta["net_tp2"] < setup.rr2
     assert setup.meta["net_weighted"] == pytest.approx((setup.meta["net_tp1"] + setup.meta["net_tp2"]) / 2)
     assert 1 < setup.meta["net_tp2"] < 5
+
+
+def test_draws_both_saved_boundaries_at_their_confirmation_prices():
+    import plotly.graph_objects as go
+    from chart_axes import add_channel_boundaries
+
+    start = pd.Timestamp("2026-01-01", tz="UTC")
+    end = start + pd.Timedelta(hours=4)
+    figure = go.Figure().update_xaxes(range=[start + pd.Timedelta(hours=2), start + pd.Timedelta(hours=3)])
+    prices = add_channel_boundaries(figure, {
+        "start": start, "end": end, "lower": (90, 94), "upper": (100, 104),
+    })
+    assert prices == (102, 104, 92, 94)
+    assert [trace.name for trace in figure.data] == ["HTF channel upper", "HTF channel lower"]
+    assert all(trace.x[-1] == end for trace in figure.data)
+    assert figure.layout.xaxis.range[1] == end

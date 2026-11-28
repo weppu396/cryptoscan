@@ -1131,6 +1131,9 @@ if MODE == "Trade":
                         figure.add_hline(y=level, line_color=color, opacity=0.65)
                     lo, hi = figure.layout.yaxis.range
                     levels = (s.entry, s.stop, s.tp1, s.tp2)
+                    if m["strategy"] == "Trend Channel Retest" and m.get("channel"):
+                        from chart_axes import add_channel_boundaries
+                        levels += add_channel_boundaries(figure, m["channel"])
                     pad = 0.03 * (max(hi, *levels) - min(lo, *levels))
                     price_range = (min(lo, *levels) - pad, max(hi, *levels) + pad)
                     figure.update_yaxes(range=price_range)

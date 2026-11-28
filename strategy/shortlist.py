@@ -129,7 +129,12 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, now):
                                f"Stop {price(stop)} beyond both the channel line and retest wick, plus {cfg.risk.stop_buffer_atr:g} LTF ATR.",
                                *[f"TP{i} {price(p)} · " + ("channel midpoint" if p == mid else "opposite channel boundary" if p == far else f"confirmed {htf} opposing swing")
                                  for i, p in enumerate(targets[:2], 1)]],
-                              {"strategy": "Trend Channel Retest"})
+                              {"strategy": "Trend Channel Retest",
+                               "channel": {
+                                   "start": a_time, "end": close_stamp,
+                                   "lower": (a_price + min(0, far - near), min(near, far)),
+                                   "upper": (a_price + max(0, far - near), max(near, far)),
+                               }})
                 setup.rr = setup.rr2
                 options.append(setup)
 

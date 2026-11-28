@@ -61,3 +61,29 @@ def add_independent_axis_controls(fig, x_range, y_range, history=None):
                           showactive=False, pad=dict(t=0, b=0))],
     )
     return fig
+
+
+def add_channel_boundaries(fig, channel):
+    """Draw the saved HTF channel over the visible portion of the setup chart."""
+    import plotly.graph_objects as go
+
+    start, end = channel["start"], channel["end"]
+    x0, x1 = (pd.Timestamp(x) for x in fig.layout.xaxis.range)
+    left = max(start, x0)
+    if end <= left:
+        return ()
+    fraction = (left - start) / (end - start)
+    levels = []
+    for side, color in (("upper", "#c4a4ff"), ("lower", "#66d9c9")):
+        initial, final = channel[side]
+        visible_start = initial + (final - initial) * fraction
+        name = f"HTF channel {side}"
+        fig.add_trace(go.Scatter(
+            x=[left, end], y=[visible_start, final], mode="lines", name=name,
+            showlegend=True, line=dict(color=color, width=2.5),
+            hovertemplate=f"{name} · %{{y:,.9g}}<extra></extra>",
+        ))
+        levels.extend((visible_start, final))
+    fig.update_layout(showlegend=True)
+    fig.update_xaxes(range=[x0, max(x1, end)])
+    return tuple(levels)

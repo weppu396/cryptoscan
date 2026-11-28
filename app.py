@@ -716,7 +716,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
 
 @st.cache_data(ttl=30, show_spinner=False)
 def cached_shortlist(exchange, top, min_vol, max_stop_atr,
-                     risk_pct, equity, proxy):
+                     risk_pct, equity, proxy, swing_only=False):
     from strategy.shortlist import PAIRS, scan_pair, shortlist, signal_window
 
     cfg = build_cfg(exchange, top, min_vol, "5m", 2.0, max_stop_atr, risk_pct, equity)
@@ -725,26 +725,31 @@ def cached_shortlist(exchange, top, min_vol, max_stop_atr,
     candidates = []
     charts = {}
     complete = 0
-    timeframes = tuple(dict.fromkeys(tf for pair in PAIRS for tf in pair))
+    swing_checked = 0
+    pairs = (("4h", "30m"),) if swing_only else PAIRS
+    timeframes = tuple(dict.fromkeys(tf for pair in pairs for tf in pair))
     for symbol in symbols:
         frames = {tf: _load(ex, symbol, tf, 300, 60) for tf in timeframes}
         now = pd.Timestamp.now(tz="UTC")
-        for htf, ltf in PAIRS:
+        for htf, ltf in pairs:
             high, high_symbol = frames[htf]
             low, low_symbol = frames[ltf]
             if high is None or low is None or high_symbol != low_symbol:
                 continue
             complete += 1
+            swing_checked += int(htf == "4h")
             results = scan_pair(low_symbol, high, low, cfg, htf, ltf, now)
             if results:
                 candidates.extend(results)
                 step = pd.Timedelta(minutes=chart_minutes(ltf))
                 charts[(low_symbol, htf, ltf)] = low.loc[low.index + step <= now].tail(120)
     scan_time = pd.Timestamp.now(tz="UTC")
-    selected = shortlist(s for s in candidates
-                         if scan_time - s.meta["confirmed_at"]
-                         < signal_window(s.meta["htf"], s.meta["ltf"]))
-    return venue, len(symbols), complete, scan_time, [
+    fresh = [setup for setup in candidates
+             if scan_time - setup.meta["confirmed_at"]
+             < signal_window(setup.meta["htf"], setup.meta["ltf"])]
+    swing_qualified = len({setup.symbol for setup in fresh if setup.meta["htf"] == "4h"})
+    selected = shortlist(fresh)
+    return venue, len(symbols), complete, swing_checked, swing_qualified, scan_time, [
         (setup, charts[(setup.symbol, setup.meta["htf"], setup.meta["ltf"])])
         for setup in selected
     ]
@@ -1091,70 +1096,81 @@ if MODE == "Spot":
 
 if MODE == "Trade":
     with T["Setups"]:
-        ui.section("Research shortlist", "Up to three valid plans. Swing first, then intraday.")
-        st.caption("Pairs 30m/3m, 1h/5m and 4h/30m. Net R models fees and slippage. "
-                   "Funding, live spread, and fills can change the result.")
-        if st.button("Run scan", type="primary"):
-            st.session_state.pop("research_shortlist", None)
-            try:
-                with st.spinner("Checking closed candles and structural targets…"):
-                    st.session_state["research_shortlist"] = cached_shortlist(
-                        exch, top, min_vol, max_stop_atr, risk_pct, equity,
-                        proxy.strip() or None)
-            except Exception as e:
-                st.error(f"Shortlist unavailable: {e}")
-        if "research_shortlist" in st.session_state:
-            from strategy.shortlist import signal_window
-
-            venue, coins, complete, scan_time, rows = st.session_state["research_shortlist"]
-            now = pd.Timestamp.now(tz="UTC")
-            rows = [(s, candles) for s, candles in rows
-                    if now - s.meta["confirmed_at"] < signal_window(s.meta["htf"], s.meta["ltf"])]
-            st.caption(f"{venue} · {coins} symbols · {complete} timeframe pairs loaded · "
-                       f"scan ended {scan_time:%H:%M:%S} UTC")
-            if not rows:
-                st.info("No fresh setup passed the confirmation and risk checks.")
-            elif not any(s.meta["htf"] == "4h" for s, _ in rows):
-                st.caption("No 4h / 30m swing setup qualified in this scan.")
-            last_bucket = None
-            for s, candles in rows:
-                m = s.meta
-                bucket = "Swing" if m["htf"] == "4h" else "Intraday"
-                if bucket != last_bucket:
-                    st.markdown(f"### {bucket} setups")
-                    last_bucket = bucket
-                with st.expander(f"{bucket} · {s.symbol} · {s.direction.upper()} · "
-                                 f"{m['strategy']} · {m['net_tp2']:.2f}R net to TP2"):
-                    st.write(f"**Timeframes** {m['htf']} / {m['ltf']} · **Status** {m['status']} · {m['status_reason']}")
-                    st.write(f"**Entry** {s.entry:,.9g} · **Stop** {s.stop:,.9g} · "
-                             f"**TP1** {s.tp1:,.9g} ({m['net_tp1']:.2f}R net) · "
-                             f"**TP2** {s.tp2:,.9g} ({m['net_tp2']:.2f}R net) · "
-                             f"**50/50 exits** {m['net_weighted']:.2f}R estimated net")
-                    for reason in s.reasons:
-                        st.write(f"- {reason}")
-                    figure, _ = _detail_figure(candles, m["ltf"], bars=100, symbol=s.symbol)
-                    for level, color in ((s.entry, "#58a6ff"), (s.stop, "#ef6b73"),
-                                         (s.tp1, "#45c895"), (s.tp2, "#45c895")):
-                        figure.add_hline(y=level, line_color=color, opacity=0.65)
-                    lo, hi = figure.layout.yaxis.range
-                    levels = (s.entry, s.stop, s.tp1, s.tp2)
-                    if m["strategy"] == "Trend Channel Retest" and m.get("channel"):
-                        from chart_axes import add_channel_boundaries
-                        levels += add_channel_boundaries(figure, m["channel"])
-                    pad = 0.03 * (max(hi, *levels) - min(lo, *levels))
-                    price_range = (min(lo, *levels) - pad, max(hi, *levels) + pad)
-                    figure.update_yaxes(range=price_range)
-                    from chart_axes import add_independent_axis_controls
-                    add_independent_axis_controls(figure, figure.layout.xaxis.range, price_range)
-                    st.plotly_chart(figure, use_container_width=True,
-                                    key=f"shortlist-{s.symbol}-{m['htf']}-{m['ltf']}")
-        st.divider()
-        if st.toggle("Show full seven-strategy board", key="trade_full_board"):
-            st.caption("Browse the broader strategy list with alerts and paper trade controls.")
+        scan_view = st.radio("Setup scan", ["Swing only (4h / 30m)", "Swing first + intraday",
+                                           "Classic seven-strategy board"], horizontal=True)
+        swing_only = scan_view == "Swing only (4h / 30m)"
+        if scan_view == "Classic seven-strategy board":
+            st.caption("Classic intraday board. Standard targets can repeat across trades. "
+                       "Choose Swing only for 4h / 30m setups with structural targets.")
             board.render(cached_scan, build_cfg, _resolve, _load, _norm, order_card,
                          notify, exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                          equity, recent, proxy.strip() or None, relax, need_smc,
                          need_mtf, need_vol)
+        else:
+            ui.section("Research shortlist", "Up to three valid plans. Swing first, then intraday.")
+            st.caption(("Pairs 4h/30m. " if swing_only else "Pairs 30m/3m, 1h/5m and 4h/30m. ")
+                       + "Net R models fees and slippage. "
+                       "Funding, live spread, and fills can change the result.")
+            button = "Run 4h swing scan" if swing_only else "Run scan"
+            results_key = "swing_only_results" if swing_only else "swing_first_results"
+            if st.button(button, type="primary"):
+                st.session_state.pop(results_key, None)
+                try:
+                    with st.spinner("Checking closed candles and structural targets…"):
+                        st.session_state[results_key] = cached_shortlist(
+                            exch, top, min_vol, max_stop_atr, risk_pct, equity,
+                            proxy.strip() or None, swing_only=swing_only)
+                except Exception as e:
+                    st.error(f"Shortlist unavailable: {e}")
+            if results_key in st.session_state:
+                from strategy.shortlist import signal_window
+
+                venue, coins, complete, swing_checked, swing_qualified, scan_time, rows = st.session_state[results_key]
+                now = pd.Timestamp.now(tz="UTC")
+                rows = [(s, candles) for s, candles in rows
+                        if now - s.meta["confirmed_at"] < signal_window(s.meta["htf"], s.meta["ltf"])]
+                st.caption(f"{venue} · {coins} symbols · {complete} timeframe pairs loaded · "
+                           f"scan ended {scan_time:%H:%M:%S} UTC")
+                st.caption(f"4h / 30m: {swing_checked}/{coins} pairs loaded · "
+                           f"{swing_qualified} coins qualified at scan time")
+                if not rows and swing_only:
+                    st.info("No fresh 4h / 30m setup passed the confirmation and risk checks.")
+                elif not rows:
+                    st.info("No fresh setup passed the confirmation and risk checks.")
+                elif not any(s.meta["htf"] == "4h" for s, _ in rows):
+                    st.caption("No 4h / 30m swing setup qualified in this scan.")
+                last_bucket = None
+                for s, candles in rows:
+                    m = s.meta
+                    bucket = "Swing" if m["htf"] == "4h" else "Intraday"
+                    if bucket != last_bucket:
+                        st.markdown(f"### {bucket} setups")
+                        last_bucket = bucket
+                    with st.expander(f"{bucket} · {s.symbol} · {s.direction.upper()} · "
+                                     f"{m['strategy']} · {m['net_tp2']:.2f}R net to TP2"):
+                        st.write(f"**Timeframes** {m['htf']} / {m['ltf']} · **Status** {m['status']} · {m['status_reason']}")
+                        st.write(f"**Entry** {s.entry:,.9g} · **Stop** {s.stop:,.9g} · "
+                                 f"**TP1** {s.tp1:,.9g} ({m['net_tp1']:.2f}R net) · "
+                                 f"**TP2** {s.tp2:,.9g} ({m['net_tp2']:.2f}R net) · "
+                                 f"**50/50 exits** {m['net_weighted']:.2f}R estimated net")
+                        for reason in s.reasons:
+                            st.write(f"- {reason}")
+                        figure, _ = _detail_figure(candles, m["ltf"], bars=100, symbol=s.symbol)
+                        for level, color in ((s.entry, "#58a6ff"), (s.stop, "#ef6b73"),
+                                             (s.tp1, "#45c895"), (s.tp2, "#45c895")):
+                            figure.add_hline(y=level, line_color=color, opacity=0.65)
+                        lo, hi = figure.layout.yaxis.range
+                        levels = (s.entry, s.stop, s.tp1, s.tp2)
+                        if m["strategy"] == "Trend Channel Retest" and m.get("channel"):
+                            from chart_axes import add_channel_boundaries
+                            levels += add_channel_boundaries(figure, m["channel"])
+                        pad = 0.03 * (max(hi, *levels) - min(lo, *levels))
+                        price_range = (min(lo, *levels) - pad, max(hi, *levels) + pad)
+                        figure.update_yaxes(range=price_range)
+                        from chart_axes import add_independent_axis_controls
+                        add_independent_axis_controls(figure, figure.layout.xaxis.range, price_range)
+                        st.plotly_chart(figure, use_container_width=True,
+                                        key=f"shortlist-{s.symbol}-{m['htf']}-{m['ltf']}")
 
 
 with T["SMC"]:

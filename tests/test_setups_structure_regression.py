@@ -11,7 +11,7 @@ from core.structure2 import run
 from strategy import reversal
 
 
-def test_setups_renders_multiple_cards_for_one_symbol():
+def test_setups_renders_one_card_for_one_symbol():
     app = AppTest.from_string("""
 import pandas as pd
 import streamlit as st
@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 from config import CFG
 
 setup = SimpleNamespace(
-    symbol="BTC/USDT", direction="long", ts=pd.Timestamp("2026-01-01"),
+    symbol="BTC/USDT", direction="long", pattern="bos_retest", ts=pd.Timestamp("2026-01-01"),
     entry=100, stop=98, tp1=104, tp2=106,
     rr1=2, rr2=3, weighted_rr=2.5, reasons=[],
     meta={"status": "ACTIONABLE", "r": {"grade": "A", "confidence": 90,
@@ -34,19 +34,19 @@ with (
     patch.object(board, "_auto_pair", return_value=("30m", "5m", {})),
     patch.object(board.chart, "build", return_value=go.Figure(go.Scatter(y=[1, 2]))),
 ):
-    board.render(None, lambda *a: CFG, lambda *a: (SimpleNamespace(id="test"), ""),
+    board.render(None, lambda *a: CFG, lambda *a: (SimpleNamespace(id="test"), "test"),
              lambda *a: (candles, setup.symbol), lambda x: x, lambda *a: None,
              None, "test", 25, 0, "5m", 2, 3, 1, 1000, 12, None,
              True, False, False, False)
 """).run()
     assert not app.exception
-    assert len(app.get("plotly_chart")) == 2
+    assert len(app.get("plotly_chart")) == 1
     assert not any("chart error" in caption.value for caption in app.caption)
     for label in ("Alert me", "Log to paper"):
         buttons = [button for button in app.button if button.label == label]
-        assert len(buttons) == len({button.key for button in buttons}) == 2
+        assert len(buttons) == len({button.key for button in buttons}) == 1
     selectors = [widget for widget in app.selectbox if widget.label == "Chart timeframe"]
-    assert len(selectors) == len({widget.key for widget in selectors}) == 2
+    assert len(selectors) == len({widget.key for widget in selectors}) == 1
 
 
 def test_one_hour_uses_only_complete_15_minute_groups():

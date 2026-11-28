@@ -21,6 +21,7 @@ import streamlit as st
 
 import auth
 import board
+from strategy.selection import best_live_per_market
 import chart
 import learn
 import market
@@ -705,8 +706,12 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             diag["err"] += 1
             continue
 
-    found = current_only(found)
-    return found, diag
+    found.sort(key=lambda s: s.ts, reverse=True)
+    ranked = current_only(found)
+    selected = best_live_per_market(ranked)
+    diag["scanned_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+    diag["alternate_setups"] = len(ranked) - len(selected)
+    return selected, diag
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -1236,10 +1241,13 @@ with T["SMC"]:
                 st.divider()
                 order_card(plan, used, side, ltf_tf)
                 if st.button("Log to paper book", key="paper_log"):
-                    paper.open_trade(used, side, plan["entry"], plan["sl"],
+                    opened = paper.open_trade(used, side, plan["entry"], plan["sl"],
                                      plan["tp1"], plan["tp2"], plan["qty"], equity,
                                      " | ".join(plan["confluence"]["flags"][:3]))
-                    st.success("Paper trade opened.")
+                    if opened:
+                        st.success("Paper trade opened.")
+                    else:
+                        st.info("This trade is already in your paper book.")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
             st.exception(e)

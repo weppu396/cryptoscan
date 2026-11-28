@@ -253,21 +253,25 @@ def list_symbols(ex, quote="USDT", limit=800):
     return syms[:limit]
 
 
-def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
+def load(ex, symbol, timeframe, limit=1500, use_cache=True, *,
+         require_current=False) -> pd.DataFrame:
     symbol = resolve_symbol(ex, symbol)
 
     safe = symbol.replace("/", "_").replace(":", "_")
     key = CACHE / f"{ex.id}_{safe}_{timeframe}.parquet"
 
+    step = TF_MS[timeframe]
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(milliseconds=step * 2)
     if use_cache and key.exists():
         try:
             cached = pd.read_parquet(key)
-            if len(cached) >= limit:
+            if len(cached) >= limit and (
+                not require_current or cached.index[-1] >= cutoff
+            ):
                 return cached
         except Exception:
             pass
 
-    step = TF_MS[timeframe]
     batch_limit = int(ex.options.get("fetchOHLCVLimit") or 1000)
     batch_limit = max(50, min(batch_limit, 1000))
 
@@ -303,6 +307,8 @@ def load(ex, symbol, timeframe, limit=1500, use_cache=True) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.drop_duplicates("ts").set_index("ts").sort_index().astype(float)
+    if require_current and (df.empty or df.index[-1] < cutoff):
+        return df.iloc[:0]
     if not df.empty:
         df.to_parquet(key)
     return df

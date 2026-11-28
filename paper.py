@@ -1,9 +1,11 @@
 """paper.py - forward test. Same tickets, no money."""
 import json
 import pathlib
+import tempfile
 import uuid
 
 import pandas as pd
+from filelock import FileLock
 
 BOOK = pathlib.Path("./state/paper.json")
 
@@ -14,28 +16,54 @@ def _load() -> list:
 
 def _save(rows: list) -> None:
     BOOK.parent.mkdir(exist_ok=True)
-    BOOK.write_text(json.dumps(rows, indent=2))
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=BOOK.parent,
+                                     delete=False) as handle:
+        temp = pathlib.Path(handle.name)
+        try:
+            json.dump(rows, handle, indent=2)
+            handle.close()
+            temp.replace(BOOK)
+        finally:
+            temp.unlink(missing_ok=True)
 
 
-def open_trade(symbol, direction, entry, stop, tp1, tp2, qty, equity, reason=""):
-    rows = _load()
-    rows.append({"id": uuid.uuid4().hex[:8], "symbol": symbol, "dir": direction,
-                 "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2,
-                 "qty": qty, "equity0": equity, "reason": reason,
-                 "ts": pd.Timestamp.utcnow().isoformat(), "state": "OPEN",
-                 "exit": None, "r": None})
-    _save(rows)
+def _lock():
+    BOOK.parent.mkdir(parents=True, exist_ok=True)
+    return FileLock(f"{BOOK}.lock", timeout=5)
+
+
+def open_trade(symbol, direction, entry, stop, tp1, tp2, qty, equity, reason="",
+               *, signal=None):
+    plan = {"symbol": symbol, "dir": direction, "entry": entry,
+            "stop": stop, "tp1": tp1, "tp2": tp2}
+    signal = list(signal) if signal is not None else None
+    with _lock():
+        rows = _load()
+        for row in rows:
+            if signal is not None and row.get("signal") == signal:
+                return False
+            if row["state"] == "OPEN" and all(row.get(k) == v for k, v in plan.items()):
+                if signal is None or row.get("signal") is None or row["signal"][0] == signal[0]:
+                    return False
+        rows.append({"id": uuid.uuid4().hex[:8], **plan, "signal": signal,
+                     "qty": qty, "equity0": equity, "reason": reason,
+                     "ts": pd.Timestamp.utcnow().isoformat(), "state": "OPEN",
+                     "exit": None, "r": None})
+        _save(rows)
+    return True
 
 
 def close_trade(tid, price, tag):
-    rows = _load()
-    for r in rows:
-        if r["id"] == tid and r["state"] == "OPEN":
-            sign = 1 if r["dir"] == "long" else -1
-            risk = abs(r["entry"] - r["stop"]) or 1e-9
-            r["exit"], r["state"], r["tag"] = price, "CLOSED", tag
-            r["r"] = round((price - r["entry"]) * sign / risk, 3)
-    _save(rows)
+    with _lock():
+        rows = _load()
+        for r in rows:
+            if r["id"] == tid and r["state"] == "OPEN":
+                sign = 1 if r["dir"] == "long" else -1
+                risk = abs(r["entry"] - r["stop"]) or 1e-9
+                r["exit"], r["state"], r["tag"] = price, "CLOSED", tag
+                r["r"] = round((price - r["entry"]) * sign / risk, 3)
+                _save(rows)
+                return
 
 
 def book() -> list:

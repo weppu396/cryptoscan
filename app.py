@@ -20,6 +20,7 @@ import streamlit as st
 
 import auth
 import board
+from strategy.selection import LIVE_STATUSES, best_live_per_market
 import chart
 import learn
 import market
@@ -79,7 +80,7 @@ from backtest.validate import monte_carlo_drawdown, permutation_test
 GRADE_ORDER = ["D", "C", "B", "A", "A+"]
 GRADE_RANK = {g: i for i, g in enumerate(GRADE_ORDER)}
 GRADE_TONE = {"A+": "up", "A": "up", "B": "warn", "C": "mut", "D": "dn"}
-OK_STATUS = {"ACTIONABLE", "BETTER_PRICE"}
+OK_STATUS = LIVE_STATUSES
 MIN_BARS = 300
 HAS_FRAGMENT = hasattr(st, "fragment")
 CHART_BARS = 1500
@@ -405,11 +406,17 @@ def _universe(ex, min_vol: int, top: int):
     return syms, floor, len(perps)
 
 
-def _load(ex, sym: str, tf: str, limit: int, min_bars: int = MIN_BARS):
+def _load(ex, sym: str, tf: str, limit: int, min_bars: int = MIN_BARS,
+          *, require_current=False):
     for cand in _alts(sym):
         try:
-            df = load(ex, cand, tf, limit=limit)
+            if require_current:
+                df = load(ex, cand, tf, limit=limit, require_current=True)
+            else:
+                df = load(ex, cand, tf, limit=limit)
         except TypeError:
+            if require_current:
+                continue
             try:
                 df = load(ex, cand, tf)
             except Exception:
@@ -548,7 +555,7 @@ def notify(text: str):
     return False, f"{msg} | {msg2}"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 equity, recent_h, min_grade, preferred, proxy, relax,
                 need_smc, long_only, need_mtf=False, need_vol=False):
@@ -572,10 +579,14 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
             "invalid": 0, "htf": cfg.scan.htf, "ltf": cfg.scan.ltf,
             "bars": bars, "recent": recent_h, "fresh": fresh}
 
+    scanned = set()
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=recent_h)
     for sym in universe:
-        df, used_sym = _load(ex, sym, cfg.scan.ltf, bars)
+        df, used_sym = _load(ex, sym, cfg.scan.ltf, bars, require_current=True)
         if df is None:
             diag["err"] += 1
+            continue
+        if used_sym in scanned:
             continue
         diag["loaded"] += 1
         try:
@@ -594,8 +605,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                 kept = [s for s in kept if s.direction == "long"]
             diag["kept"] += len(kept)
             if kept:
-                cut = df.index[max(0, len(df) - 1 - fresh)]
-                fresh_kept = [s for s in kept if s.ts >= cut]
+                fresh_kept = [s for s in kept if s.ts >= cutoff]
                 diag["stale"] += len(kept) - len(fresh_kept)
                 kept = fresh_kept
             atr_now = _last(ind, "atr", default=0.0)
@@ -663,16 +673,22 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
                     s.meta["mtf"] = {"ok": True, "why": "off", "htf": "—"}
 
                 found.append(s)
+            scanned.add(used_sym)
         except Exception:
             diag["err"] += 1
             continue
 
+    found.sort(key=lambda s: s.ts, reverse=True)
     found.sort(key=lambda s: -(s.meta["r"]["confidence"]
                                + s.meta.get("smc", {}).get("score", 0) * 3
                                + s.meta.get("avwap", {}).get("score", 0) * 0.4
                                + (15 if s.meta.get("in_value") else 0)
                                + s.meta.get("candle_q", 0) * 0.2))
-    return found, diag
+    selected = best_live_per_market(found)
+    diag["scanned_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+    diag["unique_live"] = len(selected)
+    diag["alternate_setups"] = len(found) - len(selected)
+    return selected, diag
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -1038,19 +1054,18 @@ if MODE == "Bot":
                 st.error(f"{type(e).__name__}: {e}")
                 st.exception(e)
         diag = st.session_state.get("diag")
+        live_rows = best_live_per_market(st.session_state.get("setups", []))
         if diag:
             st.caption(f"venue {diag['venue']} · universe {diag['universe']} · "
                        f"loaded {diag['loaded']} · failed {diag['err']} · raw "
                        f"{diag['raw']} · kept {diag['kept']} · live "
-                       f"{diag.get('actionable', 0) + diag.get('better', 0)} · "
+                       f"{len(live_rows)} markets · "
                        f"played {diag.get('extended', 0)} · invalid "
                        f"{diag.get('invalid', 0)} · below grade "
                        f"{diag['below_grade']} · blank bias {diag['bias_blank']} "
                        f"· scan {diag.get('ltf', '5m')} · HTF {diag['htf']} · "
                        f"freshness {diag.get('recent', 12)}h "
                        f"({diag.get('fresh', 0)} bars)")
-        live_rows = [s for s in st.session_state.get("setups", [])
-                     if s.meta.get("status") in OK_STATUS]
         if diag and not live_rows:
             st.info("Nothing executable in this window. Raise freshness hours, "
                     "keep Relax on, or lower the minimum grade.")
@@ -1152,10 +1167,13 @@ with T["SMC"]:
                 st.divider()
                 order_card(plan, used, side, ltf_tf)
                 if st.button("Log to paper book", key="paper_log"):
-                    paper.open_trade(used, side, plan["entry"], plan["sl"],
+                    opened = paper.open_trade(used, side, plan["entry"], plan["sl"],
                                      plan["tp1"], plan["tp2"], plan["qty"], equity,
                                      " | ".join(plan["confluence"]["flags"][:3]))
-                    st.success("Paper trade opened.")
+                    if opened:
+                        st.success("Paper trade opened.")
+                    else:
+                        st.info("This trade is already in your paper book.")
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
             st.exception(e)

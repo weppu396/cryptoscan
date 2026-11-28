@@ -9,8 +9,8 @@ from config import CFG
 from core.tfs import CHART_TFS, cap_htf, cap_ltf, chart_minutes, data_tf
 from strategy import reversal
 from strategy.risk import plan_rr
+from strategy.selection import best_live_per_market, signal_key
 
-FUTURE = {"ACTIONABLE", "BETTER_PRICE"}
 DEFAULT_CTF = "30m"
 
 
@@ -32,7 +32,7 @@ def _auto_pair(load_fn, ex, sym):
     return htf, ltf, frames
 
 
-def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
+def _card(s, r, sm, venue, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
           exch, proxy, cfg_fn, resolve_fn, load_fn, order_card, notify):
     conf = r["confidence"]
     pair = (cap_htf(s.meta.get("htf") or "30m"), cap_ltf(s.meta.get("ltf") or "5m"))
@@ -43,7 +43,9 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
         try:
             cfg = cfg_fn(exch, top, min_vol, ltf, min_rr, max_stop_atr,
                          risk_pct, equity)
-            ex, _ = resolve_fn(cfg, exch, proxy)
+            ex, actual_venue = resolve_fn(cfg, venue, proxy)
+            if actual_venue != venue:
+                raise RuntimeError(f"{venue} candles are unavailable")
             htf, trig, frames = _auto_pair(load_fn, ex, s.symbol)
             pair = (htf, trig)
             st.caption(f"live pair **{htf} HTF / {trig} LTF**")
@@ -107,31 +109,53 @@ def _card(s, r, sm, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
                    s.symbol, s.direction, pair[1])
 
         c1, c2 = st.columns(2)
-        if c1.button("Alert me", key=f"ba{s.symbol}"):
+        key = signal_key(venue, s)
+        sent = st.session_state.setdefault("board_alerts_sent", {})
+        already_sent = key in sent
+        if c1.button("Alert sent" if already_sent else "Alert me",
+                     key=f"ba{s.symbol}", disabled=already_sent):
             ok, msg = notify(f"{r['grade']} {s.symbol} {s.direction} "
                              f"entry {s.entry:,.6g} stop {s.stop:,.6g}")
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                sent[key] = None
+                if len(sent) > 500:
+                    sent.pop(next(iter(sent)))
+                st.success(msg)
+            else:
+                st.error(msg)
         if c2.button("Log to paper", key=f"bp{s.symbol}"):
-            paper.open_trade(s.symbol, s.direction, s.entry, s.stop, s.tp1, s.tp2,
-                             s.meta.get("qty", 0), equity,
-                             " · ".join(sm.get("flags", [])[:3]))
-            st.success("Paper trade opened.")
+            try:
+                opened = paper.open_trade(
+                    s.symbol, s.direction, s.entry, s.stop, s.tp1, s.tp2,
+                    s.meta.get("qty", 0), equity,
+                    " · ".join(sm.get("flags", [])[:3]), signal=key)
+            except (OSError, ValueError):
+                st.error("Paper book could not be updated. Try again.")
+            else:
+                if opened:
+                    st.success("Paper trade opened.")
+                else:
+                    st.info("This setup is already in your paper book.")
 
 
 def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
            exch, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
            recent, proxy, relax, need_smc, need_mtf, need_vol):
     ui.section("Setups board", "Ranked, charted, with the reasoning shown.")
-    st.caption("Press Build board. Only setups still executable from here are "
-               "listed — played and invalidated ones are dropped. Charts are "
-               "capped at 6 to stay inside rate limits.")
+    st.caption("Each market shows its highest-ranked eligible setup from the "
+               "last scan. Build the board to refresh prices. "
+               "Charts are capped at 6 to stay inside rate limits.")
 
     g1, g2 = st.columns(2)
     b_top = g1.slider("Universe size", 10, 60, 25, step=5, key="b_top")
     b_grade = g2.select_slider("Minimum grade", ["D", "C", "B", "A", "A+"],
                                value="C", key="b_grade")
 
+    settings = (exch, b_top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
+                equity, recent, b_grade, proxy, relax, need_smc, need_mtf, need_vol)
     if st.button("Build board", type="primary"):
+        for key in ("board", "board_diag", "board_settings"):
+            st.session_state.pop(key, None)
         try:
             with st.spinner("Scanning and grading..."):
                 found, diag = scan_fn(exch, b_top, min_vol, ltf, min_rr,
@@ -140,20 +164,30 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
                                       False, need_mtf, need_vol)
             st.session_state["board"] = found
             st.session_state["board_diag"] = diag
+            st.session_state["board_settings"] = settings
             for k in [k for k in st.session_state if k.startswith("pair")]:
                 st.session_state.pop(k, None)
         except Exception as e:
             st.error(f"{type(e).__name__}: {e}")
             st.exception(e)
 
+    if st.session_state.get("board_settings", settings) != settings:
+        st.info("Settings changed. Build the board to refresh the setups.")
+        return
+
     bd = st.session_state.get("board_diag")
+    board = best_live_per_market(st.session_state.get("board", []))
+    if bd and bd.get("scanned_at"):
+        age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(bd["scanned_at"])
+        if age >= pd.Timedelta(minutes=chart_minutes(bd["ltf"])):
+            st.info("This snapshot has expired. Build the board for current setups.")
+            return
     if bd:
         st.caption(f"venue {bd['venue']} · universe {bd['universe']} · loaded "
                    f"{bd['loaded']} · failed {bd['err']} · raw {bd['raw']} · "
                    f"kept {bd['kept']} · stale {bd['stale']} · live "
-                   f"{bd.get('actionable', 0) + bd.get('better', 0)} "
-                   f"(actionable {bd.get('actionable', 0)} / better "
-                   f"{bd.get('better', 0)}) · played {bd.get('extended', 0)} · "
+                   f"{len(board)} markets · alternate setups "
+                   f"{bd.get('alternate_setups', 0)} · played {bd.get('extended', 0)} · "
                    f"invalid {bd.get('invalid', 0)} · below grade "
                    f"{bd['below_grade']} · mtf {bd['mtf_skip']} · volume "
                    f"{bd['vol_skip']} · no anchor {bd['no_anchor']} · scan "
@@ -177,8 +211,6 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
             st.caption(f"{bd['stale']} setups fell outside the {bd['recent']}h "
                        f"freshness window. Raise it to see more.")
 
-    board = [s for s in st.session_state.get("board", [])
-             if s.meta.get("status") in FUTURE]
     if not board:
         st.info("No board yet, or every setup has already played out.")
         return
@@ -199,5 +231,5 @@ def render(scan_fn, cfg_fn, resolve_fn, load_fn, norm_fn, order_card, notify,
     st.divider()
     for s in board[:6]:
         _card(s, norm_fn(s.meta.get("r")), s.meta.get("smc", {}) or {},
-              b_top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
+              (bd or {}).get("venue", exch), b_top, min_vol, ltf, min_rr, max_stop_atr, risk_pct, equity,
               exch, proxy, cfg_fn, resolve_fn, load_fn, order_card, notify)

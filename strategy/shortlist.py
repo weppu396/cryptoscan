@@ -52,7 +52,57 @@ def _net_rr(setup, cfg, target):
     return (abs(target - setup.entry) - (setup.entry + target) * friction) / loss
 
 
+def signal_window(htf, ltf):
+    """Swing entries can remain eligible for three trigger candles."""
+    bars = 3 if htf == "4h" else 1
+    return bars * pd.Timedelta(minutes=chart_minutes(ltf))
+
+
+def _structure_targets(levels, minimum_separation):
+    """Keep the nearest exit. Prefer a distinct second target area."""
+    if len(levels) < 2:
+        return levels, []
+    second = next((i for i in range(1, len(levels))
+                   if abs(levels[i] - levels[0]) >= minimum_separation), 1)
+    return [levels[0], levels[second]], levels[1:second]
+
+
 def scan_pair(symbol, high, low, cfg, htf, ltf, now):
+    if high is None or low is None or len(high) < 60:
+        return []
+    step = pd.Timedelta(minutes=chart_minutes(ltf))
+    closed = low.loc[low.index + step <= now]
+    window = signal_window(htf, ltf)
+    if len(closed) < 60 or now - (closed.index[-1] + step) >= step:
+        return []
+    if htf != "4h":
+        return _scan_closed_pair(symbol, high, closed, cfg, htf, ltf, now)
+
+    high_step = pd.Timedelta(minutes=chart_minutes(htf))
+    latest_high = high.loc[high.index + high_step <= now]
+    if len(latest_high) < 60 or now - (latest_high.index[-1] + high_step) >= 2 * high_step:
+        return []
+    state = run(latest_high, symbol, htf, cfg).state_at(Layer.EXTERNAL, len(latest_high) - 1)
+    direction = {"up": "long", "down": "short"}.get(state)
+    if direction is None:
+        return []
+
+    accepted = []
+    for offset in range(int(window / step)):
+        prefix = closed.iloc[:len(closed) - offset]
+        if now - (prefix.index[-1] + step) >= window:
+            break
+        for setup in _scan_closed_pair(symbol, high, prefix, cfg, htf, ltf,
+                                        prefix.index[-1] + step):
+            status, reason = assess(setup, closed, max_age_bars=2, now=now,
+                                    timeframe_seconds=step.total_seconds())
+            if setup.direction == direction and status in ACTIVE:
+                setup.meta.update(status=status, status_reason=reason)
+                accepted.append(setup)
+    return accepted
+
+
+def _scan_closed_pair(symbol, high, low, cfg, htf, ltf, now):
     if high is None or low is None or len(high) < 60 or len(low) < 60:
         return []
     h_step = pd.Timedelta(minutes=chart_minutes(htf))
@@ -98,14 +148,18 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, now):
                                      build_structure(low, cfg.structure), [], [], cfg):
             if setup.ts != ts or setup.direction != direction:
                 continue
-            setup.tp1, setup.tp2 = swing_targets[:2]
+            targets, intervening = _structure_targets(swing_targets, 0.5 * h_atr if htf == "4h" else 0)
+            setup.tp1, setup.tp2 = targets
             setup.rr = setup.rr2
             setup.meta["strategy"] = "BOS Retest"
             setup.reasons.extend([
                 f"Closed retest entry {price(entry)} after reclaiming BOS wick {price(setup.meta['bos_level'])}.",
                 f"Stop {price(setup.stop)} beyond the retest extreme or BOS buffer, whichever is farther, plus {cfg.risk.stop_buffer_atr:g} LTF ATR.",
-                f"TP1 {price(setup.tp1)} and TP2 {price(setup.tp2)} are the next two confirmed {htf} opposing swing prices.",
+                f"TP1 {price(setup.tp1)} and TP2 {price(setup.tp2)} are confirmed {htf} opposing swing prices.",
             ])
+            if intervening:
+                setup.reasons.append("TP2 requires clearing nearby swing levels at "
+                                     + ", ".join(price(level) for level in intervening) + ".")
             options.append(setup)
 
     channel = _channel(high, swings, direction, h_atr, close_stamp)
@@ -121,6 +175,7 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, now):
             targets = sorted({p for p in [mid, far, *swing_targets]
                               if 0 < sign * (p - entry) <= sign * (far - entry)}, reverse=sign < 0)
             if len(targets) >= 2:
+                targets, intervening = _structure_targets(targets, 0.5 * h_atr if htf == "4h" else 0)
                 setup = Setup(symbol, direction, "Trend Channel Retest", ts, entry, stop,
                               targets[0], targets[1], atr, 0.0, 0.0,
                               [f"{htf} trend-side anchors {price(a_price)} ({a_time:%d %b %H:%M}) and {price(b_price)} ({b_time:%d %b %H:%M}) UTC. Two confirmed touches on the far side.",
@@ -135,6 +190,9 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, now):
                                    "lower": (a_price + min(0, far - near), min(near, far)),
                                    "upper": (a_price + max(0, far - near), max(near, far)),
                                }})
+                if intervening:
+                    setup.reasons.append("TP2 requires clearing nearer levels at "
+                                         + ", ".join(price(level) for level in intervening) + ".")
                 setup.rr = setup.rr2
                 options.append(setup)
 
@@ -156,12 +214,14 @@ def scan_pair(symbol, high, low, cfg, htf, ltf, now):
 
 
 def shortlist(candidates):
-    """Return up to three plans, with at most two swing plans and one per coin."""
+    """Return up to three plans, prioritizing swing and allowing one per coin."""
     best = sorted(candidates, key=lambda s: (-s.meta["net_tp2"], -s.meta["net_weighted"],
                                             -s.meta["candle_score"], s.symbol))
     chosen, used = [], set()
     for swing in (True, False):
-        limit = 2 if swing else 3 - len(chosen)
+        limit = 3 - len(chosen)
+        if limit == 0:
+            break
         count = 0
         for setup in best:
             coin = setup.symbol.split("/")[0]

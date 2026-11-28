@@ -717,7 +717,7 @@ def cached_scan(exchange, top, min_vol, ltf, min_rr, max_stop_atr, risk_pct,
 @st.cache_data(ttl=30, show_spinner=False)
 def cached_shortlist(exchange, top, min_vol, max_stop_atr,
                      risk_pct, equity, proxy):
-    from strategy.shortlist import PAIRS, scan_pair, shortlist
+    from strategy.shortlist import PAIRS, scan_pair, shortlist, signal_window
 
     cfg = build_cfg(exchange, top, min_vol, "5m", 2.0, max_stop_atr, risk_pct, equity)
     ex, venue = _resolve(cfg, exchange, proxy)
@@ -740,8 +740,11 @@ def cached_shortlist(exchange, top, min_vol, max_stop_atr,
                 candidates.extend(results)
                 step = pd.Timedelta(minutes=chart_minutes(ltf))
                 charts[(low_symbol, htf, ltf)] = low.loc[low.index + step <= now].tail(120)
-    selected = shortlist(candidates)
-    return venue, len(symbols), complete, pd.Timestamp.now(tz="UTC"), [
+    scan_time = pd.Timestamp.now(tz="UTC")
+    selected = shortlist(s for s in candidates
+                         if scan_time - s.meta["confirmed_at"]
+                         < signal_window(s.meta["htf"], s.meta["ltf"]))
+    return venue, len(symbols), complete, scan_time, [
         (setup, charts[(setup.symbol, setup.meta["htf"], setup.meta["ltf"])])
         for setup in selected
     ]
@@ -1101,14 +1104,18 @@ if MODE == "Trade":
             except Exception as e:
                 st.error(f"Shortlist unavailable: {e}")
         if "research_shortlist" in st.session_state:
+            from strategy.shortlist import signal_window
+
             venue, coins, complete, scan_time, rows = st.session_state["research_shortlist"]
             now = pd.Timestamp.now(tz="UTC")
             rows = [(s, candles) for s, candles in rows
-                    if now - s.meta["confirmed_at"] < pd.Timedelta(minutes=chart_minutes(s.meta["ltf"]))]
+                    if now - s.meta["confirmed_at"] < signal_window(s.meta["htf"], s.meta["ltf"])]
             st.caption(f"{venue} · {coins} symbols · {complete} timeframe pairs loaded · "
                        f"scan ended {scan_time:%H:%M:%S} UTC")
             if not rows:
                 st.info("No fresh setup passed the confirmation and risk checks.")
+            elif not any(s.meta["htf"] == "4h" for s, _ in rows):
+                st.caption("No 4h / 30m swing setup qualified in this scan.")
             last_bucket = None
             for s, candles in rows:
                 m = s.meta

@@ -18,8 +18,8 @@ def test_shortlist_prioritizes_swing_and_ranks_by_net_reward_to_risk():
     rows.append(row("S0/USDT", "1h", 100))
     selected = research.shortlist(rows)
     assert len(selected) == 3
-    assert sum(s.meta["htf"] == "4h" for s in selected) == 2
-    assert [s.symbol for s in selected] == ["S0/USDT", "S1/USDT", "D0/USDT"]
+    assert sum(s.meta["htf"] == "4h" for s in selected) == 3
+    assert [s.symbol for s in selected] == ["S0/USDT", "S1/USDT", "S2/USDT"]
 
 
 def test_channel_uses_structural_boundaries_and_rejects_a_broken_channel():
@@ -79,3 +79,32 @@ def test_draws_both_saved_boundaries_at_their_confirmation_prices():
     assert [trace.name for trace in figure.data] == ["HTF channel upper", "HTF channel lower"]
     assert all(trace.x[-1] == end for trace in figure.data)
     assert figure.layout.xaxis.range[1] == end
+
+
+def test_swing_targets_keep_tp1_and_report_levels_before_distinct_tp2():
+    assert research._structure_targets([104, 104.1, 104.3, 110], 0.5) == (
+        [104, 110], [104.1, 104.3])
+    assert research._structure_targets([96, 95.9, 90], 0.5) == ([96, 90], [95.9])
+    assert research._structure_targets([104, 104.1], 0.5) == ([104, 104.1], [])
+
+
+def test_previous_swing_signal_remains_eligible_until_stop_or_target(monkeypatch):
+    from strategy.setups import Setup
+
+    now = pd.Timestamp("2026-01-02", tz="UTC")
+    low_index = pd.date_range(end=now - pd.Timedelta(minutes=30), periods=80, freq="30min")
+    high_index = pd.date_range(end=now - pd.Timedelta(hours=4), periods=80, freq="4h")
+    low = pd.DataFrame(dict(open=100.0, high=101.0, low=99.5, close=100.0), index=low_index)
+    high = low.set_axis(high_index)
+    signal = low.index[-2]
+    monkeypatch.setattr(research, "run", lambda *args: SimpleNamespace(state_at=lambda *_: "up"))
+
+    def scan(symbol, high, prefix, *_):
+        if prefix.index[-1] == signal:
+            return [Setup(symbol, "long", "BOS Retest", signal, 100, 98, 104, 116, 1, 8, 0)]
+        return []
+
+    monkeypatch.setattr(research, "_scan_closed_pair", scan)
+    assert [s.ts for s in research.scan_pair("X/USDT", high, low, CFG, "4h", "30m", now)] == [signal]
+    low.loc[low.index[-1], "high"] = 104
+    assert not research.scan_pair("X/USDT", high, low, CFG, "4h", "30m", now)
